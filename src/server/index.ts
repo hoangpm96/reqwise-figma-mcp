@@ -24,6 +24,7 @@ import { ErrorCode, OpError, toBridgeError } from "./errors.js";
 import { validateOperation } from "./validate.js";
 import { SessionRegistry } from "./session.js";
 import { Coordinator } from "./leader.js";
+import { Follower, STATUS_RPC_TIMEOUT_MS } from "./follower.js";
 import { executeWrite, type WriteResult } from "./executor.js";
 import {
   handleDocs,
@@ -37,7 +38,7 @@ import {
 import type { Bridge } from "./bridge.js";
 import type { AnyOperation, BridgeResponse } from "../shared/protocol.js";
 import { DOC_SECTION_NAMES } from "./docs-content/index.js";
-import { READ_OPERATIONS } from "../shared/protocol.js";
+import { READ_OPERATIONS, DEFAULT_PORT, PORT_RANGE } from "../shared/protocol.js";
 
 // ---- JSON tool schemas (match ARCHITECTURE.md) ----
 
@@ -45,7 +46,7 @@ const TOOLS: Tool[] = [
   {
     name: "figma_status",
     description:
-      "Rich connection diagnostics for the Figma bridge (never a bare boolean): plugin connection, leader/follower mode, port, heartbeat, queue, sessions, and an ordered list of concrete next-step hints when something is off.",
+      "Rich connection diagnostics for the Figma bridge (never a bare boolean): plugin connection, leader/follower mode, port, heartbeat, queue, sessions, and an ordered list of concrete next-step hints when something is off. `pluginConnected` is TRI-STATE: true/false are measured, null means UNKNOWN (this follower could not query the leader — see `statusSource`/`statusError`). Do NOT treat null as disconnected and do NOT ask the user to reopen the plugin on that basis; ops may still be forwarding fine.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -132,11 +133,58 @@ const TOOLS: Tool[] = [
   },
 ];
 
+// ---- port configuration ----
+
+/**
+ * Resolve the bridge start port from FIGMA_MCP_PORT.
+ *
+ * This env var was referenced in an error hint ("Set FIGMA_MCP_PORT to a free
+ * port") long before anything read it — following that advice did nothing.
+ * It is honoured here, with two guards, because the plugin cannot be
+ * configured to match:
+ *
+ *   - A malformed/out-of-range value is REJECTED loudly rather than silently
+ *     falling back, so a typo can't look like it worked.
+ *   - plugin/ui.html scans a hardcoded DEFAULT_PORT..+PORT_RANGE-1 window. A
+ *     port outside it binds fine but the plugin will never find the server, so
+ *     we warn on stderr instead of leaving the user with a silent no-connect.
+ */
+export function resolveStartPort(
+  env: NodeJS.ProcessEnv = process.env,
+  warn: (msg: string) => void = (msg) => process.stderr.write(msg),
+): number {
+  const raw = env["FIGMA_MCP_PORT"];
+  if (raw === undefined || raw.trim() === "") return DEFAULT_PORT;
+
+  const port = Number(raw);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `FIGMA_MCP_PORT must be an integer between 1 and 65535 (got "${raw}").`,
+    );
+  }
+  // Ports below 1024 need root on Unix; the bridge is loopback-only tooling.
+  if (port < 1024) {
+    throw new Error(
+      `FIGMA_MCP_PORT=${port} is a privileged port (<1024). Use 1024–65535, ideally ${DEFAULT_PORT}.`,
+    );
+  }
+  if (port < DEFAULT_PORT || port > DEFAULT_PORT + PORT_RANGE - 1) {
+    warn(
+      `[reqwise-figma-mcp] warning: FIGMA_MCP_PORT=${port} is outside the range the Figma plugin scans ` +
+        `(${DEFAULT_PORT}-${DEFAULT_PORT + PORT_RANGE - 1}). The server will bind it, but the plugin cannot ` +
+        `discover it and will never connect. Use a port in that range unless you are proxying.\n`,
+    );
+  }
+  return port;
+}
+
 // ---- server assembly ----
 
 export interface ServerHandle {
   server: Server;
   coordinator: Coordinator;
+  /** Live status snapshot (exposed for tests + the figma_status tool path). */
+  diagnostics: () => Promise<Diagnostics>;
   close: () => Promise<void>;
 }
 
@@ -158,6 +206,7 @@ export async function createServer(): Promise<ServerHandle> {
   const liveBridge = (): Bridge | undefined => coordinator.bridge;
 
   const coordinator: Coordinator = new Coordinator({
+    startPort: resolveStartPort(),
     // THE single choke point. Called for leader-direct ops AND /rpc forwards —
     // wired by leader.ts onto EVERY bridge it creates, so the synthetic ops
     // below keep working across takeovers (no post-hoc router to forget).
@@ -169,6 +218,14 @@ export async function createServer(): Promise<ServerHandle> {
       if (op === "__register__") {
         if (sessionId) sessions.get(sessionId);
         return { registered: true };
+      }
+      // __status__ lets a follower read the leader's REAL plugin state instead
+      // of guessing. Before this existed the follower reported a hardcoded
+      // pluginConnected:false and sent users to restart a live plugin.
+      if (op === "__status__") {
+        const b = liveBridge();
+        if (!b) throw new OpError(ErrorCode.NOT_CONNECTED, "Bridge unavailable on leader.", "Restart the leader.");
+        return leaderPluginState(b);
       }
       if (op === "__write__") {
         const code = typeof params["code"] === "string" ? (params["code"] as string) : "";
@@ -291,7 +348,44 @@ export async function createServer(): Promise<ServerHandle> {
     });
   }
 
-  const diagnostics = (): Diagnostics => {
+  /**
+   * The plugin-state half of diagnostics, measured from a bridge this process
+   * owns. Serialised verbatim over /rpc for followers (plain JSON — every field
+   * is a string/number/array), so a follower sees exactly what the leader sees.
+   */
+  type LeaderPluginState = Pick<
+    Diagnostics,
+    "pluginConnected" | "plugin" | "channels" | "lastHeartbeatMs" | "queueLength" | "pendingCount"
+  >;
+
+  function leaderPluginState(bridge: Bridge): LeaderPluginState {
+    return {
+      pluginConnected: bridge.pluginConnected,
+      ...(bridge.plugin
+        ? {
+            plugin: {
+              version: bridge.plugin.version,
+              protocolVersion: bridge.plugin.protocolVersion,
+              fileName: bridge.plugin.fileName,
+              pageName: bridge.plugin.pageName,
+              editorType: bridge.plugin.editorType,
+            },
+          }
+        : {}),
+      channels: bridge.channelSummaries().map((c) => ({
+        ...c,
+        boundSessions: sessions
+          .summaries()
+          .filter((s) => bridge.sessionBinding(s.id) === c.channel)
+          .map((s) => s.id),
+      })),
+      lastHeartbeatMs: bridge.lastHeartbeatMs,
+      queueLength: bridge.queueLength,
+      pendingCount: bridge.pendingCount,
+    };
+  }
+
+  const diagnostics = async (): Promise<Diagnostics> => {
     const info = coordinator.info();
     const bridge = liveBridge();
     if (coordinator.role === "leader" && bridge) {
@@ -299,28 +393,8 @@ export async function createServer(): Promise<ServerHandle> {
         mode: "leader",
         port: bridge.port,
         bridgeAuth: info?.token ? "ok" : "missing",
-        pluginConnected: bridge.pluginConnected,
-        ...(bridge.plugin
-          ? {
-              plugin: {
-                version: bridge.plugin.version,
-                protocolVersion: bridge.plugin.protocolVersion,
-                fileName: bridge.plugin.fileName,
-                pageName: bridge.plugin.pageName,
-                editorType: bridge.plugin.editorType,
-              },
-            }
-          : {}),
-        channels: bridge.channelSummaries().map((c) => ({
-          ...c,
-          boundSessions: sessions
-            .summaries()
-            .filter((s) => bridge?.sessionBinding(s.id) === c.channel)
-            .map((s) => s.id),
-        })),
-        lastHeartbeatMs: bridge.lastHeartbeatMs,
-        queueLength: bridge.queueLength,
-        pendingCount: bridge.pendingCount,
+        statusSource: "local",
+        ...leaderPluginState(bridge),
         leader: info,
         defaultSessionId,
         ...(bridge.sessionBinding(defaultSessionId)
@@ -328,18 +402,62 @@ export async function createServer(): Promise<ServerHandle> {
           : {}),
       };
     }
-    // Follower: it does not hold plugin state; report forwarding posture.
-    return {
-      mode: "follower",
+    // Follower: ask the LEADER for real plugin state. It must never invent one.
+    const base = {
+      mode: "follower" as const,
       port: info?.port ?? 0,
-      bridgeAuth: info?.token ? "ok" : "missing",
-      pluginConnected: false,
-      lastHeartbeatMs: -1,
-      queueLength: 0,
-      pendingCount: 0,
+      bridgeAuth: (info?.token ? "ok" : "missing") as "ok" | "missing",
       leader: info,
       defaultSessionId,
     };
+    try {
+      const state = (await coordinator.forward(
+        "__status__",
+        {},
+        defaultSessionId,
+        undefined,
+        STATUS_RPC_TIMEOUT_MS,
+      )) as LeaderPluginState;
+      const boundChannel = state.channels?.find((c) =>
+        c.boundSessions?.includes(defaultSessionId),
+      )?.channel;
+      return {
+        ...base,
+        statusSource: "leader",
+        ...state,
+        ...(boundChannel ? { boundChannel } : {}),
+      };
+    } catch (err) {
+      // __status__ failed. Before giving up, try GET /health — it carries the
+      // same plugin state, needs no token, and exists in EVERY server version,
+      // so a leader too old to know __status__ (mixed-version rollout) still
+      // yields real state instead of a permanent "unknown".
+      const health = info ? await Follower.fetchHealth(info.port, STATUS_RPC_TIMEOUT_MS) : undefined;
+      if (health && typeof health.pluginConnected === "boolean") {
+        return {
+          ...base,
+          statusSource: "leader",
+          pluginConnected: health.pluginConnected,
+          ...(health.plugin ? { plugin: health.plugin } : {}),
+          channels: (health.channels ?? []).map((c) => ({ ...c, boundSessions: [] })),
+          lastHeartbeatMs: health.lastHeartbeatMs ?? null,
+          queueLength: health.queueLength ?? 0,
+          pendingCount: health.pendingCount ?? 0,
+        };
+      }
+      // UNKNOWN — NOT false. Reporting false here (the original bug) made
+      // clients gate on pluginConnected and march users through pointless
+      // plugin restarts while the plugin was connected and writing fine.
+      return {
+        ...base,
+        statusSource: "unknown",
+        statusError: err instanceof Error ? err.message : String(err),
+        pluginConnected: null,
+        lastHeartbeatMs: null,
+        queueLength: 0,
+        pendingCount: 0,
+      };
+    }
   };
 
   const ctx: ToolContext = { runValidated, runWrite, sessions, diagnostics };
@@ -377,6 +495,7 @@ export async function createServer(): Promise<ServerHandle> {
   return {
     server,
     coordinator,
+    diagnostics,
     close: async () => {
       await coordinator.close();
     },

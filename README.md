@@ -64,6 +64,8 @@ Ask your agent to call `figma_status`. A healthy connection looks like:
 
 If `pluginConnected` is `false` or a hint mentions a version mismatch or missing heartbeat, see the troubleshooting table in [`docs/INSTALL.md`](./docs/INSTALL.md).
 
+`pluginConnected` is tri-state: `true`/`false` are **measured**, `null` means **unknown** — a follower process could not query the leader (see `statusSource` and `statusError`). Treat `null` as "no information", not as disconnected: operations may still be forwarding fine, so do not reinstall or restart the plugin on the strength of a `null`.
+
 ## Tools
 
 | Tool | Purpose |

@@ -95,6 +95,28 @@ If the package is published to npm:
 }
 ```
 
+## Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FIGMA_MCP_PORT` | `38470` | Start port for the bridge. The server still walks up to 9 ports from here when the chosen one is busy, and still becomes a follower if a healthy leader already owns one. |
+
+`FIGMA_MCP_PORT` must be an integer in `1024`–`65535`; anything else (a typo, a privileged port) aborts startup with an explicit error rather than silently reverting to the default.
+
+**Keep it inside `38470`–`38479`.** The Figma plugin scans only that window, and `plugin/manifest.json` allowlists only those hosts in its CSP, so a server bound outside the range is unreachable from the plugin no matter what. The server warns on stderr if you do it anyway:
+
+```json
+{
+  "mcpServers": {
+    "reqwise-figma": {
+      "command": "npx",
+      "args": ["-y", "reqwise-figma-mcp"],
+      "env": { "FIGMA_MCP_PORT": "38475" }
+    }
+  }
+}
+```
+
 ## Importing the plugin into Figma Desktop
 
 1. Open Figma Desktop.
@@ -131,12 +153,14 @@ Once the server is registered and the plugin is running, ask your agent to call 
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `figma_status` shows `bridgeAuth: "missing"` | `leader.json` (in `$TMPDIR/reqwise-figma-mcp/`) was not written or is unreadable | Restart the MCP server process. If the problem persists, check filesystem permissions on `$TMPDIR`. |
-| Port conflict / server won't bind `38470` | Another process (or a previous crashed server) holds the port | The server automatically tries `38471`–`38479` and becomes a **follower** if a healthy leader already owns one of those ports; if none respond, restart or free the port manually. `figma_status.port` tells you which port is actually in use. |
+| `figma_status` shows `bridgeAuth: "missing"` | `leader-<port>.json` (in `$TMPDIR/reqwise-figma-mcp/`) was not written or is unreadable | Restart the MCP server process. If the problem persists, check filesystem permissions on `$TMPDIR`. |
+| Port conflict / server won't bind `38470` | Another process (or a previous crashed server) holds the port | The server automatically tries `38471`–`38479` and becomes a **follower** if a healthy leader already owns one of those ports; if none respond, restart or free the port manually. `figma_status.port` tells you which port is actually in use. To pin a specific start port, set `FIGMA_MCP_PORT` (see below). |
+| Server binds a custom `FIGMA_MCP_PORT` but the plugin never connects | The port is outside `38470`–`38479` | The plugin scans only that window, and its `manifest.json` CSP allowlists only those hosts — a port outside it can never be reached. The server warns about this on stderr at startup. Use a port inside the range. |
 | `pluginConnected: false` after opening the plugin | Plugin window was closed, or never finished its handshake | Reopen **Plugins → Development → Reqwise Figma MCP** and keep the window open (it can be minimized but not closed). |
 | `hints` mentions "No heartbeat for Ns" | The Figma window is minimized/backgrounded, or the machine went to sleep, and the ping/pong cadence (10 s) lapsed past the 30 s dead threshold | Bring Figma to the foreground; the plugin reconnects with backoff (0.5 s → 8 s cap) automatically. |
 | `hints` mentions a plugin/server version mismatch | You updated the server (new `PROTOCOL_VERSION`) but the Figma plugin still has the old bundle | Re-import the plugin: **Plugins → Development → Import plugin from manifest…** again, pointing at the freshly built `plugin/manifest.json`, or use **Plugins → Development → Reqwise Figma MCP → Update** if Figma offers it. |
 | Multiple IDE windows, unsure which owns the plugin | Only the **leader** holds the actual plugin WebSocket; followers forward via `/rpc` | Check `figma_status.mode`. Both leader and follower expose the same 5 tools; you don't need to target the leader specifically. |
 | `figma_write` throws `NOT_CONNECTED` | No plugin connected, or the bridge died mid-session | Call `figma_status` first; reopen the plugin if `pluginConnected` is `false`. |
+| `pluginConnected: null` with `"statusSource": "unknown"` | This process is a **follower** and could not query the leader for status (leader busy, restarting, or dead) | Nothing to do with the plugin — do **not** reopen or reinstall it. Just retry; the follower's health monitor takes over leadership if the leader is truly dead. |
 
 For the full error code table (what each `code` means and how to react), see [`TOOLS.md`](./TOOLS.md#error-codes).

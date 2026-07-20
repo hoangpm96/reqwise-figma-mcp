@@ -9,7 +9,7 @@ function ctxWith(
     runValidated: async (op) => impl(op),
     runWrite: async () => ({}),
     sessions: new SessionRegistry(),
-    diagnostics: () => ({}) as Diagnostics,
+    diagnostics: async () => ({}) as Diagnostics,
   };
 }
 

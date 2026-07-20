@@ -25,7 +25,7 @@ export interface ToolContext {
   /** figma_write executor (leader only; followers forward a "write" pseudo-op). */
   runWrite: (code: string, sessionId?: string, channel?: string) => Promise<unknown>;
   sessions: SessionRegistry;
-  diagnostics: () => Diagnostics;
+  diagnostics: () => Promise<Diagnostics>;
 }
 
 export interface ChannelDiagnostics {
@@ -50,7 +50,20 @@ export interface Diagnostics {
   mode: "leader" | "follower";
   port: number;
   bridgeAuth: "ok" | "missing";
-  pluginConnected: boolean;
+  /**
+   * true/false = MEASURED. null = UNKNOWN — we could not reach the leader to
+   * ask, so we do not know. Never collapse null to false: a follower that
+   * reported a momentary "leader unreachable" as pluginConnected:false sent
+   * users off to restart a plugin that was running fine the whole time.
+   */
+  pluginConnected: boolean | null;
+  /**
+   * Where the plugin state came from: this process's own bridge ("local"),
+   * the leader answering /rpc ("leader"), or nowhere ("unknown").
+   */
+  statusSource: "local" | "leader" | "unknown";
+  /** Why statusSource is "unknown" (follower could not query the leader). */
+  statusError?: string;
   plugin?: {
     version: string;
     protocolVersion: number;
@@ -58,9 +71,10 @@ export interface Diagnostics {
     pageName: string;
     editorType: string;
   };
-  /** One entry per connected Figma window (leader only). */
+  /** One entry per connected Figma window. undefined when unknown. */
   channels?: ChannelDiagnostics[];
-  lastHeartbeatMs: number;
+  /** -1 = no heartbeat yet; null = unknown (leader unreachable). */
+  lastHeartbeatMs: number | null;
   queueLength: number;
   pendingCount: number;
   leader?: LeaderInfo | undefined;
@@ -73,12 +87,15 @@ export interface Diagnostics {
 // ---- figma_status ----
 
 export async function handleStatus(ctx: ToolContext): Promise<Record<string, unknown>> {
-  const d = ctx.diagnostics();
+  const d = await ctx.diagnostics();
   const apiVersionMatch = d.plugin ? d.plugin.protocolVersion === PROTOCOL_VERSION : null;
   const hints = buildHints(d, apiVersionMatch);
 
   return {
+    // null (not false) when we could not measure — see Diagnostics.pluginConnected.
     pluginConnected: d.pluginConnected,
+    statusSource: d.statusSource,
+    ...(d.statusError ? { statusError: d.statusError } : {}),
     mode: d.mode,
     port: d.port,
     serverVersion: VERSION,
@@ -93,14 +110,18 @@ export async function handleStatus(ctx: ToolContext): Promise<Record<string, unk
           editorType: d.plugin.editorType,
         }
       : null,
-    channels: (d.channels ?? []).map((c) => ({
-      channel: c.channel,
-      fileName: c.plugin.fileName,
-      pageName: c.plugin.pageName,
-      queueLength: c.queueLength,
-      lastHeartbeatMs: c.lastHeartbeatMs,
-      ...(c.boundSessions?.length ? { boundSessions: c.boundSessions } : {}),
-    })),
+    // null, not [], when unknown — an empty array reads as "measured: none".
+    channels:
+      d.channels === undefined
+        ? null
+        : d.channels.map((c) => ({
+            channel: c.channel,
+            fileName: c.plugin.fileName,
+            pageName: c.plugin.pageName,
+            queueLength: c.queueLength,
+            lastHeartbeatMs: c.lastHeartbeatMs,
+            ...(c.boundSessions?.length ? { boundSessions: c.boundSessions } : {}),
+          })),
     lastHeartbeatMs: d.lastHeartbeatMs,
     queueLength: d.queueLength,
     pendingCount: d.pendingCount,
@@ -117,15 +138,25 @@ function buildHints(d: Diagnostics, apiVersionMatch: boolean | null): string[] {
 
   if (d.mode === "follower") {
     hints.push(
-      "This process is a FOLLOWER; operations forward to the leader over /rpc. This is normal with multiple IDE windows.",
+      "This process is a FOLLOWER; operations forward to the leader over /rpc. This is normal with multiple IDE windows." +
+        (d.statusSource === "leader" ? " Plugin state below was read from the leader and is live." : ""),
     );
   }
   if (d.bridgeAuth === "missing") {
     hints.push(
-      "Bridge auth token is missing — leader.json was not written or is unreadable. Restart the server.",
+      "Bridge auth token is missing — the discovery file (leader-<port>.json) was not written or is unreadable. Restart the server.",
     );
   }
-  if (!d.pluginConnected) {
+  if (d.pluginConnected === null) {
+    // UNKNOWN, not disconnected. Telling the user to restart a plugin we never
+    // managed to ask about is exactly the wasted-turns bug this branch exists
+    // to prevent — say what we could not do, and let ops speak for themselves.
+    hints.push(
+      `Plugin connection is UNKNOWN — this follower could not query the leader for status${
+        d.statusError ? ` (${d.statusError})` : ""
+      }. This does NOT mean the plugin is disconnected; do not ask the user to restart it on this basis. Ops still forward to the leader — try figma_read {op:"list_channels"}, and only if that fails treat the bridge as down.`,
+    );
+  } else if (!d.pluginConnected) {
     hints.push(
       "No Figma plugin connected. Open Figma Desktop → Plugins → Reqwise, and keep the plugin window open.",
     );
@@ -145,7 +176,7 @@ function buildHints(d: Diagnostics, apiVersionMatch: boolean | null): string[] {
         `Plugin protocol v${d.plugin?.protocolVersion} ≠ server v${PROTOCOL_VERSION} — reinstall the plugin from plugin/manifest.json.`,
       );
     }
-    if (d.lastHeartbeatMs >= 0 && d.lastHeartbeatMs > HEARTBEAT_DEAD_MS) {
+    if (d.lastHeartbeatMs !== null && d.lastHeartbeatMs >= 0 && d.lastHeartbeatMs > HEARTBEAT_DEAD_MS) {
       hints.push(
         `No heartbeat for ${Math.round(d.lastHeartbeatMs / 1000)}s — the Figma window may be minimized or the machine asleep.`,
       );

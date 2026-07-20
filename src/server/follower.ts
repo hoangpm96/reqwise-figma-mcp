@@ -9,15 +9,52 @@
  */
 import { request as httpRequest } from "node:http";
 import type { LeaderInfo } from "../shared/protocol.js";
+import type { ChannelSummary } from "./bridge.js";
 import { ErrorCode, OpError, toBridgeError } from "./errors.js";
 
 const RPC_TIMEOUT_MS = 130_000; // > VM_TIMEOUT_MS so the leader owns the timeout
+/**
+ * Diagnostic calls (__status__) read leader-local state and never touch the
+ * plugin, so they must not inherit the drawing-op timeout — a figma_status that
+ * blocks for 130s is worse than one that reports "unknown" in 2s.
+ */
+export const STATUS_RPC_TIMEOUT_MS = 2_000;
+
+/** The leader's GET /health body. Every field is optional — an older leader
+ * may not send all of them, and a missing field means UNKNOWN, not false. */
+export interface HealthPayload {
+  ok?: boolean;
+  port?: number;
+  pluginConnected?: boolean;
+  plugin?: {
+    version: string;
+    protocolVersion: number;
+    fileName: string;
+    pageName: string;
+    editorType: string;
+  } | null;
+  channels?: ChannelSummary[];
+  lastHeartbeatMs?: number;
+  queueLength?: number;
+  pendingCount?: number;
+}
 
 export class Follower {
   constructor(public readonly info: LeaderInfo) {}
 
   /** GET /health — resolves true iff the leader answers with ok:true. */
-  static checkHealth(port: number, timeoutMs = 1500): Promise<boolean> {
+  static async checkHealth(port: number, timeoutMs = 1500): Promise<boolean> {
+    const payload = await Follower.fetchHealth(port, timeoutMs);
+    return payload?.ok === true;
+  }
+
+  /**
+   * GET /health — the leader's full status payload, or undefined if it could
+   * not be read. Unauthenticated and present in EVERY server version, so it is
+   * the compatibility fallback when a leader is too old to know __status__
+   * (mixed-version rollout: new follower, old leader still running).
+   */
+  static fetchHealth(port: number, timeoutMs = 1500): Promise<HealthPayload | undefined> {
     return new Promise((resolve) => {
       const req = httpRequest(
         { host: "127.0.0.1", port, path: "/health", method: "GET", timeout: timeoutMs },
@@ -27,25 +64,30 @@ export class Follower {
           res.on("data", (c) => (data += c));
           res.on("end", () => {
             try {
-              const json = JSON.parse(data) as { ok?: boolean };
-              resolve(json.ok === true);
+              resolve(JSON.parse(data) as HealthPayload);
             } catch {
-              resolve(false);
+              resolve(undefined);
             }
           });
         },
       );
-      req.on("error", () => resolve(false));
+      req.on("error", () => resolve(undefined));
       req.on("timeout", () => {
         req.destroy();
-        resolve(false);
+        resolve(undefined);
       });
       req.end();
     });
   }
 
   /** Forward one op to the leader. Throws OpError on transport/leader error. */
-  forward(op: string, params: Record<string, unknown>, sessionId?: string, channel?: string): Promise<unknown> {
+  forward(
+    op: string,
+    params: Record<string, unknown>,
+    sessionId?: string,
+    channel?: string,
+    timeoutMs: number = RPC_TIMEOUT_MS,
+  ): Promise<unknown> {
     const body = JSON.stringify({
       op,
       params,
@@ -59,7 +101,7 @@ export class Follower {
           port: this.info.port,
           path: "/rpc",
           method: "POST",
-          timeout: RPC_TIMEOUT_MS,
+          timeout: timeoutMs,
           headers: {
             "content-type": "application/json",
             "content-length": Buffer.byteLength(body),
@@ -76,7 +118,10 @@ export class Follower {
                 new OpError(
                   ErrorCode.UNAUTHORIZED,
                   "Leader rejected the bridge token (401).",
-                  "The leader restarted with a new token — restart this follower to re-read leader.json.",
+                  // The coordinator auto-refreshes from the discovery file on
+                  // 401 — reaching the user means that refresh found no newer
+                  // token, so a restart is genuinely the next step.
+                  "The leader restarted with a new token and no fresh discovery file was found — restart this MCP process to re-elect.",
                 ),
               );
               return;

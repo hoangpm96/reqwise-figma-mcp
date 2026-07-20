@@ -41,7 +41,9 @@ Returns rich diagnostics — never a bare boolean:
 
 ```jsonc
 {
-  "pluginConnected": true,
+  "pluginConnected": true,        // true | false = measured; null = UNKNOWN (see statusSource)
+  "statusSource": "local",        // "local" (own bridge) | "leader" (read over /rpc) | "unknown"
+  "statusError": "…",             // only when statusSource === "unknown": why the leader query failed
   "mode": "leader",              // "leader" | "follower"
   "port": 38470,
   "serverVersion": "0.1.0",
@@ -355,7 +357,7 @@ Every failure — from a tool call, a `figma.*` proxy call, or a bridge/plugin e
 
 | Code | Meaning | Typical fix | Retryable? |
 |---|---|---|---|
-| `NOT_CONNECTED` | No plugin connected, or the bridge is unavailable on this process. | Call `figma_status`; open the Figma plugin if `pluginConnected` is `false`; restart the server if it persists. | ✅ Yes |
+| `NOT_CONNECTED` | No plugin connected, or the bridge is unavailable on this process. | Call `figma_status`; open the Figma plugin if `pluginConnected` is `false`. If it is `null` (unknown — a follower could not reach the leader) the plugin may well be fine: retry the operation rather than restarting the plugin. Restart the server if it persists. | ✅ Yes |
 | `NODE_NOT_FOUND` | A referenced `nodeId` (or icon name) doesn't exist. | Re-fetch via `get_selection`/`get_node`, or re-run `searchIcons` / try a different `library`. | ❌ No |
 | `FONT_UNAVAILABLE` | Requested font family isn't installed/available. | The response also reports `{ requestedFont, resolvedFont, reason }` — the plugin already fell back (requested → Inter → system); use `get_fonts` to check availability up front if it matters. | ❌ No (already fell back) |
 | `INVALID_PARAMS` | Params failed validation (wrong shape, missing required field, empty `nodeId`, etc). | Fix the shape per `figma_docs(section: "api")` or the message's `path`. | ❌ No |
@@ -363,7 +365,7 @@ Every failure — from a tool call, a `figma.*` proxy call, or a bridge/plugin e
 | `QUEUE_FULL` | Too many pending operations queued to the plugin. | Batch related ops with `figma.batch()` instead of firing many individual calls; wait and retry. | ✅ Yes |
 | `PAGE_LIMIT` | `createPage` hit the file's page-count limit. | Handled gracefully already — `createPage` returns `{ fallback: "current-page", reason }` instead of throwing; use the current page. | ❌ No (graceful fallback) |
 | `COMPONENT_IN_USE` | A component/component-set operation conflicts with existing instances. | Inspect via `get_components`/`get_selection` before retrying the mutation. | ⚠️ Maybe |
-| `UNAUTHORIZED` | A follower's `/rpc` request lacked a valid bridge auth token. | Restart the server so a fresh `leader.json` token is written; don't hand-edit that file. | ✅ Yes (after restart) |
+| `UNAUTHORIZED` | A follower's `/rpc` request lacked a valid bridge auth token (auto-refresh from `leader-<port>.json` already failed). | Restart the server so a fresh `leader-<port>.json` token is written; don't hand-edit that file. | ✅ Yes (after restart) |
 | `SANDBOX_ERROR` | The `figma_write` code threw inside the `vm` sandbox (syntax error, runtime exception, or hit a banned global). | Read the message; check for `require`/`process`/`fetch`/`setTimeout`/`eval` usage — those are banned; everything else in modern JS is fine. | ❌ No |
 | `UNSUPPORTED_OPERATION` | An unknown `op` name was passed to `figma_read` or inside a `batch` item. | Check spelling against the operation tables above; `figma_docs(section: "api")` lists the full surface. | ❌ No |
 | `INTERNAL` | Unclassified server-side error. | Treat as a bug; the `message` carries the underlying detail. | ⚠️ Maybe |
