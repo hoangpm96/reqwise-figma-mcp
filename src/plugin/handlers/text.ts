@@ -5,6 +5,49 @@ import { serializeNode } from "../serialize.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
 
+const H_ALIGNS = ["LEFT", "CENTER", "RIGHT", "JUSTIFIED"] as const;
+const V_ALIGNS = ["TOP", "CENTER", "BOTTOM"] as const;
+
+/**
+ * Apply text-alignment props to a TEXT node. `textAlignHorizontal` sets how the
+ * CONTENT aligns inside the node's own box (Figma's real API), which is what an
+ * agent means by "center the text" — distinct from `align`, which positions the
+ * whole NODE within its parent. Values are validated and normalized (case-
+ * insensitive) so a bad enum throws INVALID_PARAMS with a hint instead of being
+ * silently dropped (the old behavior: no-op, response still {ok:true}). Shared
+ * by both create() and modify() so the two stay in sync.
+ */
+export function applyTextAlign(
+  node: TextNode,
+  p: Record<string, unknown>,
+): void {
+  if (p.textAlignHorizontal !== undefined) {
+    const v = normalizeAlign(p.textAlignHorizontal, H_ALIGNS, "textAlignHorizontal");
+    node.textAlignHorizontal = v;
+  }
+  if (p.textAlignVertical !== undefined) {
+    const v = normalizeAlign(p.textAlignVertical, V_ALIGNS, "textAlignVertical");
+    node.textAlignVertical = v;
+  }
+}
+
+function normalizeAlign<T extends string>(
+  raw: unknown,
+  allowed: readonly T[],
+  field: string,
+): T {
+  const up = typeof raw === "string" ? raw.toUpperCase() : "";
+  const match = allowed.find((a) => a === up);
+  if (!match) {
+    throw err(
+      ErrorCode.INVALID_PARAMS,
+      `Invalid ${field} value ${JSON.stringify(raw)}.`,
+      `Use one of: ${allowed.join(", ")}.`,
+    );
+  }
+  return match;
+}
+
 /**
  * set_text: mixed-font-safe. When the target's fontName is figma.mixed, EVERY
  * font used across the node's ranges is loaded before characters are set —

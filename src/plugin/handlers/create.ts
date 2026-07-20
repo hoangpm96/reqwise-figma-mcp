@@ -4,6 +4,7 @@ import { resolveParent, insertInto } from "../insert.js";
 import { toPaints, toEffects } from "../paints.js";
 import { loadFontWithFallback, DEFAULT_FONT } from "../fonts.js";
 import { serializeNode } from "../serialize.js";
+import { applyTextAlign } from "./text.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
 import {
@@ -184,6 +185,10 @@ async function applyText(
   if (typeof p.fontSize === "number") node.fontSize = p.fontSize;
   if (typeof p.characters === "string") node.characters = p.characters;
   else if (typeof p.text === "string") node.characters = p.text;
+
+  // Content alignment inside the text box (textAlignHorizontal/Vertical). This
+  // is what "center the text" means; `align` positions the whole node instead.
+  applyTextAlign(node, p);
 
   if (p.wrap === true) {
     node.textAutoResize = "HEIGHT";

@@ -205,6 +205,10 @@ await figma.create({
   type: "TEXT", parentId: screen.id, characters: "Welcome back",
   fontSize: 26, fontName: { family: "Inter", style: "Bold" },
   fills: [{ type: "SOLID", color: "#111827" }],
+  // To CENTER a title/link/label, set textAlignHorizontal (aligns the glyphs in
+  // the text box) AND give the box a width via layoutAlign:"STRETCH". Do NOT use
+  // \`align\` for this — \`align\` moves the whole node, not its text content.
+  layoutAlign: "STRETCH", textAlignHorizontal: "CENTER",
 });
 await figma.create({
   type: "TEXT", parentId: screen.id, characters: "Sign in to continue", wrap: true,
