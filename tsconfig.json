@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "declaration": false,
+    "noEmit": true,
+    "lib": ["ES2022"]
+  },
+  "include": ["src/server/**/*", "src/shared/**/*", "tests/**/*", "scripts/**/*"],
+  // Anything under tests/plugin/** imports real plugin modules, which carry
+  // `/// <reference types="@figma/plugin-typings" />`. Pulling those into the
+  // server program redefines the global setTimeout/setInterval as DOM (number)
+  // instead of Node (Timeout), silently breaking bridge.ts/leader.ts timer
+  // typing. So exclude the whole tests/plugin tree here; it typechecks in
+  // tsconfig.plugin.json instead, where the Figma DOM-flavored globals belong.
+  "exclude": ["node_modules", "dist", "tests/plugin"]
+}

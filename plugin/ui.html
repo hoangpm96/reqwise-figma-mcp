@@ -1,0 +1,704 @@
+<!--
+  Reqwise Figma MCP — plugin UI iframe.
+  Self-contained: WebSocket client + heartbeat + auto-reconnect + status UI.
+  Relays request/response WireMessages between the WS bridge and the Figma
+  main thread (code.js) via postMessage.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --panel: #f7f7fa;
+    --fg: #1b1b1f;
+    --muted: #6b6b73;
+    --line: #e4e4e8;
+    --ok: #1a9d54;
+    --warn: #d98a00;
+    --bad: #d13438;
+    --chip: #f2f2f4;
+    --accent-a: #6d5bd0;
+    --accent-b: #4f8ef7;
+    --log-bg: #f2f2f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1e1e22;
+      --panel: #17171b;
+      --fg: #ececf0;
+      --muted: #9a9aa2;
+      --line: #34343a;
+      --ok: #35c377;
+      --warn: #e0a838;
+      --bad: #f16a6e;
+      --chip: #2a2a30;
+      --accent-a: #8b7bf0;
+      --accent-b: #6ea8ff;
+      --log-bg: #131316;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    font: 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  .wrap { padding: 14px; display: flex; flex-direction: column; gap: 12px; height: 100%; }
+
+  .header { display: flex; align-items: center; gap: 10px; }
+  .logo {
+    width: 28px; height: 28px; border-radius: 8px; flex: 0 0 auto;
+    display: block; object-fit: contain;
+  }
+  .header-text { display: flex; flex-direction: column; min-width: 0; }
+  .title { font-weight: 600; font-size: 13px; }
+  .subtitle { color: var(--muted); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .status-row {
+    display: flex; align-items: center; gap: 8px;
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 10px; background: var(--panel);
+  }
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--muted); flex: 0 0 auto;
+    box-shadow: 0 0 0 3px transparent;
+    transition: background .2s, box-shadow .2s;
+  }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(53,195,119,.18); }
+  .dot.connecting { background: var(--warn); box-shadow: 0 0 0 3px rgba(224,168,56,.18); }
+  .dot.bad { background: var(--bad); box-shadow: 0 0 0 3px rgba(209,52,56,.18); }
+  .status { flex: 1; min-width: 0; }
+  .meta { color: var(--muted); font-size: 10.5px; }
+  .port-chip {
+    display: inline-block; padding: 1px 7px; border-radius: 999px;
+    background: var(--chip); color: var(--fg); font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stat-card {
+    border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+    padding: 8px 6px; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  }
+  .stat-num { font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .stat-num.writes { color: var(--accent-a); }
+  .stat-num.reads { color: var(--accent-b); }
+  .stat-num.errors { color: var(--bad); }
+  .stat-label { color: var(--muted); font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase; }
+
+  .section-label { color: var(--muted); font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase; }
+
+  .channel-row {
+    display: flex; align-items: center; gap: 8px;
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 10px; background: var(--panel);
+  }
+  .channel-chip {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+    color: #fff; font-size: 11px; font-weight: 600; cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px;
+  }
+  .channel-chip:hover { filter: brightness(1.1); }
+  .channel-label { color: var(--muted); font-size: 10.5px; flex: 1; }
+  button.mini {
+    flex: 0 0 auto; padding: 3px 8px; font-size: 10.5px; border-radius: 6px;
+  }
+  .channel-editor { display: none; gap: 6px; align-items: center; }
+  .channel-editor.open { display: flex; }
+  .channel-editor input {
+    flex: 1; min-width: 0; font: inherit; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 8px;
+  }
+
+  .agents {
+    border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+    max-height: 150px; overflow-y: auto; padding: 4px 6px;
+  }
+  .agents-empty { color: var(--muted); font-size: 11px; padding: 6px 2px; }
+  .agent-row {
+    display: flex; align-items: center; gap: 7px; padding: 5px 2px;
+    border-bottom: 1px solid var(--line); font-size: 11px;
+  }
+  .agent-row:last-child { border-bottom: none; }
+  .agent-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .agent-meta { color: var(--muted); font-size: 10px; flex: 0 0 auto; }
+  .agent-state-here { color: var(--ok); font-size: 10px; flex: 0 0 auto; font-weight: 600; }
+  .agent-state-other { color: var(--warn); font-size: 10px; flex: 0 0 auto; }
+
+  .activity {
+    flex: 1; min-height: 90px; max-height: 200px; overflow-y: auto;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--log-bg);
+    padding: 6px 8px;
+  }
+  .activity-empty { color: var(--muted); font-size: 11px; padding: 6px 2px; }
+  .log-row {
+    display: flex; align-items: baseline; gap: 6px; padding: 3px 0;
+    border-bottom: 1px solid var(--line); font-size: 11px;
+  }
+  .log-row:last-child { border-bottom: none; }
+  .log-kind {
+    flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; margin-top: 4px;
+  }
+  .log-kind.write { background: var(--accent-a); }
+  .log-kind.read { background: var(--accent-b); }
+  .log-kind.error { background: var(--bad); }
+  .log-op { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-time { color: var(--muted); font-size: 10px; flex: 0 0 auto; }
+
+  .actions { display: flex; gap: 8px; }
+  button {
+    font: inherit; border: 1px solid var(--line); background: var(--chip);
+    color: var(--fg); border-radius: 7px; padding: 6px 10px; cursor: pointer;
+    flex: 1;
+  }
+  button:hover { border-color: var(--muted); }
+  button.primary {
+    border: none; color: #fff;
+    background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+  }
+  button.primary:hover { filter: brightness(1.08); }
+
+  .foot { color: var(--muted); font-size: 9.5px; text-align: center; }
+</style>
+
+<div class="wrap">
+  <div class="header">
+    <img class="logo" alt="Reqwise" src="data:image/png;base64,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">
+    <div class="header-text">
+      <span class="title">Reqwise Figma MCP</span>
+      <span class="subtitle" id="file">AI-powered design bridge</span>
+    </div>
+  </div>
+
+  <div class="status-row">
+    <span id="dot" class="dot connecting"></span>
+    <span class="status" id="status">Connecting…</span>
+    <span class="port-chip" id="port">—</span>
+  </div>
+
+  <div class="channel-row">
+    <span class="channel-label">Channel</span>
+    <span class="channel-chip" id="channel-chip" title="Click to copy">—</span>
+    <button class="mini" id="channel-edit">Change</button>
+  </div>
+  <div class="channel-editor" id="channel-editor">
+    <input id="channel-input" placeholder="channel name (a-z 0-9 - _ .)" maxlength="64">
+    <button class="mini primary" id="channel-join">Join</button>
+    <button class="mini" id="channel-cancel">✕</button>
+  </div>
+
+  <div class="section-label" title="Each row is one Claude Code / Codex instance. Connect routes its commands to this window.">AI sessions (<span id="agent-count">0</span>)</div>
+  <div class="agents" id="agents">
+    <div class="agents-empty" id="agents-empty">No AI sessions yet.</div>
+  </div>
+
+  <div class="stats">
+    <div class="stat-card">
+      <span class="stat-num writes" id="stat-writes">0</span>
+      <span class="stat-label">Writes</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-num reads" id="stat-reads">0</span>
+      <span class="stat-label">Reads</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-num errors" id="stat-errors">0</span>
+      <span class="stat-label">Errors</span>
+    </div>
+  </div>
+
+  <div class="section-label">Activity</div>
+  <div class="activity" id="activity">
+    <div class="activity-empty" id="activity-empty">No activity yet.</div>
+  </div>
+
+  <div class="actions">
+    <button id="clear">Clear</button>
+    <button id="autodetect">Auto-detect</button>
+    <button id="retry" class="primary">Reconnect</button>
+  </div>
+
+  <div class="foot" id="foot">Connects to the local Reqwise bridge (localhost:38470 +9).</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- constants mirrored from src/shared/protocol.ts ----
+  var DEFAULT_PORT = 38470;
+  var PORT_RANGE = 10;
+  var HEARTBEAT_INTERVAL_MS = 5000;
+  // One missed ping round + slack. At 30s the plugin sat "Connected" on a dead
+  // socket for half a minute while the server showed no plugin — 12s bounds
+  // the lie window to about one failed exchange.
+  var HEARTBEAT_DEAD_MS = 12000;
+  var BACKOFF_MIN = 500;
+  var BACKOFF_MAX = 8000;
+  // After LOSING an established connection, retry the SAME port this many
+  // times before walking the range: a restarted/taken-over leader almost
+  // always rebinds the same port, and walking first meant a full lap of dead
+  // ports (tens of seconds) before coming back to it.
+  var SAME_PORT_RETRIES = 3;
+  var MAX_LOG_ROWS = 100;
+
+  // Mirrored from src/shared/protocol.ts WRITE_OPERATIONS — used to classify
+  // activity rows as write/read since BridgeResponse itself carries no kind.
+  var WRITE_OPS = {
+    create: 1, modify: 1, delete: 1, clone: 1, move: 1, resize: 1, group: 1,
+    ungroup: 1, flatten: 1, batch: 1, find_component: 1,
+    find_or_create_component: 1, instantiate: 1, create_variants: 1,
+    setup_tokens: 1, apply_variable: 1, set_text: 1, load_icon: 1,
+    load_image: 1, create_page: 1, create_overlay: 1, set_selection: 1,
+    zoom_to_fit: 1, get_instance_overrides: 1, set_instance_overrides: 1,
+    set_selection_colors: 1, set_gradient: 1, set_effects: 1
+  };
+
+  // ---- state ----
+  var ws = null;
+  var portIndex = 0;               // which port in the fallback range we are trying
+  var samePortLeft = 0;            // same-port retries left before walking the range
+  var backoff = BACKOFF_MIN;
+  var reconnectTimer = null;
+  var heartbeatTimer = null;
+  var lastHeartbeatAt = 0;
+  var connectedPort = null;
+  var handshake = null;            // {pluginVersion, protocolVersion}
+  var hello = null;                // hello data relayed from main thread
+  var attemptCount = 0;
+  var counts = { writes: 0, reads: 0, errors: 0 };
+  var channel = null;              // desired/joined channel; null → server assigns
+  var channelsUpdate = null;       // latest {self, channels, sessions} push
+  var replacedByPeer = false;      // this window's channel was taken elsewhere
+
+  // ---- DOM ----
+  var el = {
+    dot: document.getElementById("dot"),
+    status: document.getElementById("status"),
+    port: document.getElementById("port"),
+    file: document.getElementById("file"),
+    retry: document.getElementById("retry"),
+    clear: document.getElementById("clear"),
+    autodetect: document.getElementById("autodetect"),
+    activity: document.getElementById("activity"),
+    activityEmpty: document.getElementById("activity-empty"),
+    statWrites: document.getElementById("stat-writes"),
+    statReads: document.getElementById("stat-reads"),
+    statErrors: document.getElementById("stat-errors"),
+    foot: document.getElementById("foot"),
+    channelChip: document.getElementById("channel-chip"),
+    channelEdit: document.getElementById("channel-edit"),
+    channelEditor: document.getElementById("channel-editor"),
+    channelInput: document.getElementById("channel-input"),
+    channelJoin: document.getElementById("channel-join"),
+    channelCancel: document.getElementById("channel-cancel"),
+    agents: document.getElementById("agents"),
+    agentsEmpty: document.getElementById("agents-empty"),
+    agentCount: document.getElementById("agent-count"),
+  };
+
+  function setState(kind, text) {
+    el.dot.className = "dot " + kind;
+    el.status.textContent = text;
+  }
+
+  function renderMeta() {
+    el.port.textContent = connectedPort != null ? (":" + connectedPort) : "—";
+    if (hello) {
+      el.file.textContent = (hello.fileName || "?") + " · " + (hello.pageName || "");
+    }
+    el.channelChip.textContent = channel || "—";
+    el.channelChip.title = channel ? "Click to copy \"" + channel + "\"" : "Waiting for the server to assign a channel";
+  }
+
+  function humanAge(ms) {
+    if (ms < 0 || ms == null) return "";
+    if (ms < 60000) return Math.max(1, Math.round(ms / 1000)) + "s ago";
+    if (ms < 3600000) return Math.round(ms / 60000) + "m ago";
+    return Math.round(ms / 3600000) + "h ago";
+  }
+
+  // Render the agent-session picker from the latest server push. Each row is
+  // one AI agent (Claude Code / Codex session). Picking one binds it to THIS
+  // window's channel on the server, so that agent's commands route here.
+  function renderAgents() {
+    var sessions = (channelsUpdate && channelsUpdate.sessions) || [];
+    el.agentCount.textContent = String(sessions.length);
+    el.agents.innerHTML = "";
+    if (sessions.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "agents-empty";
+      empty.textContent = "No AI sessions yet.";
+      el.agents.appendChild(empty);
+      return;
+    }
+    var self = channelsUpdate.self;
+    // Users think in files/pages, not channel codenames: label a session's
+    // paired window by its fileName · pageName (channel in the tooltip).
+    function windowLabel(ch) {
+      var wins = channelsUpdate.channels || [];
+      for (var i = 0; i < wins.length; i++) {
+        if (wins[i].channel === ch) {
+          var f = wins[i].fileName || ch;
+          return wins[i].pageName ? f + " · " + wins[i].pageName : f;
+        }
+      }
+      return ch;
+    }
+    sessions.forEach(function (s) {
+      var row = document.createElement("div");
+      row.className = "agent-row";
+
+      var id = document.createElement("span");
+      id.className = "agent-id";
+      id.textContent = s.id;
+      id.title = s.id;
+      row.appendChild(id);
+
+      var meta = document.createElement("span");
+      meta.className = "agent-meta";
+      meta.textContent = s.writeCount + "w · " + humanAge(s.lastUsedMs);
+      row.appendChild(meta);
+
+      var windowCount = (channelsUpdate.channels || []).length;
+      if (s.boundChannel === self) {
+        var here = document.createElement("span");
+        here.className = "agent-state-here";
+        here.textContent = "✓ here";
+        here.title = "Pinned to this window";
+        row.appendChild(here);
+      } else if (!s.boundChannel && windowCount <= 1) {
+        // Single window: everything routes here anyway — no button needed.
+        var auto = document.createElement("span");
+        auto.className = "agent-meta";
+        auto.textContent = "auto";
+        auto.title = "Only window open — commands route here automatically";
+        row.appendChild(auto);
+      } else {
+        if (s.boundChannel) {
+          var other = document.createElement("span");
+          other.className = "agent-state-other";
+          other.textContent = "→ " + windowLabel(s.boundChannel);
+          other.title = "Paired with channel " + s.boundChannel;
+          row.appendChild(other);
+        }
+        var btn = document.createElement("button");
+        btn.className = "mini primary";
+        btn.textContent = s.boundChannel ? "Move here" : "Connect";
+        btn.onclick = function () {
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: "bind", sessionId: s.id }));
+          }
+        };
+        row.appendChild(btn);
+      }
+      el.agents.appendChild(row);
+    });
+  }
+
+  function renderStats() {
+    el.statWrites.textContent = String(counts.writes);
+    el.statReads.textContent = String(counts.reads);
+    el.statErrors.textContent = String(counts.errors);
+  }
+
+  function logActivity(op, ok, isWrite) {
+    if (el.activityEmpty) { el.activityEmpty.remove(); el.activityEmpty = null; }
+    var row = document.createElement("div");
+    row.className = "log-row";
+    var kindClass = !ok ? "error" : (isWrite ? "write" : "read");
+    var time = new Date().toLocaleTimeString();
+    row.innerHTML =
+      '<span class="log-kind ' + kindClass + '"></span>' +
+      '<span class="log-op">' + escapeHtml(op) + (ok ? "" : " — failed") + '</span>' +
+      '<span class="log-time">' + escapeHtml(time) + '</span>';
+    el.activity.insertBefore(row, el.activity.firstChild);
+    while (el.activity.children.length > MAX_LOG_ROWS) {
+      el.activity.removeChild(el.activity.lastChild);
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function clearActivity() {
+    counts = { writes: 0, reads: 0, errors: 0 };
+    renderStats();
+    el.activity.innerHTML = "";
+    var empty = document.createElement("div");
+    empty.className = "activity-empty";
+    empty.id = "activity-empty";
+    empty.textContent = "No activity yet.";
+    el.activity.appendChild(empty);
+    el.activityEmpty = empty;
+  }
+
+  setInterval(renderMeta, 1000);
+
+  // ---- talk to the Figma main thread ----
+  function toMain(msg) {
+    parent.postMessage({ pluginMessage: msg }, "*");
+  }
+
+  // Ask the main thread for handshake + hello on load.
+  toMain({ kind: "handshake" });
+
+  window.onmessage = function (event) {
+    var msg = event.data && event.data.pluginMessage;
+    if (!msg || typeof msg !== "object") return;
+    switch (msg.kind) {
+      case "handshake":
+        handshake = { pluginVersion: msg.pluginVersion, protocolVersion: msg.protocolVersion };
+        break;
+      case "hello":
+        hello = msg.hello;
+        // Restore this file's persisted channel (main thread owns storage).
+        if (hello.channel && !channel) channel = hello.channel;
+        renderMeta();
+        // If already connected, (re)send hello so the server has fresh file info.
+        if (ws && ws.readyState === 1) sendHello();
+        break;
+      case "response":
+      case "progress": {
+        // Relay main-thread → server over the WS.
+        if (ws && ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: "response", payload: msg.payload }));
+        }
+        if (msg.kind === "response") {
+          var ok = !!(msg.payload && msg.payload.ok);
+          var isWrite = !!WRITE_OPS[msg.op];
+          if (!ok) counts.errors++;
+          else if (isWrite) counts.writes++;
+          else counts.reads++;
+          renderStats();
+          logActivity(msg.op || "unknown", ok, isWrite);
+        }
+        break;
+      }
+    }
+  };
+
+  // ---- WebSocket lifecycle ----
+  function currentPort() {
+    return DEFAULT_PORT + (portIndex % PORT_RANGE);
+  }
+
+  function connect() {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    attemptCount++;
+    var port = currentPort();
+    setState("connecting", "Connecting to :" + port + "…");
+    renderMeta();
+
+    var url = "ws://localhost:" + port + "/ws";
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      scheduleReconnect(true);
+      return;
+    }
+
+    ws.onopen = function () {
+      connectedPort = port;
+      backoff = BACKOFF_MIN;
+      attemptCount = 0;
+      // This port is known-good: if the connection drops later, retry it
+      // first instead of immediately walking the range.
+      samePortLeft = SAME_PORT_RETRIES;
+      // Seed contact time so the staleness watchdog has a baseline from t=0.
+      lastHeartbeatAt = Date.now();
+      setState("ok", "Connected");
+      sendHello();
+      startHeartbeat();
+      renderMeta();
+    };
+
+    ws.onmessage = function (event) {
+      var data;
+      try { data = JSON.parse(event.data); } catch (e) { return; }
+      if (!data || typeof data !== "object") return;
+
+      if (data.type === "ping") {
+        lastHeartbeatAt = Date.now();
+        ws.send(JSON.stringify({ type: "pong", at: Date.now() }));
+        return;
+      }
+      if (data.type === "pong") {
+        lastHeartbeatAt = Date.now();
+        return;
+      }
+      if (data.type === "request" && data.payload) {
+        // Relay server → main thread.
+        toMain({ kind: "request", payload: data.payload });
+        return;
+      }
+      if (data.type === "assigned" && data.channel) {
+        // The server confirmed/assigned this window's channel. Persist it so
+        // reopening the plugin in this file rejoins the same channel.
+        channel = data.channel;
+        replacedByPeer = false;
+        toMain({ kind: "save-channel", channel: channel });
+        renderMeta();
+        return;
+      }
+      if (data.type === "channels") {
+        channelsUpdate = data;
+        renderAgents();
+        return;
+      }
+    };
+
+    ws.onerror = function () {
+      // onclose will handle reconnect.
+    };
+
+    ws.onclose = function (event) {
+      stopHeartbeat();
+      ws = null;
+      connectedPort = null;
+      // Our channel was deliberately taken by another window ("Join" there or
+      // a reload). Do NOT rejoin the same channel — that would steal it back
+      // in an endless tug-of-war. Reconnect fresh and let the server assign a
+      // new one.
+      if (event && event.reason === "replaced") {
+        replacedByPeer = true;
+        channel = null;
+        toMain({ kind: "save-channel", channel: null });
+        setState("connecting", "Channel moved to another window — rejoining…");
+      } else {
+        setState("bad", "Disconnected");
+      }
+      renderMeta();
+      scheduleReconnect(event && event.reason === "replaced" ? false : true);
+    };
+  }
+
+  function sendHello() {
+    if (!ws || ws.readyState !== 1) return;
+    var pv = (handshake && handshake.protocolVersion) || 1;
+    var pluginVersion = (handshake && handshake.pluginVersion) || "0.0.0";
+    var h = hello || {};
+    ws.send(JSON.stringify({
+      type: "hello",
+      protocolVersion: pv,
+      pluginVersion: pluginVersion,
+      fileKey: h.fileKey != null ? h.fileKey : null,
+      fileName: h.fileName || "",
+      pageName: h.pageName || "",
+      editorType: h.editorType || "figma",
+      channel: channel
+    }));
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(function () {
+      if (ws && ws.readyState === 1) {
+        // Watchdog: if the server has gone silent (crash / silent shutdown) the
+        // socket can sit in OPEN forever. Force-close so reconnect kicks in.
+        if (lastHeartbeatAt > 0 && Date.now() - lastHeartbeatAt > HEARTBEAT_DEAD_MS) {
+          setState("warn", "No response — reconnecting");
+          try { ws.close(); } catch (e) {}
+          return;
+        }
+        ws.send(JSON.stringify({ type: "ping", at: Date.now() }));
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+  function stopHeartbeat() {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  }
+
+  function scheduleReconnect(advancePort) {
+    if (reconnectTimer) return;
+    if (advancePort) {
+      if (samePortLeft > 0) {
+        // Recently-working port: burn a same-port retry before walking.
+        samePortLeft--;
+      } else {
+        // Walk the fallback port range so we find the server wherever it bound.
+        portIndex = (portIndex + 1) % PORT_RANGE;
+      }
+    }
+    var wait = backoff;
+    setState("connecting", "Retrying in " + Math.round(wait / 100) / 10 + "s…");
+    reconnectTimer = setTimeout(connect, wait);
+    backoff = Math.min(backoff * 2, BACKOFF_MAX);
+  }
+
+  el.retry.onclick = function () {
+    backoff = BACKOFF_MIN;
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    connect();
+  };
+
+  el.clear.onclick = function () {
+    clearActivity();
+  };
+
+  // ---- channel chip: copy / change / join ----
+  el.channelChip.onclick = function () {
+    if (!channel) return;
+    var ta = document.createElement("textarea");
+    ta.value = channel;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+    var old = el.channelChip.textContent;
+    el.channelChip.textContent = "copied!";
+    setTimeout(function () { el.channelChip.textContent = channel || old; }, 900);
+  };
+
+  el.channelEdit.onclick = function () {
+    el.channelEditor.className = "channel-editor open";
+    el.channelInput.value = channel || "";
+    el.channelInput.focus();
+  };
+  el.channelCancel.onclick = function () {
+    el.channelEditor.className = "channel-editor";
+  };
+  el.channelJoin.onclick = function () {
+    var v = (el.channelInput.value || "").trim();
+    if (!/^[\w.-]{1,64}$/.test(v)) {
+      el.channelInput.value = "";
+      el.channelInput.placeholder = "letters, digits, - _ . only";
+      return;
+    }
+    channel = v;
+    toMain({ kind: "save-channel", channel: channel });
+    el.channelEditor.className = "channel-editor";
+    renderMeta();
+    // Reconnect so the server re-handshakes us onto the new channel.
+    backoff = BACKOFF_MIN;
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    connect();
+  };
+  el.channelInput.onkeydown = function (e) {
+    if (e.key === "Enter") el.channelJoin.onclick();
+    if (e.key === "Escape") el.channelCancel.onclick();
+  };
+
+  // Sweep the whole fallback port range immediately instead of waiting on
+  // the backoff timer to walk through it one port at a time.
+  el.autodetect.onclick = function () {
+    backoff = BACKOFF_MIN;
+    portIndex = 0;
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    setState("connecting", "Auto-detecting…");
+    connect();
+  };
+
+  // Kick off.
+  connect();
+})();
+</script>

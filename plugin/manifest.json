@@ -1,0 +1,36 @@
+{
+  "name": "Reqwise Figma MCP",
+  "id": "reqwise-figma-mcp",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "capabilities": [],
+  "enableProposedApi": false,
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": [
+      "http://localhost:38470",
+      "ws://localhost:38470",
+      "http://localhost:38471",
+      "ws://localhost:38471",
+      "http://localhost:38472",
+      "ws://localhost:38472",
+      "http://localhost:38473",
+      "ws://localhost:38473",
+      "http://localhost:38474",
+      "ws://localhost:38474",
+      "http://localhost:38475",
+      "ws://localhost:38475",
+      "http://localhost:38476",
+      "ws://localhost:38476",
+      "http://localhost:38477",
+      "ws://localhost:38477",
+      "http://localhost:38478",
+      "ws://localhost:38478",
+      "http://localhost:38479",
+      "ws://localhost:38479"
+    ],
+    "reasoning": "Connects to the local Reqwise MCP bridge (WebSocket) on localhost:38470 with +1..+9 port fallback."
+  }
+}

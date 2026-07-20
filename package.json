@@ -1,0 +1,47 @@
+{
+  "name": "reqwise-figma-mcp",
+  "version": "0.1.0",
+  "description": "Reqwise Figma MCP — read and draw on the Figma canvas from AI agents, with safe-by-default drawing, structured verification and a resilient plugin bridge.",
+  "type": "module",
+  "bin": {
+    "reqwise-figma-mcp": "dist/server/index.js"
+  },
+  "files": [
+    "dist",
+    "plugin",
+    "README.md",
+    "docs"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:watch": "node scripts/build.mjs --watch",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.plugin.json --noEmit",
+    "test": "vitest run",
+    "start": "node dist/server/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "figma",
+    "mcp",
+    "model-context-protocol",
+    "design",
+    "ai",
+    "claude"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.100.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
