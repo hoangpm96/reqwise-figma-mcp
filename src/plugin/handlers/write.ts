@@ -4,7 +4,7 @@ import { resolveParent, insertInto } from "../insert.js";
 import { toPaints, toEffects } from "../paints.js";
 import { loadNodeFonts, loadFontWithFallback, DEFAULT_FONT } from "../fonts.js";
 import { serializeNode } from "../serialize.js";
-import { applyTextAlign } from "./text.js";
+import { applyTextAlign, applyTextTypography } from "./text.js";
 import { err, nodeNotFound } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
 import {
@@ -130,6 +130,7 @@ async function modifyText(
   if (typeof props.characters === "string") node.characters = props.characters;
   else if (typeof props.text === "string") node.characters = props.text;
   applyTextAlign(node, props);
+  applyTextTypography(node, props);
 }
 
 function applyLayoutProps(node: FrameNode, props: Record<string, unknown>): void {

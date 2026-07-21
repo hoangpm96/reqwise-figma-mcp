@@ -24,6 +24,23 @@ technical defects in \`summary.issues\` from non-blocking \`summary.styleHints\`
 such as low contrast, tight padding and inconsistent radius. A screenshot is
 still the final visual check for composition and brand fit.
 
+## Typography on TEXT (not silent no-ops)
+\`lineHeight\`, \`letterSpacing\`, \`textCase\`, \`textDecoration\`, and
+\`paragraphSpacing\` are written on create and modify — same validation style as
+\`textAlignHorizontal\` (bad values throw; they are never silently ignored).
+\`\`\`js
+await figma.create({
+  type: "TEXT", parentId: card.id, characters: "SECTION",
+  fontSize: 12, letterSpacing: "4%", textCase: "UPPER",
+  textDecoration: "NONE", lineHeight: 16,
+});
+// wrap:true still supplies a default lineHeight only when you omit it:
+await figma.create({
+  type: "TEXT", parentId: card.id, wrap: true, characters: "Body…",
+  lineHeight: 22, // wins over the ~1.45× default
+});
+\`\`\`
+
 ## Overlay (modal scrim)
 \`\`\`js
 await figma.overlay({ parentId: screen.id, color: "#000000", opacity: 0.5, insertAt: "top" });

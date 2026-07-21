@@ -309,7 +309,12 @@ await figma.overlay({ parentId: screen.id, color: "#000000", opacity: 0.5, inser
 |---|---|---|
 | `inset` | `{ left, right, top, bottom }` | Pins a node to its parent's edges; the plugin derives `x/y/w/h` from the parent minus the insets. Omit a side to leave that dimension to the node's own size. |
 | `align` | `"center-x" \| "center-y" \| "center"` | Centers without manual offset math. |
-| `wrap` | `true` (on `TEXT` create) | Sets `layoutAlign: STRETCH`, `textAutoResize: HEIGHT`, and a sane default `lineHeight` (~1.45× font size); warns if the parent has no fixed width to wrap against. |
+| `wrap` | `true` (on `TEXT` create) | Sets `layoutAlign: STRETCH`, `textAutoResize: HEIGHT`, and a sane default `lineHeight` (~1.45× font size) when `lineHeight` is omitted; warns if the parent has no fixed width to wrap against. |
+| `lineHeight` | number \| `"AUTO"` \| `"150%"` \| `{unit,value?}` | Text create/modify. Number → PIXELS. Explicit value wins over `wrap`'s default. |
+| `letterSpacing` | number \| `"2%"` \| `{unit,value}` | Text create/modify. Number → PIXELS. |
+| `textCase` | `"ORIGINAL" \| "UPPER" \| "LOWER" \| "TITLE" \| …` | Text create/modify. Invalid enum throws (never silent no-op). |
+| `textDecoration` | `"NONE" \| "UNDERLINE" \| "STRIKETHROUGH"` | Text create/modify. |
+| `paragraphSpacing` | number (px) | Text create/modify. |
 | `insertAt` | `"top" \| "bottom" \| { above: nodeId } \| { below: nodeId } \| index` | Z-order control on `create`/`move` — don't rely on creation order. |
 
 Auto-layout sizing: setting `layoutMode: "VERTICAL" | "HORIZONTAL"` turns a frame into an auto-layout. Under a fixed-size parent, the constrained axis defaults to `counterAxisSizingMode: "FIXED"` unless you explicitly override it — this default is what prevents silent overflow. Use `primaryAxisSizingMode`/`counterAxisSizingMode: "AUTO"` (hug) or `"FIXED"` deliberately, and `layoutAlign: "STRETCH"` to make a child fill the cross axis.
