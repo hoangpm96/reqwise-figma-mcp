@@ -4,7 +4,7 @@ import { resolveParent, insertInto } from "../insert.js";
 import { toPaints, toEffects } from "../paints.js";
 import { loadFontWithFallback, DEFAULT_FONT } from "../fonts.js";
 import { serializeNode } from "../serialize.js";
-import { applyTextAlign } from "./text.js";
+import { applyTextAlign, applyTextTypography } from "./text.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
 import {
@@ -193,14 +193,22 @@ async function applyText(
   if (p.wrap === true) {
     node.textAutoResize = "HEIGHT";
     node.layoutAlign = "STRETCH";
-    const size = typeof node.fontSize === "number" ? node.fontSize : 16;
-    node.lineHeight = { value: wrapLineHeight(size), unit: "PIXELS" };
+    // Default line-height only when the agent did not pass one explicitly —
+    // applyTextTypography below must win over this wrap default.
+    if (p.lineHeight === undefined) {
+      const size = typeof node.fontSize === "number" ? node.fontSize : 16;
+      node.lineHeight = { value: wrapLineHeight(size), unit: "PIXELS" };
+    }
     if (!parentHasFixedWidth(parent)) {
       ctx.warn(
         "wrap:true set but parent has no fixed width; wrapped text may not constrain. Set the parent to a fixed width.",
       );
     }
   }
+
+  // Explicit typography (lineHeight/letterSpacing/textCase/…); after wrap so
+  // an agent-provided lineHeight overrides the wrap default.
+  applyTextTypography(node, p);
 
   (ctx as unknown as { fontResolution?: unknown }).fontResolution = {
     requestedFont: res.requestedFont,

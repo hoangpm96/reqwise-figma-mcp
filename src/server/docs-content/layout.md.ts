@@ -42,6 +42,25 @@ Note: for a hug-width text node, LEFT vs CENTER looks identical — give the nod
 a width (\`layoutAlign:"STRETCH"\` or an explicit \`w\`) so the alignment is
 visible.
 
+## Typography props on create / modify
+These are written on both create and modify (they used to be silent no-ops —
+the serializer read them back but nothing applied them):
+
+\`\`\`js
+await figma.create({
+  type: "TEXT", parentId: card.id, characters: "Headline",
+  fontSize: 24,
+  lineHeight: 32,                 // number → PIXELS; or "AUTO" | "150%" | {unit,value}
+  letterSpacing: 0.4,             // number → PIXELS; or "2%" | {unit,value}
+  textCase: "UPPER",              // ORIGINAL|UPPER|LOWER|TITLE|SMALL_CAPS|…
+  textDecoration: "UNDERLINE",    // NONE|UNDERLINE|STRIKETHROUGH
+  paragraphSpacing: 8,            // pixels between paragraphs
+});
+\`\`\`
+An invalid enum / shape throws INVALID_PARAMS. When \`wrap: true\` is set and
+\`lineHeight\` is omitted, the plugin still supplies its ~1.45× fontSize default;
+an explicit \`lineHeight\` always wins over that default.
+
 ## Auto-layout sizing
 - \`layoutMode: "VERTICAL" | "HORIZONTAL"\` turns a frame into an auto-layout.
 - Under a fixed-size parent, the constrained axis defaults to

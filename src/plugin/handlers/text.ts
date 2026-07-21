@@ -7,6 +7,15 @@ import { ErrorCode } from "../../shared/protocol.js";
 
 const H_ALIGNS = ["LEFT", "CENTER", "RIGHT", "JUSTIFIED"] as const;
 const V_ALIGNS = ["TOP", "CENTER", "BOTTOM"] as const;
+const TEXT_CASES = [
+  "ORIGINAL",
+  "UPPER",
+  "LOWER",
+  "TITLE",
+  "SMALL_CAPS",
+  "SMALL_CAPS_FORCED",
+] as const;
+const TEXT_DECORATIONS = ["NONE", "UNDERLINE", "STRIKETHROUGH"] as const;
 
 /**
  * Apply text-alignment props to a TEXT node. `textAlignHorizontal` sets how the
@@ -22,16 +31,128 @@ export function applyTextAlign(
   p: Record<string, unknown>,
 ): void {
   if (p.textAlignHorizontal !== undefined) {
-    const v = normalizeAlign(p.textAlignHorizontal, H_ALIGNS, "textAlignHorizontal");
+    const v = normalizeEnum(p.textAlignHorizontal, H_ALIGNS, "textAlignHorizontal");
     node.textAlignHorizontal = v;
   }
   if (p.textAlignVertical !== undefined) {
-    const v = normalizeAlign(p.textAlignVertical, V_ALIGNS, "textAlignVertical");
+    const v = normalizeEnum(p.textAlignVertical, V_ALIGNS, "textAlignVertical");
     node.textAlignVertical = v;
   }
 }
 
-function normalizeAlign<T extends string>(
+/**
+ * Apply remaining typography props that agents routinely set on create/modify
+ * and that the serializer already reads back: lineHeight, letterSpacing,
+ * textCase, textDecoration, paragraphSpacing.
+ *
+ * Same silent-drop class as textAlign — values were accepted in the response
+ * shape (design detail) but never written, so agents saw {ok:true} while the
+ * canvas kept Figma defaults. Shared by create() and modify().
+ *
+ * Accepted shapes (bad values throw INVALID_PARAMS, never no-op):
+ * - lineHeight: number (PIXELS) | "AUTO" | "150%" | {unit, value?}
+ * - letterSpacing: number (PIXELS) | "2%" | {unit, value}
+ * - textCase / textDecoration: Figma enum strings (case-insensitive)
+ * - paragraphSpacing: number (pixels between paragraphs)
+ */
+export function applyTextTypography(
+  node: TextNode,
+  p: Record<string, unknown>,
+): void {
+  if (p.lineHeight !== undefined) {
+    node.lineHeight = parseLineHeight(p.lineHeight);
+  }
+  if (p.letterSpacing !== undefined) {
+    node.letterSpacing = parseLetterSpacing(p.letterSpacing);
+  }
+  if (p.textCase !== undefined) {
+    node.textCase = normalizeEnum(p.textCase, TEXT_CASES, "textCase");
+  }
+  if (p.textDecoration !== undefined) {
+    node.textDecoration = normalizeEnum(
+      p.textDecoration,
+      TEXT_DECORATIONS,
+      "textDecoration",
+    );
+  }
+  if (p.paragraphSpacing !== undefined) {
+    if (typeof p.paragraphSpacing !== "number" || !Number.isFinite(p.paragraphSpacing)) {
+      throw err(
+        ErrorCode.INVALID_PARAMS,
+        `Invalid paragraphSpacing value ${JSON.stringify(p.paragraphSpacing)}.`,
+        "Use a finite number of pixels (e.g. 8).",
+      );
+    }
+    node.paragraphSpacing = p.paragraphSpacing;
+  }
+}
+
+function parseLineHeight(raw: unknown): LineHeight {
+  if (raw === "AUTO" || raw === "auto") return { unit: "AUTO" };
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return { unit: "PIXELS", value: raw };
+  }
+  if (typeof raw === "string") {
+    const pct = parsePercentString(raw);
+    if (pct !== null) return { unit: "PERCENT", value: pct };
+  }
+  if (raw && typeof raw === "object") {
+    const o = raw as { unit?: unknown; value?: unknown };
+    const unit =
+      typeof o.unit === "string" ? o.unit.toUpperCase() : "";
+    if (unit === "AUTO") return { unit: "AUTO" };
+    if (
+      (unit === "PIXELS" || unit === "PERCENT") &&
+      typeof o.value === "number" &&
+      Number.isFinite(o.value)
+    ) {
+      return { unit, value: o.value } as LineHeight;
+    }
+  }
+  throw err(
+    ErrorCode.INVALID_PARAMS,
+    `Invalid lineHeight value ${JSON.stringify(raw)}.`,
+    'Use a number (pixels), "AUTO", "150%", or {unit:"PIXELS"|"PERCENT"|"AUTO", value?}.',
+  );
+}
+
+function parseLetterSpacing(raw: unknown): LetterSpacing {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return { unit: "PIXELS", value: raw };
+  }
+  if (typeof raw === "string") {
+    const pct = parsePercentString(raw);
+    if (pct !== null) return { unit: "PERCENT", value: pct };
+    const n = Number(raw);
+    if (Number.isFinite(n)) return { unit: "PIXELS", value: n };
+  }
+  if (raw && typeof raw === "object") {
+    const o = raw as { unit?: unknown; value?: unknown };
+    const unit =
+      typeof o.unit === "string" ? o.unit.toUpperCase() : "";
+    if (
+      (unit === "PIXELS" || unit === "PERCENT") &&
+      typeof o.value === "number" &&
+      Number.isFinite(o.value)
+    ) {
+      return { unit, value: o.value } as LetterSpacing;
+    }
+  }
+  throw err(
+    ErrorCode.INVALID_PARAMS,
+    `Invalid letterSpacing value ${JSON.stringify(raw)}.`,
+    'Use a number (pixels), "2%", or {unit:"PIXELS"|"PERCENT", value}.',
+  );
+}
+
+/** Parse "150%" / "150" → 150; null if not a percent form. */
+function parsePercentString(raw: string): number | null {
+  const m = raw.trim().match(/^(\d+(?:\.\d+)?)\s*%$/);
+  if (!m) return null;
+  return Number(m[1]);
+}
+
+function normalizeEnum<T extends string>(
   raw: unknown,
   allowed: readonly T[],
   field: string,
