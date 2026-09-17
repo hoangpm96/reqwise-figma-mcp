@@ -39,10 +39,17 @@ export function normalizePadding(
     out.left = out.right = out.top = out.bottom = props.padding;
   } else if (props.padding && typeof props.padding === "object") {
     const p = props.padding as Record<string, unknown>;
+    // Both spellings: `{left,right,top,bottom}` is Figma's, and `{l,r,t,b}` is
+    // what a READ of this node hands back — a caller who round-trips what they
+    // read used to have their padding silently dropped.
     if (typeof p.left === "number") out.left = p.left;
+    else if (typeof p.l === "number") out.left = p.l;
     if (typeof p.right === "number") out.right = p.right;
+    else if (typeof p.r === "number") out.right = p.r;
     if (typeof p.top === "number") out.top = p.top;
+    else if (typeof p.t === "number") out.top = p.t;
     if (typeof p.bottom === "number") out.bottom = p.bottom;
+    else if (typeof p.b === "number") out.bottom = p.b;
   }
 
   // Flat Figma-native fields win when both spellings are present.
@@ -217,9 +224,44 @@ export function overflowsParent(
   );
 }
 
-/** Default line height for wrapped text (≈1.45 × font size). */
+/**
+ * Whether two axis-aligned boxes (same coordinate space) overlap with more than
+ * a hairline of shared area. Touching edges do not count. Used to warn when a
+ * newly-created page-level node lands on top of existing content (the classic
+ * "created a COMPONENT without x/y → it dropped at (0,0) over a screen" trap).
+ */
+export function boxesOverlap(a: Box, b: Box): boolean {
+  const EPS = 0.5;
+  return (
+    a.x < b.x + b.w - EPS &&
+    a.x + a.w > b.x + EPS &&
+    a.y < b.y + b.h - EPS &&
+    a.y + a.h > b.y + EPS
+  );
+}
+
+/**
+ * Line height as a FUNCTION of font size, not a flat multiplier. Real type
+ * ramps tighten line-height as size grows: body ~1.5, headings ~1.25, display
+ * ~1.1. A single factor (the old 1.45) leaves large headings looking loose and
+ * disconnected — one of the clearest "AI-drew-this" tells. Mirrors the
+ * Tailwind/Radix size→leading curve.
+ */
+export function defaultLineHeight(fontSize: number): number {
+  let factor: number;
+  if (fontSize <= 14) factor = 1.45; // small/body text: needs air
+  else if (fontSize <= 18) factor = 1.5; // body
+  else if (fontSize <= 24) factor = 1.35; // subhead/heading
+  else if (fontSize <= 32) factor = 1.25; // heading/title
+  else if (fontSize <= 48) factor = 1.15; // display
+  else factor = 1.05; // hero/oversized
+  return round(fontSize * factor);
+}
+
+/** @deprecated kept for callers; use defaultLineHeight (size-aware). */
 export const WRAP_LINE_HEIGHT_FACTOR = 1.45;
 
+/** Back-compat alias — now size-aware rather than a flat 1.45×. */
 export function wrapLineHeight(fontSize: number): number {
-  return round(fontSize * WRAP_LINE_HEIGHT_FACTOR);
+  return defaultLineHeight(fontSize);
 }

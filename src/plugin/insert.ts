@@ -1,6 +1,8 @@
 /// <reference types="@figma/plugin-typings" />
 import { resolveInsertIndex, InsertAt } from "./layout-math.js";
 import { isParentNode } from "./context.js";
+
+export { isParentNode };
 import { err } from "./errors.js";
 import { ErrorCode } from "../shared/protocol.js";
 
@@ -24,9 +26,12 @@ export function insertInto(
 /**
  * Resolve the parent for a create/move: explicit parentId, else current page.
  */
+/** Anything that can hold children: the live node, not an id. */
+export type ParentNode = BaseNode & ChildrenMixin;
+
 export async function resolveParent(
   parentId: unknown,
-): Promise<BaseNode & ChildrenMixin> {
+): Promise<ParentNode> {
   if (typeof parentId === "string" && parentId.length > 0) {
     const p = await figma.getNodeByIdAsync(parentId);
     if (!p) {
@@ -43,6 +48,10 @@ export async function resolveParent(
         "Choose a FRAME, GROUP, COMPONENT, SECTION or PAGE as the parent.",
       );
     }
+    // A PAGE parent resolves by id while its children are still unloaded —
+    // under documentAccess:"dynamic-page", insertInto reading parent.children
+    // throws until loadAsync runs.
+    if (p.type === "PAGE") await (p as PageNode).loadAsync?.();
     return p;
   }
   return figma.currentPage;

@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LeaderInfo } from "../../src/shared/protocol.js";
 import { Coordinator } from "../../src/server/leader.js";
 import { Bridge } from "../../src/server/bridge.js";
+import { Follower } from "../../src/server/follower.js";
 import { leaderFilePathFor, baseDir } from "../../src/server/paths.js";
 
 /**
@@ -99,6 +100,36 @@ describe("election attempt budget", () => {
     await writeFile(leaderFilePathFor(46330), JSON.stringify(infoFor(46330, "orphan-token")), { mode: 0o600 });
     expect(await d.start()).toBe("follower");
   }, 20_000);
+
+  it("keeps a live leader discoverable after one transient health-check miss", async () => {
+    const leader = mkCoord(46331);
+    expect(await leader.start()).toBe("leader");
+
+    const follower = new Coordinator({
+      runValidated: async () => ({}),
+      startPort: 46331,
+      healthIntervalMs: [5, 6],
+    });
+    coords.push(follower);
+    expect(await follower.start()).toBe("follower");
+
+    const check = vi
+      .spyOn(Follower, "checkHealth")
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    try {
+      await vi.waitFor(() => expect(check.mock.calls.length).toBeGreaterThanOrEqual(2), {
+        timeout: 1_000,
+      });
+
+      // The first miss used to delete both discovery files before retrying
+      // election, even though the second probe proved the leader was alive.
+      expect((await leader.readLeaderFile(46331))?.token).toBe(leader.info()?.token);
+      expect(follower.role).toBe("follower");
+    } finally {
+      check.mockRestore();
+    }
+  });
 });
 
 describe("follower token refresh on 401", () => {

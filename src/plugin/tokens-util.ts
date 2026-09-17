@@ -4,7 +4,17 @@
  * never left at the Figma default (0 / "String value").
  */
 
-/** Collect the set of mode names referenced by any per-mode color value. */
+/**
+ * Collect the set of mode names referenced by any per-mode color value.
+ *
+ * EMPTY means "no opinion about modes" — write whatever modes the collection
+ * already has. It used to return `["Mode 1"]`, Figma's name for a fresh
+ * collection's only mode, and that sentinel was a demand: a caller passing
+ * plain hexes was asking for a mode literally named "Mode 1". Once the first
+ * mode had been renamed (to `light`, say), a later plain-hex call asked for a
+ * mode that no longer existed and tried to ADD one — which on a plan that
+ * allows a single mode fails outright.
+ */
 export function collectModes(
   colors: Record<string, unknown> | undefined,
 ): string[] {
@@ -14,7 +24,6 @@ export function collectModes(
       for (const k of Object.keys(v)) modes.add(k);
     }
   }
-  if (modes.size === 0) return ["Mode 1"];
   return [...modes];
 }
 

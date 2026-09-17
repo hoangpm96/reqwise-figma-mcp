@@ -114,9 +114,14 @@ describe("toEffectCore", () => {
     }) as ShadowEffectOut;
     expect(e.color.a).toBeCloseTo(0.2, 5);
   });
-  it("omitted shadow color keeps the sensible default", () => {
-    const e = toEffectCore({ type: "DROP_SHADOW", radius: 4 }) as ShadowEffectOut;
-    expect(e.color.a).toBeCloseTo(0.25, 5);
+  it("omitted shadow color defaults to a soft modern shadow (ink-tinted, low alpha)", () => {
+    const e = toEffectCore({ type: "DROP_SHADOW" }) as ShadowEffectOut;
+    expect(e.color.a).toBeCloseTo(0.1, 5); // 10%, not the old harsh 25%
+    // tinted toward ink (#1C2024), not pure black
+    expect(e.color.r).toBeGreaterThan(0);
+    expect(e.color.r).toBeLessThan(0.2);
+    expect(e.offset).toEqual({ x: 0, y: 4 }); // was y:2
+    expect(e.radius).toBe(12); // was 4
   });
   it("present-but-malformed shadow color throws", () => {
     expect(() => toEffectCore({ type: "DROP_SHADOW", color: "shadowy", radius: 4 })).toThrow(/DROP_SHADOW color/);

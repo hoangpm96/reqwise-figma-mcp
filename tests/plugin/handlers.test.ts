@@ -1,485 +1,609 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { create } from "../../src/plugin/handlers/create.js";
+import { modify, deleteNode } from "../../src/plugin/handlers/write.js";
+import { clone } from "../../src/plugin/handlers/clone.js";
+import { createOverlay } from "../../src/plugin/handlers/assets.js";
+import { setupTokens } from "../../src/plugin/handlers/tokens.js";
+import { makeContext, HandlerContext } from "../../src/plugin/context.js";
+import { resetKeepClearGroups } from "../../src/plugin/keep-clear.js";
+import { HandlerError, toBridgeError } from "../../src/plugin/errors.js";
+import { ErrorCode } from "../../src/shared/protocol.js";
 
 /**
- * Plugin handler unit tests.
- * These test the safe-default logic and edge cases in the create/modify/delete handlers.
- * Note: Full handler execution requires mocking Figma Plugin API.
+ * Plugin handler tests against the REAL handlers in src/plugin/handlers/*,
+ * behind a mocked `figma` global — the same pattern the suites under
+ * tests/plugin/handlers/ use. (The previous version of this file built
+ * literals inside each test and asserted on them; it never imported a
+ * handler, so it passed no matter what the handlers did.)
+ *
+ * Not covered here: `batch` — its dispatch loop lives in src/plugin/main.ts,
+ * which is not importable in Node (it calls figma.showUI at module top
+ * level and references the build-time __html__ constant).
  */
 
-describe("Plugin handlers - safe defaults", () => {
-  describe("create - sizing safe defaults", () => {
-    it("auto-layout FRAME under fixed-size parent gets fixed counterAxisSizingMode", () => {
-      // Parent is 320×240 (fixed)
-      // Child wants auto-layout HORIZONTAL
-      // On the vertical axis (cross-axis), child should be FIXED unless explicitly set
-      const parent = {
-        layoutMode: "NONE",
-        width: 320,
-        height: 240,
-        clipsContent: true,
-      };
+type FakeNode = Record<string, any>;
 
-      const spec = {
+let nodes: Map<string, FakeNode>;
+let components: FakeNode[];
+let collections: FakeNode[];
+let variablesById: Map<string, FakeNode>;
+let page: FakeNode;
+let seq: number;
+let varCounter: number;
+
+function register<T extends FakeNode>(n: T): T {
+  nodes.set(n.id, n);
+  return n;
+}
+
+/** nodes.get() for tests: the id exists or the test itself is broken. */
+function mustGet(id: string): FakeNode {
+  const n = nodes.get(id);
+  if (!n) throw new Error(`test registry has no node ${id}`);
+  return n;
+}
+
+/** Generic scene-node fake: the props the handlers read/write, guarded by `in`. */
+function makeNode(id: string, type: string): FakeNode {
+  const n: FakeNode = {
+    id,
+    type,
+    name: "",
+    x: 0,
+    y: 0,
+    width: 100,
+    height: 100,
+    visible: true,
+    opacity: 1,
+    rotation: 0,
+    fills: [],
+    strokes: [],
+    effects: [],
+    strokeWeight: 1,
+    cornerRadius: 0,
+    layoutAlign: "INHERIT",
+    layoutGrow: 0,
+    removed: false,
+    children: [] as FakeNode[],
+    parent: null,
+    appendChild(c: FakeNode) {
+      this.children.push(c);
+      c.parent = this;
+    },
+    insertChild(i: number, c: FakeNode) {
+      this.children.splice(i, 0, c);
+      c.parent = this;
+    },
+    resize(w: number, h: number) {
+      this.width = w;
+      this.height = h;
+    },
+    remove() {
+      this.removed = true;
+    },
+    getPluginData: () => "",
+    setPluginData: vi.fn(),
+    setBoundVariable: vi.fn(),
+  };
+  if (type === "FRAME" || type === "COMPONENT") {
+    n.layoutMode = "NONE";
+    n.clipsContent = false;
+    n.itemSpacing = 0;
+    n.paddingLeft = 0;
+    n.paddingRight = 0;
+    n.paddingTop = 0;
+    n.paddingBottom = 0;
+    n.primaryAxisSizingMode = "FIXED";
+    n.counterAxisSizingMode = "FIXED";
+    n.primaryAxisAlignItems = "MIN";
+    n.counterAxisAlignItems = "MIN";
+    n.layoutWrap = "NO_WRAP";
+    n.counterAxisSpacing = 0;
+  }
+  return n;
+}
+
+function makeText(id: string): FakeNode {
+  const n = makeNode(id, "TEXT");
+  n.characters = "";
+  n.fontName = { family: "Inter", style: "Regular" };
+  n.fontSize = 16;
+  n.lineHeight = { unit: "AUTO" };
+  n.letterSpacing = { unit: "PIXELS", value: 0 };
+  n.textAutoResize = "WIDTH_AND_HEIGHT";
+  n.textAlignHorizontal = "LEFT";
+  n.textAlignVertical = "TOP";
+  n.textCase = "ORIGINAL";
+  n.textDecoration = "NONE";
+  n.getRangeAllFontNames = () => [{ family: "Inter", style: "Regular" }];
+  return n;
+}
+
+function ctx(params: Record<string, unknown>): HandlerContext {
+  return makeContext(params, () => {});
+}
+
+function makeCollection(name: string, modeNames: string[] = ["Mode 1"]): FakeNode {
+  const col: FakeNode = {
+    id: `VariableCollectionId:${collections.length + 1}`,
+    name,
+    modes: modeNames.map((n, i) => ({ modeId: `m${i}`, name: n })),
+    variableIds: [] as string[],
+    addMode(n: string) {
+      const modeId = `m${this.modes.length}`;
+      this.modes.push({ modeId, name: n });
+      return modeId;
+    },
+    renameMode(modeId: string, n: string) {
+      const m = this.modes.find((x: { modeId: string }) => x.modeId === modeId);
+      if (m) m.name = n;
+    },
+  };
+  collections.push(col);
+  return col;
+}
+
+function makeVariable(name: string, col: FakeNode, type: string): FakeNode {
+  const v: FakeNode = {
+    id: `VariableID:${++varCounter}`,
+    name,
+    resolvedType: type,
+    variableCollectionId: col.id,
+    valuesByMode: {} as Record<string, unknown>,
+    setValueForMode(modeId: string, val: unknown) {
+      this.valuesByMode[modeId] = val;
+    },
+  };
+  variablesById.set(v.id, v);
+  col.variableIds.push(v.id);
+  return v;
+}
+
+beforeEach(() => {
+  resetKeepClearGroups();
+  nodes = new Map();
+  components = [];
+  collections = [];
+  variablesById = new Map();
+  seq = 0;
+  varCounter = 0;
+  page = {
+    id: "0:1",
+    type: "PAGE",
+    name: "Page 1",
+    children: [] as FakeNode[],
+    appendChild(c: FakeNode) {
+      this.children.push(c);
+      c.parent = this;
+    },
+    insertChild(i: number, c: FakeNode) {
+      this.children.splice(i, 0, c);
+      c.parent = this;
+    },
+  };
+  nodes.set(page.id, page);
+  (globalThis as any).figma = {
+    currentPage: page,
+    mixed: Symbol("mixed"),
+    getNodeByIdAsync: vi.fn(async (id: string) => nodes.get(id) ?? null),
+    createFrame: () => register(makeNode(`10:${++seq}`, "FRAME")),
+    createText: () => register(makeText(`11:${++seq}`)),
+    createRectangle: () => register(makeNode(`12:${++seq}`, "RECTANGLE")),
+    createComponent: () => register(makeNode(`20:${++seq}`, "COMPONENT")),
+    loadAllPagesAsync: vi.fn(async () => {}),
+    listAvailableFontsAsync: vi.fn(async () => [
+      { fontName: { family: "Inter", style: "Regular" } },
+      { fontName: { family: "Inter", style: "Bold" } },
+      { fontName: { family: "Courier", style: "Regular" } },
+    ]),
+    loadFontAsync: vi.fn(async () => {}),
+    root: { findAllWithCriteria: vi.fn(() => components) },
+    variables: {
+      getLocalVariableCollectionsAsync: vi.fn(async () => collections),
+      createVariableCollection: vi.fn((name: string) => makeCollection(name)),
+      createVariable: vi.fn((name: string, col: FakeNode, type: string) =>
+        makeVariable(name, col, type),
+      ),
+      getVariableByIdAsync: vi.fn(async (id: string) => variablesById.get(id) ?? null),
+    },
+  };
+});
+
+/** A fixed-size parent frame already on the page. */
+function addParent(id = "30:1", w = 400, h = 300): FakeNode {
+  const parent = register(makeNode(id, "FRAME"));
+  parent.width = w;
+  parent.height = h;
+  page.children.push(parent);
+  parent.parent = page;
+  return parent;
+}
+
+describe("create — nested children", () => {
+  it("builds the whole subtree in one call, array order first", async () => {
+    const res = (await create(
+      ctx({
         type: "FRAME",
-        layoutMode: "HORIZONTAL",
-        width: 100,
-        height: 50,
-      };
-
-      // Safe default: parent is fixed, so child's counterAxisSizingMode = FIXED
-      // This prevents auto-layout overflow of the parent
-      expect(spec.layoutMode).toBe("HORIZONTAL");
-      // Verify: cross-axis should be FIXED (not AUTO)
-    });
-
-    it("create with explicit x+w > parent.w while parent clipsContent emits warning", () => {
-      // Node would overflow parent's clipped bounds
-      // Should succeed but add warning to response
-      const parent = { width: 320, clipsContent: true };
-      const spec = { x: 260, width: 100 }; // x + w = 360 > 320
-
-      // Operation succeeds, but response.warnings includes overflow message
-      expect(260 + 100).toBeGreaterThan(320);
-    });
-
-    it("child with inset/align math under auto-layout parent inherits layout orientation", () => {
-      // If parent is HORIZONTAL auto-layout and child uses inset
-      // inset applies to absolute coords, not auto-layout
-      const spec = {
-        parentId: "parent-1",
-        inset: { left: 16, right: 16 },
-      };
-
-      // The geometry resolver should expand width to parent - 32
-      // But if parent is auto-layout HORIZONTAL, the child may not respect absolute sizing
-      // Handler should warn or adjust layoutAlign
-    });
-  });
-
-  describe("create - text wrap safe defaults", () => {
-    it("TEXT with wrap:true gets layoutAlign STRETCH + textAutoResize HEIGHT", () => {
-      const spec = {
-        type: "TEXT",
-        wrap: true,
-        characters: "A long paragraph",
-      };
-
-      // Safe defaults applied:
-      // - layoutAlign = STRETCH (use parent width)
-      // - textAutoResize = HEIGHT (auto-height as text wraps)
-      // - lineHeight ≈ 1.45 × fontSize if not set
-      expect(spec.wrap).toBe(true);
-      // Handler should set these properties
-    });
-
-    it("TEXT with wrap:true under parent without fixed width emits warning", () => {
-      const parent = { layoutMode: "NONE" }; // No fixed width
-      const spec = {
-        type: "TEXT",
-        wrap: true,
-        characters: "Text",
-      };
-
-      // Warning: wrap requested but parent has no measurable fixed width
-    });
-
-    it("TEXT mix fonts across ranges gets font loaded per range", () => {
-      // setText with styleOverrides mixing fonts
-      // Handler should loadAvailableFontsAsync for each unique family
-      // Never fail; use fallback chain
-      const edits = [
-        { startIndex: 0, endIndex: 5, fontFamily: "Inter", fontWeight: 600 },
-        { startIndex: 5, endIndex: 10, fontFamily: "Courier", fontWeight: 400 },
-      ];
-
-      // Both fonts should be checked before committing
-      expect(edits.length).toBe(2);
-    });
-  });
-
-  describe("create - overlay safe defaults", () => {
-    it("overlay() creates RECTANGLE not FRAME", () => {
-      const spec = {
-        type: "overlay",
-        color: "#000000",
-        opacity: 0.3,
-        parentId: "parent-1",
-      };
-
-      // Handler should convert to type: RECTANGLE
-      // Positioned at top-left of parent
-      // Sized to parent bounds
-    });
-
-    it("overlay on FRAME with opacity < 1 uses RECTANGLE at correct z-order", () => {
-      // opacity on FRAME affects entire subtree (safe default: don't do this)
-      // Instead, create RECTANGLE overlay
-      const spec = {
-        type: "overlay",
-        opacity: 0.5,
-        parentId: "frame-1",
-      };
-
-      // Result: RECTANGLE child of frame-1, not a new FRAME with opacity
-    });
-
-    it("creating FRAME with opacity < 1 emits warning suggesting overlay()", () => {
-      const spec = {
-        type: "FRAME",
-        opacity: 0.5,
-      };
-
-      // Warning: opacity applies to entire subtree — use overlay() instead
-    });
-  });
-
-  describe("create - relative layout", () => {
-    it("inset: { left, right } with no w stretches width", () => {
-      const parent = { width: 400 };
-      const spec = {
-        inset: { left: 16, right: 16 },
-        height: 100,
-      };
-
-      const expectedX = 16;
-      const expectedW = 400 - 32;
-
-      expect(expectedX).toBe(16);
-      expect(expectedW).toBe(368);
-    });
-
-    it("align: 'center-x' centers node horizontally", () => {
-      const parent = { width: 400 };
-      const spec = {
-        align: "center-x",
-        width: 100,
-      };
-
-      const expectedX = (400 - 100) / 2;
-      expect(expectedX).toBe(150);
-    });
-
-    it("align: 'center-y' centers node vertically", () => {
-      const parent = { height: 300 };
-      const spec = {
-        align: "center-y",
-        height: 50,
-      };
-
-      const expectedY = (300 - 50) / 2;
-      expect(expectedY).toBe(125);
-    });
-
-    it("align: 'center' centers both axes", () => {
-      const parent = { width: 400, height: 300 };
-      const spec = {
-        align: "center",
-        width: 100,
-        height: 50,
-      };
-
-      const expectedX = 150;
-      const expectedY = 125;
-
-      expect(expectedX).toBe(150);
-      expect(expectedY).toBe(125);
-    });
-  });
-
-  describe("create - insertAt z-order", () => {
-    it("insertAt: 'top' inserts at highest z-index", () => {
-      const parent = { children: ["a", "b", "c"] };
-      const insertAt = "top";
-
-      // New node should be at index 3 (last = top)
-      expect(insertAt).toBe("top");
-    });
-
-    it("insertAt: 'bottom' inserts at lowest z-index", () => {
-      const parent = { children: ["a", "b", "c"] };
-      const insertAt = "bottom";
-
-      // New node should be at index 0 (first = bottom)
-      expect(insertAt).toBe("bottom");
-    });
-
-    it("insertAt: { above: nodeId } inserts after target", () => {
-      const insertAt = { above: "b" };
-      // Children: ["a", "b", "c"] → ["a", "b", NEW, "c"]
-      expect(insertAt.above).toBe("b");
-    });
-
-    it("insertAt: { below: nodeId } inserts before target", () => {
-      const insertAt = { below: "b" };
-      // Children: ["a", "b", "c"] → ["a", NEW, "b", "c"]
-      expect(insertAt.below).toBe("b");
-    });
-
-    it("insertAt: numeric index uses direct index", () => {
-      const insertAt = 1;
-      // Children: ["a", "b", "c"] → ["a", NEW, "b", "c"]
-      expect(insertAt).toBe(1);
-    });
-  });
-
-  describe("create - component reuse", () => {
-    it("findComponent fuzzy-matches before any create", () => {
-      // Query: "button primary"
-      // Should match "ButtonPrimary" (normalized, case-insensitive)
-      const query = "button primary";
-      const candidates = ["ButtonPrimary", "Button/Primary", "button"];
-
-      // Fuzzy match should find "ButtonPrimary" first
-      expect(candidates).toContain("ButtonPrimary");
-    });
-
-    it("findComponent respects component path with /", () => {
-      // Query: "form/button"
-      // Should match "Form/Button" or deeper paths
-      const query = "form/button";
-      const path = "form/button";
-
-      expect(query.split("/")).toEqual(path.split("/"));
-    });
-
-    it("findOrCreateComponent creates only if not found", () => {
-      // First call: not found → create
-      // Second call: found → reuse
-      const name = "MyComponent";
-
-      expect(name).toBe("MyComponent");
-      // Idempotent: calling twice returns same component
-    });
-  });
-
-  describe("modify - safe constraints", () => {
-    it("modify respects parent clipsContent bounds", () => {
-      const parent = { width: 320, height: 240, clipsContent: true };
-      const spec = { x: 300, width: 50 };
-
-      // x + w = 350 > 320, parent clips
-      // Modify succeeds but warns about clipping
-      expect(300 + 50).toBeGreaterThan(320);
-    });
-
-    it("modify text font checks availability before apply", () => {
-      const spec = { fontFamily: "SomeFancyFont" };
-
-      // Handler calls listAvailableFontsAsync(["SomeFancyFont"])
-      // If missing, falls back to Inter → system
-      // Response includes { requestedFont, resolvedFont, reason }
-      expect(spec.fontFamily).toBe("SomeFancyFont");
-    });
-
-    it("modify with token color applies variable instead of hex literal", () => {
-      const state = { tokens: { colors: { primary: "#2563EB" } } };
-      const fillColor = "#2563EB";
-
-      // When modifying fills to exactly match a token
-      // Response warns: "token 'primary' matches this color — use applyVariable"
-      expect(fillColor).toBe(state.tokens.colors.primary);
-    });
-
-    it("modify multi-mode variable sets all modes explicitly", () => {
-      const spec = {
-        field: "fills",
-        variable: {
-          collectionId: "collection-1",
-          variableId: "var-1",
-          modes: { light: "#fff", dark: "#000" },
-        },
-      };
-
-      // Handler sets variable for **all** modes, not just current
-      expect(spec.variable.modes).toBeDefined();
-      expect(Object.keys(spec.variable.modes)).toEqual(["light", "dark"]);
-    });
-  });
-
-  describe("batch - streaming & partial commit", () => {
-    it("batch chunks operations at 20 per round-trip", () => {
-      const ops = Array.from({ length: 55 }, (_, i) => ({
-        op: "create",
-        params: { type: "RECTANGLE", name: `rect-${i}` },
-      }));
-
-      // Chunks: [0-19], [20-39], [40-54]
-      const chunkSize = 20;
-      expect(Math.ceil(ops.length / chunkSize)).toBe(3);
-    });
-
-    it("batch reports per-index errors, not all-or-nothing", () => {
-      const ops = [
-        { op: "create", params: { type: "FRAME" } }, // ok
-        { op: "create", params: { type: "INVALID" } }, // error
-        { op: "create", params: { type: "TEXT" } }, // ok
-      ];
-
-      // Response: [{ ok, id }, { error }, { ok, id }]
-      // Index 1 failed, but 0 and 2 committed
-      expect(ops.length).toBe(3);
-    });
-
-    it("batch progress message resets timeout per chunk", () => {
-      // Chunk 0: completes in 5s → timeout resets
-      // Chunk 1: completes in 8s → timeout resets
-      // Total: 13s, but per-chunk timeout is 30s (so no timeout)
-      const perChunkTimeout = 30;
-      const totalTime = 13;
-
-      expect(totalTime).toBeLessThan(perChunkTimeout);
-    });
-
-    it("batch has no hard cap (200 ops processed fine)", () => {
-      const ops = Array.from({ length: 200 }, (_, i) => ({
-        op: "create",
-        params: { name: `item-${i}` },
-      }));
-
-      // All 200 should process via chunking
-      expect(ops.length).toBe(200);
-    });
-  });
-
-  describe("delete - force safety", () => {
-    it("delete without force refuses if node is component or in component set", () => {
-      const nodeId = "component-id";
-      const force = false;
-
-      // Error: cannot delete component, use force: true to override
-      expect(force).toBe(false);
-    });
-
-    it("delete with force allows component deletion", () => {
-      const nodeId = "component-id";
-      const force = true;
-
-      expect(force).toBe(true);
-      // Component deleted, all instances break
-    });
-  });
-
-  describe("fonts - fallback chain", () => {
-    it("unavailable font falls back Inter → system → first available", () => {
-      const requested = "SomeFancyFont";
-      const fallbackChain = ["SomeFancyFont", "Inter", "system"];
-
-      // Try each in order, first available wins
-      expect(fallbackChain[0]).toBe("SomeFancyFont");
-    });
-
-    it("response always includes { requestedFont, resolvedFont, reason }", () => {
-      const result = {
-        requestedFont: "SomeFancyFont",
-        resolvedFont: "Inter",
-        reason: "Requested font not available; fell back to Inter",
-      };
-
-      expect(result.requestedFont).toBeDefined();
-      expect(result.resolvedFont).toBeDefined();
-      expect(result.reason).toBeDefined();
-    });
-  });
-
-  describe("clone - child mapping", () => {
-    it("clone returns childMap: original→cloned id mapping", () => {
-      const original = {
-        id: "frame-1",
         children: [
-          { id: "text-1", name: "Title" },
-          { id: "rect-1", name: "Background" },
+          { type: "TEXT", name: "title", characters: "Hi" },
+          { type: "TEXT", name: "sub", characters: "There" },
         ],
-      };
+      }),
+    )) as { id: string };
+    const frame = mustGet(res.id);
+    expect(frame.children.map((c: FakeNode) => c.name)).toEqual(["title", "sub"]);
+    expect(frame.children.every((c: FakeNode) => c.parent === frame)).toBe(true);
+  });
 
-      const cloned = {
-        id: "frame-2",
-        childMap: {
-          "text-1": "text-2",
-          "rect-1": "rect-2",
+  it("forces the child parentId to the new parent — a spec parentId cannot leak to the page", async () => {
+    const res = (await create(
+      ctx({
+        type: "FRAME",
+        children: [{ type: "TEXT", parentId: "9:9", characters: "x" }],
+      }),
+    )) as { id: string };
+    const frame = mustGet(res.id);
+    // "9:9" does not exist; had the handler honoured it, this create would
+    // have thrown NODE_NOT_FOUND instead of nesting under the new frame.
+    expect(frame.children).toHaveLength(1);
+    expect(page.children.find((c: FakeNode) => c.type === "TEXT")).toBeUndefined();
+  });
+
+  it("recurses to arbitrary depth", async () => {
+    const res = (await create(
+      ctx({
+        type: "FRAME",
+        name: "card",
+        children: [
+          {
+            type: "FRAME",
+            name: "row",
+            children: [
+              { type: "TEXT", name: "label", characters: "L" },
+              { type: "TEXT", name: "value", characters: "V" },
+            ],
+          },
+        ],
+      }),
+    )) as { id: string };
+    const row = mustGet(res.id).children[0]!;
+    expect(row.type).toBe("FRAME");
+    expect(row.children.map((c: FakeNode) => c.name)).toEqual(["label", "value"]);
+  });
+
+  it("a failing child removes the parent it already placed — no half-built subtree", async () => {
+    // An unknown child type throws INVALID_PARAMS AFTER the outer frame was
+    // created and appended, which used to leave it orphaned on the canvas.
+    await expect(
+      create(
+        ctx({
+          type: "FRAME",
+          name: "doomed",
+          children: [{ type: "WIDGET" }],
+        }),
+      ),
+    ).rejects.toThrow();
+    expect(nodes.get([...nodes.keys()].find((id) => nodes.get(id)?.name === "doomed")!)?.removed).toBe(true);
+    expect(page.children.some((c: FakeNode) => c.name === "doomed" && !c.removed)).toBe(false);
+  });
+});
+
+describe("create — sizing safe defaults", () => {
+  it("auto-layout child under a fixed parent defaults counterAxisSizingMode to FIXED", async () => {
+    const parent = addParent();
+    const c = ctx({ type: "FRAME", parentId: parent.id, layoutMode: "HORIZONTAL", width: 100, height: 50 });
+    const res = (await create(c)) as { id: string };
+    const node = mustGet(res.id);
+    expect(node.counterAxisSizingMode).toBe("FIXED");
+    expect(c.warnings.some((w) => /counterAxisSizingMode/.test(w))).toBe(true);
+  });
+
+  it("an explicit counterAxisSizingMode is honoured and not warned about", async () => {
+    const parent = addParent();
+    const c = ctx({
+      type: "FRAME",
+      parentId: parent.id,
+      layoutMode: "HORIZONTAL",
+      counterAxisSizingMode: "AUTO",
+      width: 100,
+      height: 50,
+    });
+    const res = (await create(c)) as { id: string };
+    expect(mustGet(res.id).counterAxisSizingMode).toBe("AUTO");
+    expect(c.warnings.some((w) => /counterAxisSizingMode/.test(w))).toBe(false);
+  });
+});
+
+describe("create — clip warning", () => {
+  it("x + w beyond a clipsContent parent warns instead of silently clipping", async () => {
+    const parent = addParent("30:1", 320, 240);
+    parent.clipsContent = true;
+    const c = ctx({ type: "FRAME", parentId: parent.id, x: 260, width: 100 });
+    await create(c);
+    expect(c.warnings.some((w) => /clipped by its parent/.test(w))).toBe(true);
+  });
+});
+
+describe("create — text wrap safe defaults", () => {
+  it("wrap:true sets textAutoResize HEIGHT + layoutAlign STRETCH", async () => {
+    const res = (await create(
+      ctx({ type: "TEXT", wrap: true, characters: "A long paragraph" }),
+    )) as { id: string };
+    const node = mustGet(res.id);
+    expect(node.textAutoResize).toBe("HEIGHT");
+    expect(node.layoutAlign).toBe("STRETCH");
+  });
+
+  it("wrap:true under a parent with no fixed width warns", async () => {
+    // The fake page has no `width` property, like an unbounded canvas.
+    const c = ctx({ type: "TEXT", wrap: true, characters: "Text" });
+    await create(c);
+    expect(c.warnings.some((w) => /wrap:true set but parent has no fixed width/.test(w))).toBe(true);
+  });
+
+  it("wrap:true under a fixed-width parent does not warn", async () => {
+    const parent = addParent();
+    const c = ctx({ type: "TEXT", parentId: parent.id, wrap: true, characters: "Text" });
+    await create(c);
+    expect(c.warnings.some((w) => /no fixed width/.test(w))).toBe(false);
+  });
+});
+
+describe("create — overlay safe defaults", () => {
+  it("create_overlay makes a RECTANGLE sized to the parent, at 0,0 on top", async () => {
+    const parent = addParent("30:1", 320, 240);
+    const res = (await createOverlay(
+      ctx({ parentId: parent.id, color: "#000000", opacity: 0.3 }),
+    )) as { id: string };
+    const node = mustGet(res.id);
+    expect(node.type).toBe("RECTANGLE");
+    expect([node.x, node.y, node.width, node.height]).toEqual([0, 0, 320, 240]);
+    expect(node.opacity).toBe(0.3);
+    expect(node.fills[0].type).toBe("SOLID");
+    // "top" insert: the overlay is the last (front-most) child.
+    expect(parent.children[parent.children.length - 1]).toBe(node);
+  });
+
+  it("FRAME with opacity < 1 warns to use overlay instead", async () => {
+    const c = ctx({ type: "FRAME", opacity: 0.5 });
+    await create(c);
+    expect(c.warnings.some((w) => /opacity < 1 on a FRAME/.test(w))).toBe(true);
+  });
+});
+
+describe("create — relative layout", () => {
+  it("inset {left,right} stretches width against the parent", async () => {
+    const parent = addParent("30:1", 400, 300);
+    const res = (await create(
+      ctx({ type: "FRAME", parentId: parent.id, inset: { left: 16, right: 16 }, height: 100 }),
+    )) as { id: string };
+    const node = mustGet(res.id);
+    expect([node.x, node.width]).toEqual([16, 368]);
+  });
+
+  it("align center-x / center-y / center center within the parent", async () => {
+    const parent = addParent("30:1", 400, 300);
+    const cx = mustGet(
+      ((await create(ctx({ type: "FRAME", parentId: parent.id, align: "center-x", width: 100 }))) as { id: string }).id,
+    );
+    const cy = mustGet(
+      ((await create(ctx({ type: "FRAME", parentId: parent.id, align: "center-y", height: 50 }))) as { id: string }).id,
+    );
+    const cb = mustGet(
+      ((await create(ctx({ type: "FRAME", parentId: parent.id, align: "center", width: 100, height: 50 }))) as { id: string }).id,
+    );
+    expect(cx.x).toBe(150);
+    expect(cy.y).toBe(125);
+    expect([cb.x, cb.y]).toEqual([150, 125]);
+  });
+});
+
+describe("create — insertAt z-order", () => {
+  function parentWithKids(): FakeNode {
+    const parent = addParent();
+    for (const id of ["a", "b", "c"]) {
+      const kid = makeNode(id, "RECTANGLE");
+      parent.children.push(kid);
+      kid.parent = parent;
+    }
+    return parent;
+  }
+
+  it.each([
+    ["top", 3],
+    ["bottom", 0],
+    [{ above: "b" }, 2],
+    [{ below: "b" }, 1],
+    [1, 1],
+  ] as const)("insertAt %j lands at index %i", async (insertAt, index) => {
+    const parent = parentWithKids();
+    const res = (await create(
+      ctx({ type: "RECTANGLE", parentId: parent.id, insertAt }),
+    )) as { id: string };
+    expect(parent.children[index].id).toBe(res.id);
+  });
+});
+
+describe("modify — safe constraints", () => {
+  it("applies name, geometry and a hex fill to the real node", async () => {
+    const node = register(makeNode("10:1", "FRAME"));
+    await modify(ctx({ nodeId: "10:1", props: { name: "Renamed", w: 50, fill: "#2563eb" } }));
+    expect(node.name).toBe("Renamed");
+    expect(node.width).toBe(50);
+    expect(node.fills[0].color.b).toBeCloseTo(0xeb / 255, 2);
+  });
+
+  it("falls back to Inter for an unavailable fontFamily and warns", async () => {
+    const node = register(makeText("11:1"));
+    const c = ctx({ nodeId: "11:1", props: { fontFamily: "SomeFancyFont" } });
+    await modify(c);
+    expect(node.fontName.family).toBe("Inter");
+    expect(c.warnings.some((w) => /fell back/.test(w))).toBe(true);
+  });
+});
+
+describe("delete — force safety", () => {
+  function addComponentWithInstances(id: string, instanceCount: number): FakeNode {
+    const comp = register(makeNode(id, "COMPONENT"));
+    comp.getInstancesAsync = vi.fn(async () =>
+      Array.from({ length: instanceCount }, (_, i) => ({ id: `I${id};${i}` })),
+    );
+    return comp;
+  }
+
+  it("refuses to delete a component that still has instances", async () => {
+    addComponentWithInstances("20:1", 2);
+    const error = (await deleteNode(ctx({ nodeId: "20:1" })).catch((e) => e)) as HandlerError;
+    expect(error).toBeInstanceOf(HandlerError);
+    expect(error.code).toBe(ErrorCode.COMPONENT_IN_USE);
+    expect(error.hint).toMatch(/force:true/);
+  });
+
+  it("force:true deletes it anyway", async () => {
+    const comp = addComponentWithInstances("20:1", 2);
+    const res = (await deleteNode(ctx({ nodeId: "20:1", force: true }))) as any;
+    expect(res.deleted).toBe(true);
+    expect(comp.removed).toBe(true);
+  });
+
+  it("a component Figma soft-deletes (removed stays false, parent goes null) counts as deleted", async () => {
+    // Live: a main component keeps living for its instances' "Restore
+    // component" — `removed` never flips, only the parent link goes.
+    const comp = addComponentWithInstances("20:2", 1);
+    comp.parent = page;
+    comp.remove = function (this: FakeNode) {
+      this.parent = null;
+    };
+    const res = (await deleteNode(ctx({ nodeId: "20:2", force: true }))) as any;
+    expect(res).toMatchObject({ id: "20:2", deleted: true, instancesLeft: 1 });
+    expect(res.note).toMatch(/Restore component/);
+  });
+
+  it("removing the last variant reports the set went with it", async () => {
+    const set = register(makeNode("30:1", "COMPONENT_SET"));
+    set.name = "Button";
+    const variant = addComponentWithInstances("30:2", 0);
+    set.appendChild(variant);
+    const res = (await deleteNode(ctx({ nodeId: "30:2" }))) as any;
+    expect(res.componentSetDeleted).toBe("Button");
+  });
+
+  it("a page id is pointed at deletePage instead of 'not found'", async () => {
+    const pg = register(makeNode("0:9", "PAGE"));
+    pg.name = "Old";
+    const error = (await deleteNode(ctx({ nodeId: "0:9" })).catch((e) => e)) as HandlerError;
+    expect(error.code).toBe(ErrorCode.INVALID_PARAMS);
+    expect(error.hint).toMatch(/deletePage/);
+  });
+
+  it("a plain node deletes without force", async () => {
+    const node = register(makeNode("10:1", "FRAME"));
+    const res = (await deleteNode(ctx({ nodeId: "10:1" }))) as any;
+    expect(res).toEqual({ id: "10:1", deleted: true });
+    expect(node.removed).toBe(true);
+  });
+
+  it("a remove() that silently does nothing is reported, not claimed", async () => {
+    const node = register(makeNode("10:1", "FRAME"));
+    node.parent = page; // still attached
+    node.remove = () => {}; // e.g. a locked node — removed stays false
+    const error = (await deleteNode(ctx({ nodeId: "10:1" })).catch((e) => e)) as HandlerError;
+    expect(error.code).toBe(ErrorCode.INTERNAL);
+  });
+});
+
+describe("fonts — fallback chain", () => {
+  it("create TEXT reports {requestedFont, resolvedFont, reason} on substitution", async () => {
+    const res = (await create(
+      ctx({ type: "TEXT", characters: "Hi", fontFamily: "SomeFancyFont" }),
+    )) as any;
+    expect(res.font.requestedFont.family).toBe("SomeFancyFont");
+    expect(res.font.resolvedFont.family).toBe("Inter");
+    // `font` carries a reason only when a substitution happened.
+    expect(res.font.reason).toMatch(/fell back/);
+  });
+});
+
+describe("clone — child mapping", () => {
+  it("returns a childMap of original → cloned ids, including the root", async () => {
+    const original = register(makeNode("frame-1", "FRAME"));
+    const t1 = makeNode("text-1", "TEXT");
+    const r1 = makeNode("rect-1", "RECTANGLE");
+    original.children.push(t1, r1);
+    page.children.push(original);
+    original.parent = page;
+    original.clone = () => {
+      const c = makeNode("frame-2", "FRAME");
+      const t2 = makeNode("text-2", "TEXT");
+      const r2 = makeNode("rect-2", "RECTANGLE");
+      c.children.push(t2, r2);
+      return c;
+    };
+    const res = (await clone(ctx({ nodeId: "frame-1" }))) as any;
+    expect(res.id).toBe("frame-2");
+    expect(res.childMap).toEqual({
+      "frame-1": "frame-2",
+      "text-1": "text-2",
+      "rect-1": "rect-2",
+    });
+  });
+});
+
+describe("tokens — setupTokens", () => {
+  it("creates variables in one collection and writes every mode explicitly", async () => {
+    const res = (await setupTokens(
+      ctx({
+        tokens: {
+          colors: { primary: { light: "#ffffff", dark: "#000000" } },
+          numbers: { "radius-md": 8 },
         },
-      };
+      }),
+    )) as any;
+    expect(res.collection).toBe("Reqwise Tokens");
+    expect(res.modes).toEqual(["light", "dark"]);
+    expect(res.created).toEqual(["primary", "radius-md"]);
 
-      expect(cloned.childMap["text-1"]).toBe("text-2");
-      // Caller can edit the right descendant without name-based search
-    });
-
-    it("clone respects insertAt for z-order", () => {
-      const insertAt = { above: "some-node" };
-      // Cloned frame inserted after some-node
-      expect(insertAt.above).toBeDefined();
-    });
+    const primary = [...variablesById.values()].find((v) => v.name === "primary")!;
+    // Both modes got a real value — the old bug left non-default modes unset.
+    expect(primary.valuesByMode.m0.a).toBeCloseTo(1, 5);
+    expect(primary.valuesByMode.m1.r).toBe(0);
+    const radius = [...variablesById.values()].find((v) => v.name === "radius-md")!;
+    expect(radius.valuesByMode).toEqual({ m0: 8, m1: 8 });
   });
 
-  describe("tokens - session state", () => {
-    it("setupTokens stores token map in session.state.tokens (persist across calls)", () => {
-      const tokensJson = {
-        colors: { primary: "#2563EB", surface: "#0B0B0F" },
-        numbers: { "radius-md": 8 },
-      };
+  it("is idempotent: a second identical call updates, not recreates", async () => {
+    const params = { tokens: { colors: { primary: "#2563EB" } } };
+    const first = (await setupTokens(ctx(params))) as any;
+    expect(first.created).toEqual(["primary"]);
+    const second = (await setupTokens(ctx(params))) as any;
+    expect(second.created).toEqual([]);
+    expect(second.updated).toEqual(["primary"]);
+    expect(collections).toHaveLength(1);
+  });
+});
 
-      // First call: setupTokens
-      // Later call in same session: applyVariable can use state.tokens without re-declaring
-      expect(tokensJson.colors.primary).toBe("#2563EB");
-    });
-
-    it("setupTokens is idempotent (same tokens, same map)", () => {
-      const tokens1 = { colors: { primary: "#2563EB" } };
-      const tokens2 = { colors: { primary: "#2563EB" } };
-
-      // Both calls should result in identical state.tokens
-      expect(tokens1).toEqual(tokens2);
-    });
-
-    it("multi-mode variable sets all modes explicitly (not just current)", () => {
-      const modes = { light: { primary: "#fff" }, dark: { primary: "#000" } };
-
-      // When applying variable in a mode, both light and dark get set
-      expect(Object.keys(modes)).toHaveLength(2);
-    });
+describe("error reporting", () => {
+  it("a missing parentId throws HandlerError with code, message and hint", async () => {
+    const error = (await create(ctx({ type: "FRAME", parentId: "9:9" })).catch(
+      (e) => e,
+    )) as HandlerError;
+    expect(error).toBeInstanceOf(HandlerError);
+    expect(error.code).toBe(ErrorCode.NODE_NOT_FOUND);
+    expect(error.message).toContain("9:9");
+    expect(error.hint).toBeDefined();
   });
 
-  describe("error reporting", () => {
-    it("every error includes { code, message, hint }", () => {
-      const error = {
-        code: "NODE_NOT_FOUND",
-        message: "Node with id '12:34' not found in document",
-        hint: "Check the node id or use figma_read to find it",
-      };
-
-      expect(error.code).toBeDefined();
-      expect(error.message).toBeDefined();
-      expect(error.hint).toBeDefined();
+  it("toBridgeError passes HandlerError through and wraps anything else as INTERNAL", () => {
+    const handled = toBridgeError(
+      new HandlerError(ErrorCode.NODE_NOT_FOUND, "gone", "try get_selection"),
+    );
+    expect(handled).toEqual({
+      code: ErrorCode.NODE_NOT_FOUND,
+      message: "gone",
+      hint: "try get_selection",
     });
-
-    it("handler errors are caught and converted to OpError", () => {
-      // If handler throws, it's wrapped as { code, message, hint }
-      const thrown = new Error("Some internal issue");
-
-      // Should be caught and converted to OpError with code INTERNAL
-      expect(thrown).toBeDefined();
-    });
-  });
-
-  describe("safe defaults interaction", () => {
-    it("all 15 safe defaults work together (create text with wrap + inset + auto-layout parent)", () => {
-      // Parent: auto-layout HORIZONTAL, 320×100
-      // Create: TEXT with wrap:true, inset: { left: 16, right: 16 }
-
-      // Applied:
-      // 1. inset computes x=16, w=288
-      // 2. wrap sets layoutAlign=STRETCH, textAutoResize=HEIGHT
-      // 3. parent is auto-layout → child inherits layout orientation
-      // 4. font checked and loaded
-      // 5. bounds validated
-
-      const spec = {
-        type: "TEXT",
-        wrap: true,
-        inset: { left: 16, right: 16 },
-      };
-
-      expect(spec.wrap).toBe(true);
-      expect(spec.inset).toBeDefined();
-    });
+    const wrapped = toBridgeError(new Error("boom"));
+    expect(wrapped.code).toBe(ErrorCode.INTERNAL);
+    expect(wrapped.message).toBe("boom");
   });
 });

@@ -69,9 +69,7 @@ describe("validateOperation", () => {
     expect(isReadOp("generate_design_md")).toBe(true);
     expect(isWriteOp("set_gradient")).toBe(true);
     expect(isWriteOp("set_effects")).toBe(true);
-    expect(isWriteOp("set_instance_overrides")).toBe(true);
     expect(isWriteOp("set_selection_colors")).toBe(true);
-    expect(isWriteOp("get_instance_overrides")).toBe(true);
   });
 });
 
@@ -85,35 +83,7 @@ describe("validateOperation — edit-in-place ops", () => {
     }
   }
 
-  describe("get_instance_overrides", () => {
-    it("accepts an empty params object (defaults to selection)", () => {
-      const v = validateOperation("get_instance_overrides", {});
-      expect(v.op).toBe("get_instance_overrides");
-    });
-    it("accepts an optional nodeId and passes it through", () => {
-      const v = validateOperation("get_instance_overrides", { nodeId: "12:3" });
-      expect(v.params["nodeId"]).toBe("12:3");
-    });
-    it("rejects a blank nodeId when present", () => {
-      expect(codeOf(() => validateOperation("get_instance_overrides", { nodeId: "  " }))).toBe("INVALID_PARAMS");
-    });
-  });
 
-  describe("set_instance_overrides", () => {
-    it("accepts a source + non-empty target list", () => {
-      const v = validateOperation("set_instance_overrides", { sourceId: "1:1", targetIds: ["1:2", "1:3"] });
-      expect(v.params["targetIds"]).toEqual(["1:2", "1:3"]);
-    });
-    it("rejects a missing sourceId", () => {
-      expect(codeOf(() => validateOperation("set_instance_overrides", { targetIds: ["1:2"] }))).toBe("INVALID_PARAMS");
-    });
-    it("rejects an empty targetIds array", () => {
-      expect(codeOf(() => validateOperation("set_instance_overrides", { sourceId: "1:1", targetIds: [] }))).toBe("INVALID_PARAMS");
-    });
-    it("rejects a blank target id", () => {
-      expect(codeOf(() => validateOperation("set_instance_overrides", { sourceId: "1:1", targetIds: [" "] }))).toBe("INVALID_PARAMS");
-    });
-  });
 
   describe("set_selection_colors", () => {
     it("accepts a `to` color (nodeId + from optional)", () => {
@@ -269,102 +239,9 @@ describe("validate choke point covers direct AND rpc paths", () => {
   });
 });
 
-describe("validateOperation — instantiate by id or name", () => {
-  it("accepts componentId alone (legacy path)", () => {
-    const v = validateOperation("instantiate", { componentId: "1:2" });
-    expect(v.params["componentId"]).toBe("1:2");
-  });
 
-  it("accepts component or query without componentId", () => {
-    expect(validateOperation("instantiate", { component: "Button/Primary" }).params["component"]).toBe("Button/Primary");
-    expect(validateOperation("instantiate", { query: "button" }).params["query"]).toBe("button");
-  });
 
-  it("rejects when none of componentId/component/query is present", () => {
-    expect(() => validateOperation("instantiate", {})).toThrowError(OpError);
-    try {
-      validateOperation("instantiate", {});
-    } catch (e) {
-      expect((e as OpError).code).toBe("INVALID_PARAMS");
-      expect((e as OpError).message).toContain("componentId, component, query");
-    }
-  });
 
-  it("rejects blank strings", () => {
-    expect(() => validateOperation("instantiate", { component: "   " })).toThrowError(OpError);
-  });
-});
-
-describe("validateOperation — find_or_create_component", () => {
-  it("accepts name + spec + dryRun + threshold", () => {
-    const v = validateOperation("find_or_create_component", {
-      name: "Button",
-      spec: { type: "FRAME" },
-      dryRun: true,
-      threshold: 700,
-    });
-    expect(v.params["dryRun"]).toBe(true);
-    expect(v.params["threshold"]).toBe(700);
-  });
-
-  it("rejects a missing/blank name and non-boolean dryRun", () => {
-    expect(() => validateOperation("find_or_create_component", {})).toThrowError(OpError);
-    expect(() => validateOperation("find_or_create_component", { name: " " })).toThrowError(OpError);
-    expect(() =>
-      validateOperation("find_or_create_component", { name: "B", dryRun: "yes" }),
-    ).toThrowError(OpError);
-  });
-});
-
-describe("validateOperation — create_variants axes", () => {
-  it("accepts an axes matrix", () => {
-    const v = validateOperation("create_variants", {
-      baseSpec: { name: "Button" },
-      axes: { Size: ["sm", "md"], State: ["default"] },
-    });
-    expect(v.params["axes"]).toEqual({ Size: ["sm", "md"], State: ["default"] });
-  });
-
-  it("accepts legacy variants/states without axes", () => {
-    expect(() =>
-      validateOperation("create_variants", { baseSpec: {}, variants: ["a", "b"] }),
-    ).not.toThrow();
-    expect(() =>
-      validateOperation("create_variants", { baseSpec: {}, states: ["a"] }),
-    ).not.toThrow();
-  });
-
-  it("rejects an empty axis and a call with neither axes nor variants", () => {
-    expect(() =>
-      validateOperation("create_variants", { axes: { Size: [] } }),
-    ).toThrowError(OpError);
-    expect(() => validateOperation("create_variants", { baseSpec: {} })).toThrowError(OpError);
-  });
-});
-
-describe("validateOperation — new component ops", () => {
-  it("arrange_component_set needs nodeId; options typed", () => {
-    expect(() => validateOperation("arrange_component_set", {})).toThrowError(OpError);
-    const v = validateOperation("arrange_component_set", { nodeId: "5:0", gap: 32, columnsBy: "State" });
-    expect(v.params["gap"]).toBe(32);
-    expect(() =>
-      validateOperation("arrange_component_set", { nodeId: "5:0", gap: -1 }),
-    ).toThrowError(OpError);
-  });
-
-  it("set_component_description needs description or documentationLinks", () => {
-    expect(() => validateOperation("set_component_description", { nodeId: "1:2" })).toThrowError(OpError);
-    expect(() =>
-      validateOperation("set_component_description", { nodeId: "1:2", description: "" }),
-    ).not.toThrow();
-    expect(() =>
-      validateOperation("set_component_description", {
-        nodeId: "1:2",
-        documentationLinks: [{ uri: "https://x" }],
-      }),
-    ).not.toThrow();
-  });
-});
 
 describe("validateOperation — library + instance lifecycle ops", () => {
   it("get_library_component requires a key and a valid type", () => {
@@ -376,14 +253,6 @@ describe("validateOperation — library + instance lifecycle ops", () => {
     expect(v.params["key"]).toBe("abc");
   });
 
-  it("detach/reset require nodeId or nodeIds", () => {
-    for (const op of ["detach_instance", "reset_instance_overrides"]) {
-      expect(() => validateOperation(op, {}), op).toThrowError(OpError);
-      expect(() => validateOperation(op, { nodeIds: [] }), op).toThrowError(OpError);
-      expect(() => validateOperation(op, { nodeId: "1:2" }), op).not.toThrow();
-      expect(() => validateOperation(op, { nodeIds: ["1:2", "1:3"] }), op).not.toThrow();
-    }
-  });
 });
 
 describe("validateOperation — variable CRUD", () => {
@@ -410,6 +279,26 @@ describe("validateOperation — variable CRUD", () => {
     expect(() =>
       validateOperation("delete_variable", { variable: "x", replaceWith: "y", force: false }),
     ).not.toThrow();
+  });
+});
+
+describe("validateOperation — delete page/style", () => {
+  it("delete_page and delete_style need a target", () => {
+    expect(() => validateOperation("delete_page", {})).toThrowError(OpError);
+    expect(() => validateOperation("delete_page", { page: "Old", force: true })).not.toThrow();
+    expect(() => validateOperation("delete_style", {})).toThrowError(OpError);
+    expect(() =>
+      validateOperation("delete_style", { style: "brand", type: "paint", replaceWith: "x" }),
+    ).not.toThrow();
+    expect(() => validateOperation("delete_style", { style: "brand", type: "COLOR" })).toThrowError(OpError);
+  });
+
+  it("delete_unused_styles takes types, keep and confirm", () => {
+    expect(() => validateOperation("delete_unused_styles", {})).not.toThrow();
+    expect(() =>
+      validateOperation("delete_unused_styles", { types: ["TEXT", "effect"], keep: ["a"], confirm: "del-1-x" }),
+    ).not.toThrow();
+    expect(() => validateOperation("delete_unused_styles", { types: ["FONT"] })).toThrowError(OpError);
   });
 });
 

@@ -139,17 +139,19 @@ export function toEffectCore(spec: unknown): EffectOut {
   const s = (spec ?? {}) as Record<string, unknown>;
   const type = (s.type as string) ?? "DROP_SHADOW";
   if (type === "DROP_SHADOW" || type === "INNER_SHADOW") {
-    // Omitted color → sensible default shadow; a PRESENT but malformed color throws.
+    // Omitted color → a soft, modern default (tinted near-ink, low alpha, wide
+    // blur) rather than the harsh pure-black 0.25/2px/4px that reads as "2014".
+    // A PRESENT but malformed color still throws.
     const { r, g, b, a } =
       s.color === undefined
-        ? { r: 0, g: 0, b: 0, a: 0.25 }
+        ? { r: 0x1c / 255, g: 0x20 / 255, b: 0x24 / 255, a: 0.1 }
         : requireColor(s.color, `${type} color`);
-    const offset = (s.offset as { x: number; y: number }) ?? { x: 0, y: 2 };
+    const offset = (s.offset as { x: number; y: number }) ?? { x: 0, y: 4 };
     return {
       type,
       color: { r, g, b, a },
       offset,
-      radius: typeof s.radius === "number" ? s.radius : 4,
+      radius: typeof s.radius === "number" ? s.radius : 12,
       spread: typeof s.spread === "number" ? s.spread : 0,
       visible: s.visible !== false,
       blendMode: "NORMAL",

@@ -3,8 +3,9 @@
  *
  * - Speaks MCP over stdio (@modelcontextprotocol/sdk low-level Server, so we
  *   own the exact JSON schemas and the {code,message,hint} error shape).
- * - Registers 5 tools: figma_status, figma_read, figma_write, figma_rules,
- *   figma_docs.
+ * - Registers the tools: figma_status, figma_read, figma_write, figma_diagram,
+ *   figma_rules, figma_docs.
+ *   A userflow is figma_diagram type:"userflow".
  * - Elects leader/follower via the Coordinator. Every operation — a direct
  *   tool call on the leader, a figma.* call from the vm executor, or a
  *   follower forward arriving on /rpc — funnels through `runValidated()`, the
@@ -22,12 +23,15 @@ import {
 import { VERSION } from "./version.js";
 import { ErrorCode, OpError, toBridgeError } from "./errors.js";
 import { validateOperation } from "./validate.js";
+import { isProFeature, proFeatureMessage } from "../shared/editions.js";
 import { SessionRegistry } from "./session.js";
 import { Coordinator } from "./leader.js";
 import { Follower, STATUS_RPC_TIMEOUT_MS } from "./follower.js";
 import { executeWrite, type WriteResult } from "./executor.js";
+import { isDirectRun } from "./is-main.js";
 import {
   handleDocs,
+  handleDiagram,
   handleRead,
   handleRules,
   handleStatus,
@@ -42,7 +46,24 @@ import { READ_OPERATIONS, DEFAULT_PORT, PORT_RANGE } from "../shared/protocol.js
 
 // ---- JSON tool schemas (match ARCHITECTURE.md) ----
 
-const TOOLS: Tool[] = [
+/** Exported so a test can hold the advertised surface to what actually exists. */
+/**
+ * A shallow array property: the field list lives in one line of prose instead
+ * of a nested JSON Schema tree.
+ *
+ * Every byte of every tool definition is paid for in EVERY session, whether or
+ * not a diagram gets drawn, and the five per-type field trees were 14KB of it.
+ * The exact shape is still enforced — by the zod schemas in validate.ts, which
+ * answer a wrong call with INVALID_PARAMS and a hint — and figma_docs carries
+ * the full tables. Same trade the tool already makes for figma_write's `code`.
+ */
+const arrayOf = (description: string) => ({
+  type: "array" as const,
+  description,
+  items: { type: "object" as const, additionalProperties: true },
+});
+
+export const TOOLS: Tool[] = [
   {
     name: "figma_status",
     description:
@@ -78,7 +99,7 @@ const TOOLS: Tool[] = [
   {
     name: "figma_write",
     description:
-      "Execute modern-ES JavaScript in a sandbox against the figma.* proxy to draw/modify the canvas. NOT the official Figma Plugin API — read figma_docs(section=\"api\") before first use. Key rules: FRAME/COMPONENT without fill/fills is transparent (structural wrapper); visible cards/controls need an explicit fill, design-system radius and 12–24px padding. create() takes ONE spec object with parentId INSIDE it (omitting parentId drops the node at page level). Colors are \"#rrggbb\" or {r,g,b} 0..1. `state` persists across calls. Banned: require/process/fetch/timers/eval. Returns { ok, result, logs, warnings }.",
+      "Execute modern-ES JavaScript in a sandbox against the figma.* proxy to draw/modify the canvas. NOT the official Figma Plugin API — read figma_docs(section=\"api\") before first use. Key rules: FRAME/COMPONENT without fill/fills is transparent (structural wrapper); visible cards/controls need an explicit fill, design-system radius and 12–24px padding. create() takes ONE spec object with parentId INSIDE it (omitting parentId drops the node at page level). Colors are \"#rrggbb\" or {r,g,b} 0..1. `state` persists across calls. Drawing SCREENS? Ask the user first whether to map the userflow (figma_diagram type:\"userflow\") — create() warns you when the page has no flow, or has one the new screen is missing from. Banned: require/process/fetch/timers/eval. Returns { ok, result, logs, warnings }.",
     inputSchema: {
       type: "object",
       properties: {
@@ -100,6 +121,112 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "figma_diagram",
+    description:
+      "Draw a UML/BA diagram that is not a userflow, from a model YOU derived — the tool lays it out, draws it, and proof-reads the model. Pick `type` by the question it answers — its own description lists all six. Read figma_docs(section=\"activity\"|\"erd\"|\"sequence\"|\"sitemap\"|\"state\"|\"userflow\") for the field tables and the notation traps; the /figma-* skills carry the interview and the DO/DON'T tables. `warnings` are findings about the MODEL, not the drawing — an unlabelled handoff, a table with no primary key, a call nobody answers, a state nothing can leave — and they are the deliverable: act on each one, never fill a field to silence one. Compare `stats` with what you sent: anything a diagram of that kind cannot mean is DROPPED. One call does the lot: options.checkFirst proof-reads and draws only if clean, `audit` (render-side: overflow/clipping/truncation) comes back with the draw, and `diagrams: [...]` draws and places a whole set. For type:\"activity\", ASK the user LR (horizontal lanes) or TB before drawing. Arrows follow their boxes: dragging a shape re-routes live, dragging an arrow's END reconnects it, and figma.reflowDiagram() fixes one rearranged with the plugin closed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        diagrams: {
+          type: "array",
+          description: "Draw a SET in one call: one entry per diagram, each with its own type/title/content. The frames are PLACED for you (see `place`), so you never compute x/y from the previous box. Findings come back per entry, prefixed with its title. An entry may carry its own `update` (and `patch`) to redraw a frame that already exists: it keeps its id and its position, and does not take a slot in the placement — which is how you re-run a set without ending up with every diagram on the page twice.",
+          items: { type: "object", additionalProperties: true },
+        },
+        place: {
+          type: "string",
+          enum: ["column", "row", "none"],
+          description: "Batch layout: \"column\" (default) stacks the frames downwards from x/y, \"row\" lays them rightwards, \"none\" leaves every entry at its own x/y. An explicit x/y on an entry always wins.",
+        },
+        gap: { type: "number", description: "Gap between batched frames in px (default 250)." },
+        type: {
+          type: "string",
+          enum: ["activity", "erd", "sequence", "sitemap", "state", "userflow"],
+          description: "Which diagram to draw. activity = a business process (with or without swimlanes); erd = a data model of tables, columns and the keys that join them; sequence = the exchange between systems over time; sitemap = the product's PAGES and which page contains which — containment, NOT navigation; state = the lifecycle of ONE entity, the values it can hold and what moves it between them; userflow = the screens a user moves through, which alone takes `mermaid` rather than `text`.",
+        },
+        title: { type: "string", description: "Heading drawn on the frame, e.g. \"Purchase order approval\"." },
+        subtitle: { type: "string", description: "Optional one-line context under the title." },
+        text: {
+          type: "string",
+          description: "The COMPACT form — pass this INSTEAD of the arrays, at roughly a third of the tokens. One line per thing, `#` comments, and the ids that exist only to be referenced are generated for you. sequence: `actor u \"User\"` then `u ->> api: POST /pay` (`-->>` reply, `--)` async) with `alt … else … end` / `loop … end` written where they apply. activity: `lane sys \"System\"` then `sys: pay ? \"Paid?\"` and `a > b \"label\"` (`~>` rework). erd: a table then its indented columns `id uuid pk!`, and `users.id 1-* bookings.user_id \"books\"`. state: `paid \"Paid\" final ok` and `held -> paying: Event [guard] / action`. usecase: `system \"…\"`, `uc book \"Book seats\"`, then `visitor - book` / `book => hold` / `login +> book` / `member :> visitor`. journey: `phase pay \"Thanh toán\"` then `do`/`at`/`think`/`feel`/`pain`/`fix`. persona: `source \"4 phỏng vấn\"`, then `persona tu \"Tên\" primary` and `tag`/`fact`/`quote`/`bio`/`behav`/`goal`/`pain`/`need`/`want`/`level \"X\" 4`/`app`. sitemap: `crm \"CRM\"`, children INDENTED under their parent; `screen:<artboardId>`, `/ detail`. FULL grammar per kind: figma_docs({ section, level: \"cheat\" }) — read it once before your first one. Any line it cannot read is REPORTED, never dropped. NOT for type:\"userflow\", which takes `mermaid`.",
+        },
+        mermaid: {
+          type: "string",
+          description: "type:\"userflow\" ONLY — a mermaid `flowchart TD` source, used INSTEAD of nodes+edges. Every other kind uses `text`, a different grammar; passing `text` to a userflow is an error it cannot diagnose.",
+        },
+        parentId: { type: "string", description: "Parent frame/section id. Omitted → the frame lands on the current page." },
+        x: { type: "number", description: "Frame x on the page (default 0). Place blocks yourself so they don't stack." },
+        y: { type: "number", description: "Frame y on the page (default 0)." },
+        update: {
+          type: "string",
+          description: "Redraw THIS frame (the `frameId` a diagram tool returned) instead of making a new one. It keeps its id, so comments on it, prototype links into it and wherever the user dragged it all survive. With `patch` the spec is not needed at all; without one, the spec in this call replaces what the frame holds.",
+        },
+        patch: arrayOf(
+          "Change the model the frame already stores — needs `update`, and NOTHING else of the model, because the frame is the source. Each op: { collection, id|where|at, set:{…} } | { collection, add:{…}, after? } | { collection, remove: id }. `collection` is any array of the kind (messages, entities, transitions, links, nodes, edges, …); omit it to set a field on the diagram itself (title, system, …). Select by `id`, or by `where:{from,to}` for the collections that have none, or `at:<index>`. Applied in order, then checked like any other spec. Read what is there first with figma_read op:\"get_diagram_spec\".",
+        ),
+        participants: arrayOf(
+          "sequence — the columns, left to right. id, name, detail?, kind?(actor|system|external|queue|db), cls?",
+        ),
+        messages: arrayOf(
+          "sequence — the arrows, IN TIME ORDER: the array IS the diagram. id, from, to, label (say WHAT is sent), kind?(sync default, opens an activation bar|async|return, which CLOSES it), note?, cls?. from===to is a self-message",
+        ),
+        fragments: arrayOf(
+          "sequence — alt/opt/loop/par/break around a CONTIGUOUS run. kind, label, messages[] (ids), else?{label,messages[]}",
+        ),
+        entities: arrayOf(
+          "erd — the tables. id, name, detail?, cls?(happy|edge|error), external?, attributes[]{name,type?,key?(pk|fk|pfk),required?}",
+        ),
+        relations: arrayOf(
+          "erd — what joins to what. from, to, fromField/toField (NAME THE COLUMNS), fromCard?/toCard?(one|many|zero-one|zero-many|one-many), label?, identifying?, fromSide?/toSide?. Many-to-many is not storable: add the join table",
+        ),
+        pages: arrayOf(
+          "sitemap — the pages. id, label, parent (the page that CONTAINS it, never the page you came FROM; omit on the root), kind?(page|section: a nav heading with no page of its own|modal|external), detail?, screenId? (ONE artboard id, or a LIST: the page plus its states — a list page and its empty state are one page), cls?. There is NO edges array: the tree is the parents",
+        ),
+        states: arrayOf(
+          "state — every value the ONE entity can hold. id (the value the SYSTEM stores), label?, kind?(initial: exactly one|final|choice|fork|join), entry?/do?/exit?, detail?, cls?",
+        ),
+        transitions: arrayOf(
+          "state — every change allowed, as `event [guard] / action`. from, to, event?, guard? (two transitions on one event NEED guards), action?, kind?(return for a way back), cls?, fromSide?/toSide?/fromAt?/toAt?",
+        ),
+        lanes: arrayOf(
+          "activity — one band per OWNER (a role/team/system that DOES something, never a system layer). id, label, detail?. Omit for a plain activity diagram",
+        ),
+        nodes: arrayOf(
+          "activity — the steps: id, label, lane (REQUIRED once the diagram has lanes; a step nobody owns is reported), kind?(action|decision needs >=2 labelled branches|start|end|fork|join|event|external), cls?. userflow — the screens: id, label, detail?, kind?(screen|decision|terminal|external|state), cls?, screenId?, slug?",
+        ),
+        edges: arrayOf(
+          "activity/userflow — from, to, label (on a lane crossing say WHAT is handed over; an unlabelled handoff is reported), event? (userflow: what CAUSES it), kind?(return: dashed, routed outside), fromSide?/toSide?/fromAt?/toAt?",
+        ),
+        options: {
+          type: "object",
+          properties: {
+            rankdir: { type: "string", enum: ["TB", "LR"], description: "LR (default) runs a process left→right with horizontal lanes; TB downwards. For state/userflow it is simply which way it reads (userflow defaults TB)." },
+            font: { type: "string", description: "Font for every label. Default Inter, which has NO CJK/Hangul glyphs — a Vietnamese diagram is fine, a Japanese or Korean one renders BLANK without e.g. \"Noto Sans KR\". Check with figma_read get_fonts." },
+            colorByTarget: { type: "boolean", description: "Colour each arrow by the class of what it points at (default true)." },
+            liveRoute: { type: "boolean", description: "Keep arrows attached when a shape is dragged (default true)." },
+            linkScreens: { type: "boolean", description: "type:\"userflow\" — wire ON_CLICK → NAVIGATE from each screen box to the artboard whose name contains its screenId. Unmatched ids are reported, never guessed." },
+            dryRun: { type: "boolean", description: "Check and return findings + size WITHOUT drawing. It never reaches the plugin, so it proves nothing about the write path — use figma_status." },
+            checkFirst: { type: "boolean", description: "Check, and draw ONLY if there are no findings. Dirty → `checkedOnly: true` + the findings, nothing drawn. All-or-nothing across a `diagrams` batch." },
+            layout: { type: "string", enum: ["tree", "dagre"], description: "type:\"sitemap\" — tree (default, keeps the nav order you wrote) or dagre." },
+            maxDepth: { type: "number", description: "type:\"sitemap\" — levels allowed before depth is reported, root = 1 (default 4, i.e. three clicks in)." },
+            verify: { type: "boolean", description: "Return layout_audit of the frame just drawn as `audit` (default TRUE — it costs no round trip)." },
+            policies: {
+              type: "object",
+              description: "Rules that have a VALUE: { \"hold-minutes\": 10, \"retry-attempts\": 3 }. Reference one from any label as `@hold-minutes` and it is filled in when drawn — \"Giữ ghế @hold-minutes phút\" draws \"Giữ ghế 10 phút\". Two diagrams then cannot quote one rule differently. The reference survives into the stored model, so get_page_model can say which frames depend on a rule.",
+              additionalProperties: { type: ["string", "number"] },
+            },
+            crossCheck: { type: "boolean", description: "Compare the drawing against the other diagrams on its page and return contradictions as `consistency`; a sitemap also gets `coverage` — pages with no artboard yet, artboards belonging to no page (default TRUE; costs no round trip)." },
+          },
+          additionalProperties: false,
+        },
+        channel: { type: "string", description: "Target Figma window's channel; omit with a single window." },
+      },
+      // One diagram needs type+title; a `diagrams` batch carries them per entry,
+      // so the pair is checked in the handler, with a hint instead of a schema error.
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "figma_rules",
     description:
       "One-call design-system rule sheet as markdown: styles + variables + components, fetched in parallel. Read before drawing so you reuse tokens/components instead of hardcoding.",
@@ -117,7 +244,7 @@ const TOOLS: Tool[] = [
   {
     name: "figma_docs",
     description:
-      "On-demand documentation for this API and its safe-by-default rules. Sections: rules | layout | api | tokens | icons | recipes.",
+      "On-demand documentation for this API and its safe-by-default rules. Sections: rules | layout | api | tokens | icons | recipes | style | userflow | activity | erd | sequence | sitemap | state. Read `style` when drawing a screen with NO design.md / no existing design system — it is the default type scale, spacing grid, color palette and elevation to fall back on instead of inventing values (which reads as generic/lifeless).",
     inputSchema: {
       type: "object",
       properties: {
@@ -125,6 +252,11 @@ const TOOLS: Tool[] = [
           type: "string",
           enum: [...DOC_SECTION_NAMES],
           description: "Which doc section to return.",
+        },
+        level: {
+          type: "string",
+          enum: ["full", "cheat"],
+          description: "\"cheat\" returns just the call shape and the field tables — a fraction of the tokens, enough to write the call. \"full\" (default) adds the findings this kind reports, the notation traps and the layout notes: read it when a warning needs explaining, or the first time you draw this kind.",
         },
       },
       required: ["section"],
@@ -520,12 +652,20 @@ async function callTool(ctx: ToolContext, name: string, args: Record<string, unk
         args["sessionId"] as string | undefined,
         args["channel"] as string | undefined,
       );
+    case "figma_diagram": {
+      const { type, channel, ...spec } = args;
+      return handleDiagram(ctx, type, spec, channel as string | undefined);
+    }
     case "figma_rules":
       return handleRules(ctx, args["channel"] as string | undefined);
     case "figma_docs":
-      return handleDocs(String(args["section"] ?? ""));
+      return handleDocs(String(args["section"] ?? ""), args["level"] === "cheat" ? "cheat" : "full");
     default:
-      throw new OpError(ErrorCode.INVALID_PARAMS, `Unknown tool "${name}".`, "Tools: figma_status, figma_read, figma_write, figma_rules, figma_docs.");
+      if (isProFeature(name)) {
+        const pro = proFeatureMessage(name);
+        throw new OpError(ErrorCode.INVALID_PARAMS, pro.message, pro.hint);
+      }
+      throw new OpError(ErrorCode.INVALID_PARAMS, `Unknown tool "${name}".`, "Tools: figma_status, figma_read, figma_write, figma_diagram, figma_rules, figma_docs.");
   }
 }
 
@@ -625,14 +765,12 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-// Only auto-run when executed directly (not when imported by tests).
-const isMain = (() => {
-  try {
-    return process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`;
-  } catch {
-    return false;
-  }
-})();
+// Only auto-run when executed directly (not when imported by tests). The
+// string-compare form (`import.meta.url === "file://" + argv[1]`) silently
+// failed on paths with spaces and on any launch through a symlink — including
+// the npm `bin` entry — exiting 0 with no tools. isDirectRun realpaths both
+// sides; see is-main.ts.
+const isMain = isDirectRun(import.meta.url, process.argv[1]);
 
 if (isMain) {
   main().catch((err) => {

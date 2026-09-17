@@ -22,7 +22,8 @@ describe("figma_rules empty-design-system guidance", () => {
     });
     const md = await handleRules(ctx);
     expect(md).toContain("No design system in this file");
-    expect(md).toContain("PROPOSE a small palette to the user");
+    // Points the agent at the default-style fallback instead of inventing values.
+    expect(md).toContain('figma_docs(section="style")');
     expect(md).toContain("setupTokens");
     expect(md).toContain("design.md");
   });

@@ -61,6 +61,14 @@ export function serializeNode(
     const o = (node as BlendMixin).opacity;
     if (o !== 1) base.opacity = r2(o);
   }
+  // A VECTOR's own geometry, in PARENT coordinates — the same `points` shape
+  // create and modify take. Without it an agent asked to move an arrow's
+  // connection point has no way to see where the arrow currently is.
+  if (node.type === "VECTOR") {
+    const pts = polylinePoints(node as VectorNode);
+    if (pts) base.points = pts;
+  }
+
   if ("layoutMode" in node) {
     const f = node as FrameNode;
     if (f.layoutMode !== "NONE") {
@@ -111,12 +119,65 @@ export function serializeNode(
   if ("children" in node) {
     base.childCount = (node as ChildrenMixin).children.length;
   }
+  const reactions = summarizeReactions(node);
+  if (reactions) base.reactions = reactions;
   if (detail !== "design") {
     return base;
   }
 
   addDesignFields(base, node);
   return base;
+}
+
+/**
+ * Prototype links, compactly — `"AFTER_TIMEOUT 2s → 12:34 NAVIGATE"`.
+ *
+ * `set_reactions` could write a prototype link and nothing could read one
+ * back, which made a wiring bug invisible to everything except playing the
+ * prototype by hand. Only nodes that actually have reactions pay for this
+ * (they are a handful in any file), the same rule empty strokes and effects
+ * already follow.
+ */
+function summarizeReactions(node: BaseNode): string[] | null {
+  if (!("reactions" in node)) return null;
+  const list = (node as SceneNode & { reactions?: readonly Reaction[] }).reactions;
+  if (!list || list.length === 0) return null;
+  const out: string[] = [];
+  for (const reaction of list) {
+    const trigger = reaction.trigger as
+      | (Record<string, unknown> & { type?: string; timeout?: number; delay?: number })
+      | null;
+    let when = String(trigger?.type ?? "?");
+    const wait = trigger?.timeout ?? trigger?.delay;
+    // Figma stores timeout/delay in MILLISECONDS as a 32-bit float — 1800 can
+    // come back as 1799.9999…. Shown in seconds like every other duration
+    // this tool reports, rounded so Figma's storage noise reads as the value
+    // we wrote.
+    if (typeof wait === "number") when += ` ${Math.round((wait / 1000) * 100) / 100}s`;
+    const actions = [
+      ...(reaction.action ? [reaction.action] : []),
+      ...((reaction as Reaction & { actions?: readonly Action[] }).actions ?? []),
+    ];
+    const seen = new Set<string>();
+    for (const action of actions) {
+      const a = action as Record<string, unknown> | null;
+      if (!a) continue;
+      const type = String(a.type ?? "?");
+      const where =
+        type === "NODE"
+          ? `${String(a.destinationId ?? "?")} ${String(a.navigation ?? "NAVIGATE")}`
+          : type === "URL"
+            ? String(a.url ?? "")
+            : type;
+      const transition = a.transition as { type?: string } | null | undefined;
+      const how = transition?.type ? ` ${transition.type}` : "";
+      const line = `${when} → ${where}${how}`;
+      if (seen.has(line)) continue; // action and actions[0] are the same link
+      seen.add(line);
+      out.push(line);
+    }
+  }
+  return out.length > 0 ? out : null;
 }
 
 /**
@@ -348,4 +409,25 @@ export function plainValue(value: unknown, depth = 0): unknown {
     return out;
   }
   return String(value);
+}
+
+/**
+ * `[[x,y], ...]` in parent space when the vector is a plain polyline (which is
+ * what every diagram arrow is). Curves and multi-part paths are left out
+ * rather than half-described.
+ */
+function polylinePoints(node: VectorNode): Array<[number, number]> | null {
+  const paths = node.vectorPaths;
+  if (paths.length !== 1) return null;
+  const data = paths[0]!.data;
+  if (/[CQAScqas]/.test(data)) return null;
+  const out: Array<[number, number]> = [];
+  const re = /([ML])\s*(-?[\d.]+)[\s,]+(-?[\d.]+)/g;
+  let m: RegExpExecArray | null;
+  let moves = 0;
+  while ((m = re.exec(data))) {
+    if (m[1] === "M" && ++moves > 1) return null;
+    out.push([r2(Number(m[2]) + node.x), r2(Number(m[3]) + node.y)]);
+  }
+  return out.length >= 2 ? out : null;
 }

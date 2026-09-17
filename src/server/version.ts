@@ -26,3 +26,14 @@ function resolveVersion(): string {
 }
 
 export const VERSION = resolveVersion();
+
+/**
+ * When the dist this process is RUNNING was built.
+ *
+ * Node reads a bundle once, at startup, so a rebuild is invisible to a server
+ * that is already running — and that is indistinguishable, from the outside,
+ * from a fix that did not work. Reported next to the plugin's own stamp so
+ * figma_status can say which half is behind instead of leaving it to be
+ * guessed, which has cost this project hours more than once.
+ */
+export const BUILD = typeof __BUILD__ !== "undefined" ? __BUILD__ : "dev";

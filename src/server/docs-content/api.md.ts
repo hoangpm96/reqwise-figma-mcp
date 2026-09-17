@@ -21,6 +21,11 @@ A malformed color THROWS — it is never silently replaced.
   \`create(spec, parentId)\` also works, but prefer parentId inside the spec.
   OMITTING parentId puts the node at PAGE level — always parent screen
   content explicitly.
+  A node that lands on the page (or a section) never covers existing work:
+  if it overlaps anything — no x/y, or a guessed x/y — it keeps its x and is
+  MOVED down until clear, with a warning saying where. Nodes of ONE
+  figma_write call move together, so a row of screens stays a row.
+  \`allowOverlap: true\` lays it on top on purpose. Same for clone/instantiate.
   FRAME/COMPONENT nodes are transparent when both \`fill\` and \`fills\` are
   omitted (Figma's default white fill is cleared), so structural wrappers do
   not become accidental white slabs. Declare a fill for visible surfaces.
@@ -28,6 +33,12 @@ A malformed color THROWS — it is never silently replaced.
   flat \`paddingLeft\`/\`paddingRight\`/\`paddingTop\`/\`paddingBottom\`.
   Radius accepts \`cornerRadius\` plus the common \`borderRadius\`/\`radius\`
   aliases and per-corner radius fields.
+  \`children: [spec, ...]\` builds a whole subtree in ONE call — each entry is a
+  full create spec (its own type/fills/tokens/textStyle/children), parented to
+  the node being created, in array order (index 0 = bottom of the z-stack). This
+  is the reliable way to lay out a screen: declare the tree once instead of
+  appending node-by-node. (INSTANCE children aren't supported inside \`children\` —
+  instantiate components, then \`move\` them into the built frame.)
 - \`modify(nodeId, props)\` → patch properties.
 - \`delete(nodeId, {force})\` (alias \`del\`).
 - \`clone(nodeId, {parentId, insertAt})\` → \`{id, childMap}\` mapping ORIGINAL
@@ -40,47 +51,37 @@ A malformed color THROWS — it is never silently replaced.
   (skip echoing a full node per item on large create batches).
 
 ## Components
-- \`findComponent(query)\` fuzzy match across COMPONENT and COMPONENT_SET nodes
-  (normalized name, set/variant /-path aware). Results expose type/path and a
-  component set's defaultVariantId.
-- \`findOrCreateComponent(name, spec, {dryRun, threshold})\` — reuse-first.
-  Always returns \`decision: "reuse"|"create"\` + \`score\` + \`reason\`;
-  \`dryRun: true\` decides without creating (create branch lists candidates).
-- \`instantiate(componentIdOrName, {parentId, props, overrides})\` — pass a
-  component id OR a name query ("Button/Primary"); names resolve via the same
-  fuzzy match as findComponent (below-threshold → error listing candidates).
-  Result carries \`resolved: {via: "id"|"query", score?}\`. Prefer \`props\`
-  for Figma component properties; use layer-name \`overrides\` only as a fallback.
-  Text overrides on layers wired to a component property are applied through
-  setProperties (auto-layout reflows correctly); the result reports each one in
-  \`overridesApplied: [{target, field, appliedVia: "property"|"name", ok}]\`.
-- \`createVariants(baseSpec, variantsOrAxes)\` — real Figma component set.
-  Multi-axis: pass \`{Size: ["sm","md"], State: ["default","hover"]}\` →
-  Cartesian matrix ("Size=sm, State=hover", max 50 combos). Legacy single-axis
-  list still works; object entries may add per-variant spec overrides
-  (\`{name: "State=Hover", fills: [...]}\`).
-- \`arrangeComponentSet(setId, {gap, padding, columnsBy})\` — grid the variants
-  of a COMPONENT_SET: columns iterate \`columnsBy\` (default: last axis),
-  rows iterate the remaining axis combinations; the set resizes to fit.
-- \`setComponentDescription(id, "markdown text")\` (or
-  \`{description, documentationLinks: [{uri}]}\`) — document a COMPONENT /
-  COMPONENT_SET; empty string clears. get_component reads it back.
 - \`getLibraryComponent(key)\` — import a component/set from a PUBLISHED
   shared library by key; returns the same rich shape as get_component
   (props + variants + anatomy = reconstruction spec). Instantiate the result
   via its id.
-- \`detachInstance(idOrIds)\` / \`resetInstanceOverrides(idOrIds)\` — detach
-  instance(s) into plain frames / reset instance(s) to the main component.
-  Per-target try/catch; result lists ok/error per id.
-- \`componentize(nodeId, {name, replaceCopies, scope})\` — turn a drawn tree
-  into a COMPONENT in place and (default on) replace every structural copy
-  (same type/name tree) on the page — or \`scope: "document"\` — with an
-  instance at the same spot. Draw once, reuse everywhere.
 
 ## Tokens & variables
 - \`setupTokens(tokensJson)\` — DTCG-ish {colors, numbers, strings} → Variables,
   idempotent, stored in \`state.tokens\`. Sets ALL modes explicitly.
-- \`applyVariable(nodeId, field, tokenName)\`.
+- \`setupTextStyles(styles)\` — typography ramp → LOCAL text styles, upserted by
+  name (idempotent, like setupTokens). Each entry: \`{ name, fontSize,
+  fontFamily?, weight? (100–900) | fontStyle? ("Medium"), lineHeight?
+  (px | "150%" | "auto"), letterSpacing?, description? }\`. Fonts resolve
+  through the fallback chain; substitutions come back as warnings.
+- \`setTextStyle(nodeId, styleNameOrId)\` — apply a local text style to a TEXT
+  node; a miss throws listing candidate names.
+- \`setupEffectStyles(styles)\` — elevation ramp → LOCAL effect styles, upserted
+  by name (idempotent). Each entry: \`{ name, effects:[<shadow|blur>...],
+  description? }\` where each effect is the same shape as create({effects}):
+  \`{type:"DROP_SHADOW", color:"#rrggbbaa", offset:{x,y}, radius, spread?}\` or
+  \`{type:"LAYER_BLUR", radius}\`. This is what makes elevation TOKENIZABLE —
+  define \`elevation/card\`, \`elevation/overlay\` once, reuse everywhere. Prefer
+  layered, low-alpha, ink-tinted shadows over one harsh black shadow; see
+  figma_docs(section="style"). Apply with setEffects or by binding the style.
+- \`applyVariable(nodeId, field, tokenName)\` — friendly fields expand:
+  \`fill\`→fills, \`cornerRadius\`→all four corners, \`padding\`→all four paddings.
+- **Create-time binding (prefer this over hex-then-bind):** in a create spec,
+  \`fill: "$color/primary/500"\` / \`stroke: "$..."\` bind that variable as the
+  paint, \`textStyle: "Title 02"\` applies a text style to a TEXT node, and
+  \`tokens: { cornerRadius: "radius/md", padding: "space/4" }\` binds any other
+  field — one call, no follow-up applyVariable. Unknown token/style names throw
+  BEFORE the node is created.
 - Variable CRUD: \`createVariable(name, {value|valuesByMode, type?, collection?,
   description?})\` (type inferred from the value; \`value\` writes ALL modes,
   \`valuesByMode: {light: "#fff", dark: "#111"}\` targets/creates modes),
@@ -107,15 +108,41 @@ A malformed color THROWS — it is never silently replaced.
   drawn by the plugin.
 - \`loadImage(urlOrBase64)\`.
 
+## Userflow
+- \`userflow(spec)\` — draw a userflow: screen boxes, decision diamonds,
+  labelled arrows, dashed return paths in side gutters. The GRAPH is your own
+  analysis of the spec (\`nodes\`/\`edges\`, or a \`mermaid\` source); layout,
+  routing and the graph proof-read are the tool's. Returns
+  \`{ frameId, nodes: {flowId: figmaNodeId}, warnings, stats }\`, where
+  \`warnings\` names the holes in the flow (a decision with one way out, a dead
+  end, an unreachable node, a screen with no screenId). Ask the user whether to
+  map the flow BEFORE drawing screens. Full reference:
+  figma_docs(section="userflow"). Also available as \`figma_diagram\` \`type:"userflow"\`
+  tool.
+- \`reflowDiagram({ frameId? })\` — put a drawn diagram's arrows back on its
+  boxes after somebody rearranged them (userflow or activity). While the plugin is open this happens
+  by itself on every drag (Figma Design has no connector node, so the plugin
+  re-routes the vectors); this op is the same pass on demand, for a flow moved
+  with the plugin closed. Omit \`frameId\` for every userflow on the page. It
+  re-routes the LINES only — the boxes stay where the user put them. An arrow
+  somebody moved BY HAND is left alone and reported as \`pinned\`;
+  \`{ force: true }\` re-routes those too. To steer a connection point without
+  giving up the following, pass \`fromAt\`/\`toAt\` (0..1) on the edge instead.
+
+## Drawing primitives worth knowing
+- \`create({type:"VECTOR", points:[[x,y],...], closed?})\` — a polyline (or a
+  filled shape with \`closed:true\`) in PARENT coordinates; the plugin
+  normalizes it into a local path plus x/y. Raw \`vectorPaths\` still work.
+- \`create({type:"POLYGON", pointCount:4, ...})\` — pointCount 4 is a diamond,
+  3 a triangle. \`STAR\` takes \`pointCount\` + \`innerRadius\`.
+- \`strokeCap\` (\`"ARROW_LINES"\`, \`"ROUND"\`, …), \`strokeJoin\`,
+  \`strokeAlign\`, \`dashPattern:[6,4]\` and \`rotation\` all apply on
+  \`create\` — no second \`modify\` round-trip. A \`LINE\` honours \`w\`
+  instead of keeping Figma's native 100px.
+
 ## Edit-in-place (composite ops)
 These change existing nodes rather than drawing new ones. See the
 "Edit-in-place lifecycle" in figma_docs(section="recipes").
-- \`getInstanceOverrides(nodeId?)\` → the overrides of a component instance
-  (defaults to the current selection). Pair with setInstanceOverrides.
-- \`setInstanceOverrides(sourceId, targetIds)\` — format-painter: copy the
-  overrides captured from \`sourceId\` onto every instance in \`targetIds\`
-  (\`targetIds\` is a non-empty array). Both must be instances of the same
-  component.
 - \`setSelectionColors(nodeId, { from?, to, includeStrokes? })\` — recursively
   recolor a subtree: swap every fill matching \`from\` (hex; omit to replace ALL
   solid fills) to \`to\`. \`includeStrokes: true\` also recolors strokes. \`nodeId\`
@@ -130,6 +157,18 @@ These change existing nodes rather than drawing new ones. See the
   "BACKGROUND_BLUR", color?: "#rrggbbaa", offset?: { x, y }, radius, spread? }\`.
   Shadows need \`color\`/\`offset\`/\`radius\` (\`spread\` optional); blurs need only
   \`radius\`.
+- \`setReactions(nodeId, reactions)\` — replace a node's prototype reactions
+  (click-through wiring). Each reaction: \`{ trigger: { type: "ON_CLICK" |
+  "ON_HOVER" | "AFTER_TIMEOUT" | ... }, action: { type: "NODE", destinationId,
+  navigation?: "NAVIGATE" | "SWAP" | "OVERLAY", transition?,
+  preserveScrollPosition? } }\` (also \`{ type: "BACK" | "CLOSE" }\` and
+  \`{ type: "URL", url }\`). Omitted \`transition\` defaults to SMART_ANIMATE /
+  EASE_IN_AND_OUT / 0.3s; pass \`transition: null\` for an instant jump.
+  \`destinationId\` must be an existing node; \`[]\` clears all reactions. Example:
+  \`setReactions(btn.id, [{ trigger: { type: "ON_CLICK" }, action: { type:
+  "NODE", destinationId: frame.id, navigation: "NAVIGATE" } }])\`.
+  \`trigger.timeout\` (AFTER_TIMEOUT) and \`trigger.delay\` (MOUSE_*) are in
+  SECONDS, like transition duration — the plugin converts to Figma's ms.
 
 ## Reads (usable from write code too)
 - \`getNode(id)\` (alias \`getNodeById\`) → a flat SNAPSHOT object
@@ -149,13 +188,23 @@ These change existing nodes rather than drawing new ones. See the
   the user picked: readSelection → modify → layoutAudit.
 - \`getStyles()\`, \`getVariables()\`, \`getComponents({detail:"design"})\`,
   \`getComponent(componentId)\`, \`getDesignSystemKit({depth?})\`, \`getFonts(families)\`.
+- \`generateDesignMd(...)\` → \`{ markdown, fingerprint, extraction }\`. The
+  markdown is the machine-generated design-kit file (save it as \`design-kit.md\`
+  in the codebase, NOT hand-edited); its top carries a \`<!-- dsfp:… -->\`
+  fingerprint of the DS shape.
+- \`designFingerprint()\` → \`{ counts, hash }\` — a CHEAP shape hash of the current
+  design system (token/style/component NAMES + counts), no full scan. At the
+  start of a draw session, compare it to the \`dsfp:\` in the cached
+  design-kit.md: if they differ the DS changed since the file was written —
+  regenerate before trusting it. Renaming/adding/removing a token or component
+  changes the hash; recolouring an existing token does not.
 - \`generateDesignMd({ depth?, screenDepth?, includeAnatomy?, includeScreens?,
   includeComponentUsage?, maxComponents?, maxScreens?, maxInstances?,
   maxVariantsPerComponent?, maxTextLayersPerComponent?, maxOutputChars? })\` —
   the durable spec of an existing Figma system: coverage, screen composition,
   observed usage, exact ids/keys/variants/property keys, token names, style refs
   and text layers. Call it before building UI from an existing system and save
-  the markdown as \`design.md\`. Output limits omit whole sections rather than
+  the markdown as \`design-kit.md\`. Output limits omit whole sections rather than
   slicing Markdown. (See the "Reuse before create" rule in
   figma_docs(section="rules").)
 - \`screenshot({nodeId, scale})\`, \`exportNode({nodeId, format})\`. PNG/JPG come
@@ -169,6 +218,28 @@ These change existing nodes rather than drawing new ones. See the
   returns \`{fallback:"current-page", reason}\`, never throws mid-flow), and
   \`setCurrentPage(pageId|{name})\` to switch the visible target page before
   selection/zoom operations.
+- \`deletePage(idOrName, {force?})\` — refuses the last page; switches off the
+  current page first. A page that still has layers throws CONFIRM_REQUIRED
+  naming what is on it: show that to the user, and pass \`force: true\` only
+  after they agree. (\`delete(pageId)\` does not remove pages.)
+
+## Deleting components and styles
+- \`delete(componentId, {force?})\` removes a COMPONENT / COMPONENT_SET. With
+  instances it needs \`force: true\`; the instances stay and can "Restore
+  component" (result: \`instancesLeft\`). Deleting the last variant deletes its
+  set (\`componentSetDeleted\`). Library components are read-only.
+- \`deleteStyle(nameOrId, {type?, replaceWith?, force?})\` — PAINT/TEXT/EFFECT/
+  GRID, replace-gated like deleteVariable: a style still applied is refused
+  with the layer count; \`replaceWith\` (same type) moves those layers first;
+  \`force\` unlinks them (they keep their look). \`type\` settles a name two
+  kinds share.
+- \`deleteUnusedStyles({types?, keep?, confirm?})\` — ALWAYS two calls. Without
+  \`confirm\` it deletes nothing and returns \`wouldDelete\` + \`confirmToken\`.
+  STOP there: show the user the full list, ask explicitly (AskUserQuestion),
+  and only on a clear yes call again with the SAME types/keep and
+  \`confirm: confirmToken\`. Never confirm on your own. A changed file makes
+  the token stale (CONFIRM_REQUIRED) — preview and ask again. Only this file
+  is scanned; a published library's consumers elsewhere are invisible.
 - \`zoomToFit(nodeId)\`, \`overlay(spec)\`.
 - \`listChannels()\` — connected Figma windows (server-answered, no plugin
   round-trip): \`[{channel, plugin:{fileName,pageName,...}, queueLength}]\`.

@@ -109,6 +109,17 @@ describe("gradient transform defaults", () => {
     expect(() => normalizeGradientStops([])).toThrow(/non-empty stops/);
     expect(() => normalizeGradientStops("nope")).toThrow(/non-empty stops/);
   });
+
+  it("normalizeGradientStops throws on a missing or non-string color — never silent black", () => {
+    expect(() => normalizeGradientStops([{ position: 0 }])).toThrow(/hex color/);
+    expect(() => normalizeGradientStops([{ colour: "#fff" }])).toThrow(/hex color/);
+    expect(() =>
+      normalizeGradientStops([{ color: 123 }]),
+    ).toThrow(/hex color/);
+    expect(() =>
+      normalizeGradientStops([{ color: "not-a-color" }]),
+    ).toThrow();
+  });
 });
 
 describe("effect normalization", () => {

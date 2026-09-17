@@ -9,14 +9,15 @@ import { resolveGeometry, InsertAt, Inset } from "../layout-math.js";
 import { parentSize } from "./create.js";
 
 import { decodeBase64 } from "../base64.js";
+import { fitArtwork } from "../fit-artwork.js";
 
 /** Decode a base64 string to a Uint8Array (no Buffer/atob guarantee in the main-thread sandbox). */
 export function base64ToBytes(b64: string): Uint8Array {
   return decodeBase64(b64);
 }
 
-/** Recolor every solid fill of a node subtree to `hex`. */
-function recolorFills(node: SceneNode, hex: string): void {
+/** Recolor every solid fill and stroke of a node subtree to `hex`. */
+function recolorPaints(node: SceneNode, hex: string): void {
   const rgb = hexToRgb(hex);
   const stack: SceneNode[] = [node];
   while (stack.length > 0) {
@@ -25,6 +26,14 @@ function recolorFills(node: SceneNode, hex: string): void {
       const fills = (n as GeometryMixin).fills;
       if (Array.isArray(fills) && fills.length > 0) {
         (n as GeometryMixin).fills = fills.map((f) =>
+          f.type === "SOLID" ? { ...f, color: rgb } : f,
+        );
+      }
+    }
+    if ("strokes" in n) {
+      const strokes = (n as GeometryMixin).strokes;
+      if (Array.isArray(strokes) && strokes.length > 0) {
+        (n as GeometryMixin).strokes = strokes.map((f) =>
           f.type === "SOLID" ? { ...f, color: rgb } : f,
         );
       }
@@ -50,8 +59,8 @@ export async function loadIcon(ctx: HandlerContext): Promise<unknown> {
   const node = figma.createNodeFromSvg(svg);
   node.name = typeof p.name === "string" ? p.name : "icon";
   const size = typeof p.size === "number" ? p.size : 24;
-  node.resize(size, size);
-  if (typeof p.color === "string") recolorFills(node, p.color);
+  fitArtwork(node, size);
+  if (typeof p.color === "string") recolorPaints(node, p.color);
 
   const parent = await resolveParent(p.parentId);
   insertInto(parent, node, p.insertAt as InsertAt | undefined);
@@ -186,7 +195,20 @@ export async function setCurrentPage(ctx: HandlerContext): Promise<unknown> {
       "Call get_document_info to list page ids and names.",
     );
   }
-  figma.currentPage = page;
+  // `figma.currentPage = page` is the pre-dynamic-page API. This plugin
+  // declares `documentAccess: "dynamic-page"`, where the synchronous setter
+  // does not take effect — it reported success and left the user on the page
+  // they were already on, so everything drawn afterwards landed there.
+  if (typeof figma.setCurrentPageAsync === "function") await figma.setCurrentPageAsync(page);
+  else figma.currentPage = page;
+
+  if (figma.currentPage.id !== page.id) {
+    throw err(
+      ErrorCode.INTERNAL,
+      `Could not switch to "${page.name}" — still on "${figma.currentPage.name}".`,
+      "Switch pages in the Figma UI, or pass parentId to draw into a specific frame.",
+    );
+  }
   return { id: page.id, name: page.name, current: true };
 }
 

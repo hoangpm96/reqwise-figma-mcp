@@ -1,6 +1,14 @@
 /// <reference types="@figma/plugin-typings" />
 import { HandlerContext, requireNode } from "../context.js";
 import { r2 } from "../num.js";
+import {
+  contrastRatio,
+  compositeOver,
+  type RGB,
+  type RGBA,
+} from "../color-util.js";
+import { isDiagramLayerName } from "../diagram-mark.js";
+import { loadNodeFonts } from "../fonts.js";
 
 interface Rect {
   x: number;
@@ -34,31 +42,38 @@ function recordHasFinding(rec: AuditRecord): boolean {
   );
 }
 
-function firstSolidFill(node: SceneNode): RGB | null {
+/** First visible solid fill WITH its effective alpha (paint opacity × fill α). */
+export function firstSolidFillRgba(node: SceneNode): RGBA | null {
   const fills = (node as GeometryMixin).fills;
   if (!Array.isArray(fills)) return null;
   for (const f of fills) {
-    if (f && f.type === "SOLID" && f.visible !== false) return f.color;
+    if (f && f.type === "SOLID" && f.visible !== false) {
+      const opacity = typeof f.opacity === "number" ? f.opacity : 1;
+      return { r: f.color.r, g: f.color.g, b: f.color.b, a: opacity };
+    }
   }
   return null;
 }
 
-/** Rough perceptual distance between two RGB (0..1 channels), 0 = identical. */
-function colorDistance(a: RGB, b: RGB): number {
-  return Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b);
-}
-
-/** Nearest ancestor SOLID fill — the effective background behind a node. */
-function ancestorFill(node: SceneNode): RGB | null {
+/** Nearest OPAQUE ancestor background (0..1), compositing translucent layers. */
+export function effectiveBackground(node: SceneNode): RGB | null {
+  const layers: RGBA[] = [];
   let cur: BaseNode | null = node.parent;
   while (cur) {
     if ("fills" in cur) {
-      const c = firstSolidFill(cur as SceneNode);
-      if (c) return c;
+      const c = firstSolidFillRgba(cur as SceneNode);
+      if (c) {
+        layers.push(c);
+        if (c.a >= 0.999) break; // fully opaque — stop climbing
+      }
     }
     cur = cur.parent;
   }
-  return null;
+  if (layers.length === 0) return null;
+  // Composite from the furthest opaque layer forward toward the node.
+  let acc: RGB = { r: layers[layers.length - 1]!.r, g: layers[layers.length - 1]!.g, b: layers[layers.length - 1]!.b };
+  for (let i = layers.length - 2; i >= 0; i--) acc = compositeOver(layers[i]!, acc);
+  return acc;
 }
 
 /**
@@ -70,6 +85,11 @@ export function styleWarningsFor(
   siblings: readonly SceneNode[],
 ): string[] {
   const out: string[] = [];
+
+  // A drawn diagram's own layers are notation, not design decisions: a table's
+  // rows are full-bleed on purpose, a start pill's radius is its meaning. The
+  // TEXT inside them is still checked — contrast has caught real bugs twice.
+  if (isDiagramLayerName(node.name)) return out;
 
   const container = node.type === "FRAME" || node.type === "COMPONENT";
   const surface = container && hasVisibleSurface(node);
@@ -92,7 +112,9 @@ export function styleWarningsFor(
   // 2. Similar sibling surfaces are almost always repeated controls/cards.
   //    Compare only near-identical dimensions so pills are not compared with
   //    their containing rows. A 3px+ deviation is visually noticeable.
-  if (surface && radius !== null && node.width >= 64 && node.height >= 24) {
+  //    Diagram layers are exempt: a start pill next to an action box differs on
+  //    purpose, and that is notation, not a token that slipped.
+  if (surface && radius !== null && node.width >= 64 && node.height >= 24 && !isDiagramLayerName(node.name)) {
     const peerRadii = siblings
       .filter((s) => s.id !== node.id && hasVisibleSurface(s) && similarSize(node, s))
       .map(numericCornerRadius)
@@ -157,18 +179,41 @@ export function styleWarningsFor(
     }
   }
 
-  // 5. Text whose color is nearly the same as its background is unreadable.
+  // 5. Text-vs-background contrast, judged by the REAL WCAG ratio (not RGB
+  //    distance), through the true composited background and the text's alpha.
   if (node.type === "TEXT") {
-    const fg = firstSolidFill(node);
-    const bg = ancestorFill(node);
-    if (fg && bg && colorDistance(fg, bg) < 0.12) {
-      out.push(
-        "Text color is nearly identical to its background — very low contrast, likely unreadable.",
-      );
+    const fgRgba = firstSolidFillRgba(node);
+    const bg = effectiveBackground(node);
+    if (fgRgba && bg) {
+      const fg = compositeOver(fgRgba, bg); // flatten translucent text
+      const ratio = contrastRatio(fg, bg);
+      const min = wcagMinRatio(node);
+      if (ratio < min) {
+        out.push(
+          `Text contrast ${r2(ratio)}:1 is below the WCAG minimum ${min}:1 for this size — hard to read. Darken the text or lighten the background.`,
+        );
+      }
     }
   }
 
   return out;
+}
+
+/**
+ * WCAG 1.4.3 threshold: 3:1 for "large" text (≥24px, or ≥18.66px bold),
+ * otherwise 4.5:1. Bold is inferred from the font style/weight when available.
+ */
+export function wcagMinRatio(node: TextNode): number {
+  const size = typeof node.fontSize === "number" ? node.fontSize : 16;
+  const style =
+    typeof node.fontName === "object" &&
+    node.fontName &&
+    "style" in node.fontName
+      ? String((node.fontName as FontName).style)
+      : "";
+  const bold = /bold|black|heavy|semibold|extrabold/i.test(style);
+  const isLarge = size >= 24 || (bold && size >= 18.66);
+  return isLarge ? 3 : 4.5;
 }
 
 function hasVisibleSurface(node: SceneNode): boolean {
@@ -267,29 +312,34 @@ function rectContains(outer: Rect, inner: Rect, eps = 0.5): boolean {
  * content does not fit its box — horizontally OR vertically. The old check only
  * compared rendered vs declared height, which is always equal for a fixed box,
  * so single-line horizontal overflow and clipped multi-line text slipped
- * through. We instead compare the box against the text's intrinsic size, which
- * Figma exposes without mutating the node.
+ * through. We instead compare the box against the text's intrinsic size.
  */
-function isTextTruncated(
+async function isTextTruncated(
   t: TextNode,
   rendered: { width: number; height: number } | null,
-): boolean {
+): Promise<boolean> {
   if (t.textAutoResize === "TRUNCATE") return true;
   if (t.textAutoResize !== "NONE") return false;
 
   const boxW = rendered?.width ?? t.width;
   const boxH = rendered?.height ?? t.height;
 
-  // Intrinsic size the text WANTS if it could grow. Figma computes this from
-  // the glyph layout; a mixed/unloaded font can throw, so guard defensively.
+  // Intrinsic size the text WANTS if it could grow: clone the node, lift the
+  // fixed height, and let Figma's glyph layout re-measure it. (This used to
+  // re-fetch the SAME node through the synchronous figma.getNodeById — which
+  // throws outright under this manifest's documentAccess:"dynamic-page" — and
+  // read back the box's own fixed height, so the branch could never fire.) A
+  // mixed/unloadable font can still throw, so guard and fall through.
   try {
-    const size = figma.getNodeById(t.id) as TextNode | null;
-    if (size && typeof size.width === "number") {
-      // WIDTH-auto height: measure the natural single-line/paragraph width.
-      // If the fixed box is narrower/shorter than the text's own bounds by more
-      // than a rounding epsilon, content is being clipped.
-      const intrinsicH = size.height;
-      if (intrinsicH > boxH + 0.5) return true;
+    await loadNodeFonts(t); // mixed-safe: every range font, once each
+    const probe = t.clone();
+    try {
+      // HEIGHT keeps the box width and lets the wrapped text take the height
+      // it needs — taller than the declared box means clipped content.
+      probe.textAutoResize = "HEIGHT";
+      if (probe.height > boxH + 0.5) return true;
+    } finally {
+      probe.remove();
     }
   } catch {
     /* fall through to the heuristic below */
@@ -317,6 +367,32 @@ function isOverlayLike(node: SceneNode): boolean {
 }
 
 /**
+ * "This looks like a scrim and it is not on top."
+ *
+ * Exported so the exemption is testable: a layer a DIAGRAM tool drew is left
+ * alone, for the same reason the style hints leave it alone — the tool decided
+ * that z-order deliberately. A journey map's column band is a big
+ * semi-transparent rectangle that BELONGS at the bottom, grouping a column
+ * behind its cells, and `isOverlayLike` reads any large translucent rect as a
+ * scrim. Without the exemption every journey map came back with one
+ * "move to top" issue per phase: advice that would break a correct drawing,
+ * which is the fastest way to teach somebody to stop reading the audit.
+ */
+export function zIndexWarningsFor(
+  node: SceneNode,
+  index: number,
+  siblingCount: number,
+): string[] {
+  if (siblingCount <= 0) return [];
+  if (!isOverlayLike(node)) return [];
+  if (isDiagramLayerName(node.name)) return [];
+  if (index === siblingCount - 1) return [];
+  return [
+    `Overlay-like node is at z-index ${index}/${siblingCount - 1}; content above it will not be dimmed. Move to top.`,
+  ];
+}
+
+/**
  * layout_audit: walk the subtree (iterative) and compute per-node overflow /
  * clip / text-truncation / z-index issues. Returns records + a summary issues
  * list — the structured verify step.
@@ -331,6 +407,13 @@ export async function layoutAudit(ctx: HandlerContext): Promise<unknown> {
   const records: AuditRecord[] = [];
   const issues: string[] = [];
   const styleHints: string[] = [];
+
+  // Subtree-wide consistency collectors (the "why does this look busy/flat"
+  // signals that per-node checks can't see). Filled during the walk, analyzed
+  // once at the end.
+  const fontSizes: number[] = [];
+  const cornerRadii: number[] = [];
+  const gaps: number[] = []; // itemSpacing of auto-layout frames with ≥2 kids
 
   interface Frame {
     node: SceneNode;
@@ -382,19 +465,10 @@ export async function layoutAudit(ctx: HandlerContext): Promise<unknown> {
     // text truncation
     let textTruncated = false;
     if (node.type === "TEXT") {
-      textTruncated = isTextTruncated(node as TextNode, rendered);
+      textTruncated = await isTextTruncated(node as TextNode, rendered);
     }
 
-    // z-index: overlay-like not topmost among siblings
-    const zWarnings: string[] = [];
-    if (isOverlayLike(node) && frame.siblings.length > 0) {
-      const isTop = frame.index === frame.siblings.length - 1;
-      if (!isTop) {
-        zWarnings.push(
-          `Overlay-like node is at z-index ${frame.index}/${frame.siblings.length - 1}; content above it will not be dimmed. Move to top.`,
-        );
-      }
-    }
+    const zWarnings = zIndexWarningsFor(node, frame.index, frame.siblings.length);
 
     const rec: AuditRecord = {
       id: node.id,
@@ -422,6 +496,27 @@ export async function layoutAudit(ctx: HandlerContext): Promise<unknown> {
     };
     records.push(rec);
 
+    // Collect subtree-wide consistency signals. A drawn diagram is exempt: its
+    // radii ARE its notation — a 20px start pill, a 4px fork bar, an 11.5px
+    // label pill — so counting them as an unsystematic scale sends the agent
+    // off to "fix" the vocabulary of the drawing.
+    const generated = isDiagramLayerName(node.name);
+    if (!generated && node.type === "TEXT" && typeof node.fontSize === "number") {
+      fontSizes.push(node.fontSize);
+    }
+    const nr = numericCornerRadius(node);
+    if (!generated && nr !== null && nr > 0 && hasVisibleSurface(node)) cornerRadii.push(nr);
+    if (
+      !generated &&
+      "layoutMode" in node &&
+      (node as FrameNode).layoutMode !== "NONE" &&
+      "children" in node &&
+      (node as ChildrenMixin).children.length >= 2 &&
+      typeof (node as FrameNode).itemSpacing === "number"
+    ) {
+      gaps.push((node as FrameNode).itemSpacing);
+    }
+
     if (overflows)
       issues.push(`${node.name} (${node.id}) overflows its parent bounds.`);
     if (clippedBy)
@@ -448,6 +543,11 @@ export async function layoutAudit(ctx: HandlerContext): Promise<unknown> {
     if (processed % 50 === 0) ctx.progress(processed, processed, "auditing");
   }
 
+  // Subtree-wide aesthetic signals (added to styleHints, never to issues).
+  for (const h of subtreeStyleHints(fontSizes, cornerRadii, gaps)) {
+    styleHints.push(h);
+  }
+
   // Token-frugal by default: only return records that carry a finding, since
   // a clean subtree's full per-node dump is pure overhead (a 22-node audit was
   // ~2.7K tokens with issueCount:0). Pass verbose:true for the full dump.
@@ -466,4 +566,49 @@ export async function layoutAudit(ctx: HandlerContext): Promise<unknown> {
       styleHintCount: styleHints.length,
     },
   };
+}
+
+/**
+ * Consistency hints computed across the whole subtree — the signals a per-node
+ * pass can't see: too many distinct font sizes (busy typography), too many
+ * distinct radii (incoherent shapes), and uniform spacing (no visual grouping).
+ * Conservative thresholds so a normal screen stays quiet.
+ */
+export function subtreeStyleHints(
+  fontSizes: readonly number[],
+  cornerRadii: readonly number[],
+  gaps: readonly number[],
+): string[] {
+  const out: string[] = [];
+
+  const distinctSizes = uniqueSorted(fontSizes);
+  if (distinctSizes.length > 6) {
+    out.push(
+      `Typography uses ${distinctSizes.length} distinct font sizes (${distinctSizes.join("/")}) — this reads as busy/unsystematic. Collapse to a 4–6 step scale via text styles (figma_docs(section="style")).`,
+    );
+  }
+
+  const distinctRadii = uniqueSorted(cornerRadii);
+  if (distinctRadii.length > 4) {
+    out.push(
+      `Corners use ${distinctRadii.length} distinct radii (${distinctRadii.join("/")}) — bind a small radius scale (e.g. 8/12/16) instead of arbitrary values.`,
+    );
+  }
+
+  // Uniform spacing = no grouping. If there are several gaps and they're ALL
+  // identical, proximity can't signal what belongs together.
+  const distinctGaps = uniqueSorted(gaps);
+  if (gaps.length >= 4 && distinctGaps.length === 1) {
+    out.push(
+      `Every gap is ${distinctGaps[0]}px — uniform spacing gives no visual grouping. Make in-group spacing tighter than between-group spacing (e.g. 8px inside a field, 24px between sections).`,
+    );
+  }
+
+  return out;
+}
+
+function uniqueSorted(nums: readonly number[]): number[] {
+  return Array.from(new Set(nums.map((n) => Math.round(n * 100) / 100))).sort(
+    (a, b) => a - b,
+  );
 }

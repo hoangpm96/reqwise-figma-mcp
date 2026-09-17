@@ -1,6 +1,6 @@
 {
   "name": "reqwise-figma-mcp",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Reqwise Figma MCP — read and draw on the Figma canvas from AI agents, with safe-by-default drawing, structured verification and a resilient plugin bridge.",
   "type": "module",
   "bin": {
@@ -9,15 +9,23 @@
   "files": [
     "dist",
     "plugin",
+    ".claude/skills",
+    "assets",
     "README.md",
-    "docs"
+    "CHANGELOG.md",
+    "docs",
+    "!**/*.map"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:watch": "node scripts/build.mjs --watch",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.plugin.json --noEmit",
     "test": "vitest run",
-    "start": "node dist/server/index.js"
+    "start": "node dist/server/index.js",
+    "install:mcp": "node scripts/install-mcp-global.mjs",
+    "prepare": "node scripts/build.mjs",
+    "verify": "npm run typecheck && npm test",
+    "package": "node scripts/package.mjs"
   },
   "engines": {
     "node": ">=18"
@@ -31,17 +39,21 @@
     "claude"
   ],
   "license": "MIT",
+  "private": false,
   "dependencies": {
+    "@dagrejs/dagre": "^3.1.1",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "ws": "^8.18.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@dicebear/collection": "^9.4.2",
+    "@dicebear/core": "^9.4.3",
     "@figma/plugin-typings": "^1.100.0",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
-    "esbuild": "^0.24.0",
+    "esbuild": "^0.28.1",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "vitest": "^4.1.10"
   }
 }

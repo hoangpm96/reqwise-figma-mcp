@@ -136,7 +136,10 @@ describe("GET /health fallback (mixed-version rollout)", () => {
     // No plugin attached in this test, but the field is MEASURED (a boolean),
     // which is what lets the fallback report it instead of "unknown".
     expect(typeof health?.pluginConnected).toBe("boolean");
-    expect(Array.isArray(health?.channels)).toBe(true);
+    // Public /health no longer ships channel names (hijack oracle); detail
+    // stays on authenticated /health or __status__.
+    expect(health?.channels).toBeUndefined();
+    expect(typeof health?.channelCount === "number" || health?.channelCount === undefined).toBe(true);
   });
 
   it("returns undefined (→ unknown) when nothing answers the port", async () => {

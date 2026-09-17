@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { renderDesignMarkdown, type DesignSystemKit } from "../../src/shared/design-system.js";
+import {
+  renderDesignMarkdown,
+  computeFingerprint,
+  stableHash,
+  type DesignSystemKit,
+} from "../../src/shared/design-system.js";
 
 describe("renderDesignMarkdown", () => {
   it("renders a useful empty-state document", () => {
@@ -185,5 +190,110 @@ describe("renderDesignMarkdown", () => {
     expect(md.match(/^### Button$/gm)).toHaveLength(1);
     expect(md).toContain("State=Default — id `1:1`");
     expect(md).not.toContain("### State=Default");
+  });
+});
+
+describe("computeFingerprint", () => {
+  const kit: DesignSystemKit = {
+    variables: {
+      collections: [
+        {
+          name: "Tokens",
+          variables: [
+            { name: "color/primary", type: "COLOR", values: { M: "#5865f2" } },
+            { name: "radius/sm", type: "FLOAT", values: { M: 12 } },
+          ],
+        },
+      ],
+    },
+    styles: {
+      text: [{ name: "display-xl" }, { name: "body" }],
+      paint: [{ name: "brand/primary" }],
+    },
+    components: [{ id: "1:0", name: "Button", type: "COMPONENT" }],
+  };
+
+  it("counts variables, styles and components", () => {
+    const fp = computeFingerprint(kit);
+    expect(fp.counts).toEqual({
+      variables: 2,
+      textStyles: 2,
+      paintStyles: 1,
+      effectStyles: 0,
+      components: 1,
+    });
+    expect(fp.hash).toMatch(/^[0-9a-z]{8}$/);
+  });
+
+  it("is stable across identical input and independent of key order", () => {
+    const a = computeFingerprint(kit);
+    // Same catalog, variables listed in a different order.
+    const shuffled: DesignSystemKit = {
+      ...kit,
+      variables: {
+        collections: [
+          {
+            name: "Tokens",
+            variables: [
+              { name: "radius/sm", type: "FLOAT", values: { M: 12 } },
+              { name: "color/primary", type: "COLOR", values: { M: "#5865f2" } },
+            ],
+          },
+        ],
+      },
+    };
+    expect(computeFingerprint(shuffled).hash).toBe(a.hash);
+  });
+
+  it("does NOT change when a token's VALUE changes (only names matter)", () => {
+    const recoloured: DesignSystemKit = {
+      ...kit,
+      variables: {
+        collections: [
+          {
+            name: "Tokens",
+            variables: [
+              { name: "color/primary", type: "COLOR", values: { M: "#ff0000" } },
+              { name: "radius/sm", type: "FLOAT", values: { M: 99 } },
+            ],
+          },
+        ],
+      },
+    };
+    expect(computeFingerprint(recoloured).hash).toBe(computeFingerprint(kit).hash);
+  });
+
+  it("DOES change when a token is added, removed or renamed", () => {
+    const base = computeFingerprint(kit).hash;
+    const added: DesignSystemKit = {
+      ...kit,
+      styles: { ...kit.styles, text: [{ name: "display-xl" }, { name: "body" }, { name: "caption" }] },
+    };
+    expect(computeFingerprint(added).hash).not.toBe(base);
+
+    const renamed: DesignSystemKit = {
+      ...kit,
+      components: [{ id: "1:0", name: "Btn", type: "COMPONENT" }],
+    };
+    expect(computeFingerprint(renamed).hash).not.toBe(base);
+  });
+
+  it("embeds the fingerprint as an HTML comment at the top of the markdown", () => {
+    const md = renderDesignMarkdown(kit);
+    const fp = computeFingerprint(kit);
+    expect(md.startsWith("<!-- design-kit:generated")).toBe(true);
+    expect(md).toContain(`dsfp:${fp.hash}`);
+    expect(md).toContain("vars:2");
+    expect(md).toContain("components:1");
+  });
+});
+
+describe("stableHash", () => {
+  it("is deterministic and 8 chars base36", () => {
+    expect(stableHash("hello")).toBe(stableHash("hello"));
+    expect(stableHash("hello")).toMatch(/^[0-9a-z]{8}$/);
+  });
+  it("differs for different input", () => {
+    expect(stableHash("a")).not.toBe(stableHash("b"));
   });
 });

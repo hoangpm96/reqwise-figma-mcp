@@ -32,11 +32,13 @@
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import { randomUUID, randomInt } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
+import { safeEqualString, newResumeToken } from "./security.js";
 import {
   DEFAULT_OP_TIMEOUT_MS,
   HEARTBEAT_DEAD_MS,
   HEARTBEAT_INTERVAL_MS,
   OP_TIMEOUTS,
+  WRITE_OPERATIONS,
   type BridgeRequest,
   type BridgeResponse,
   type Operation,
@@ -45,6 +47,16 @@ import {
   type WireMessage,
 } from "../shared/protocol.js";
 import { ErrorCode, OpError, toBridgeError } from "./errors.js";
+
+/**
+ * Does this operation CHANGE the document? A timeout on a read is just a
+ * missing answer; a timeout on a write leaves the caller not knowing whether
+ * the work happened, which is a different problem and needs a different hint.
+ */
+const MUTATING = new Set<string>(WRITE_OPERATIONS as readonly string[]);
+function mutates(op: string): boolean {
+  return MUTATING.has(op);
+}
 
 /** Cap on requests waiting for a plugin slot (per connection + unrouted). */
 const MAX_QUEUE = 100;
@@ -64,6 +76,27 @@ const MAX_QUEUE = 100;
  */
 const MAX_IN_FLIGHT = 1;
 
+/**
+ * WS upgrade Origin allowlist (CSWSH guard). Browsers always send an Origin
+ * header on WebSocket upgrades, and every browser page — including a
+ * malicious tab — may open a cross-origin socket to 127.0.0.1. The Figma
+ * plugin iframe is a sandboxed opaque origin, so its upgrades carry
+ * `Origin: null`; non-browser clients (the `ws` library, tests, drivers)
+ * send none. Anything presenting a real http(s) origin is a web page posing
+ * as the plugin — the upgrade is refused before a socket ever opens.
+ */
+const TRUSTED_WS_ORIGINS = new Set(["https://www.figma.com", "https://figma.com"]);
+
+/** How long a socket may sit staged (connected but no `hello`) before it is
+ * terminated. A connect-and-say-nothing client is pure resource cost — the
+ * heartbeat monitor only watches established channels. */
+const DEFAULT_HELLO_TIMEOUT_MS = 30_000;
+
+/** Largest WS frame accepted on the plugin channel. Responses carry base64
+ * screenshots/exports, so this sits well above those and far below the `ws`
+ * default (100 MiB). */
+const DEFAULT_MAX_PAYLOAD = 64 * 1024 * 1024;
+
 /** Word lists for human-friendly generated channel names (adj-noun-NN). */
 const CHANNEL_ADJECTIVES = [
   "brave", "calm", "eager", "fancy", "gentle", "happy", "jolly", "kind",
@@ -76,6 +109,8 @@ const CHANNEL_NOUNS = [
 
 export interface PluginInfo {
   version: string;
+  /** When the bundle Figma is running was built; absent on an older plugin. */
+  build?: string;
   protocolVersion: number;
   fileKey: string | null;
   fileName: string;
@@ -143,6 +178,13 @@ export interface BridgeHandlers {
   ) => Promise<unknown>;
 }
 
+export interface BridgeOptions {
+  /** ms a socket may stay staged (connected, no `hello`) before termination. */
+  helloTimeoutMs?: number;
+  /** Max accepted WS frame size in bytes. */
+  maxPayloadBytes?: number;
+}
+
 /**
  * One established (hello-completed) plugin connection joined to a channel.
  * Owns its own queue, in-flight gate, pending map and heartbeat clock so
@@ -158,6 +200,8 @@ class PluginConnection {
     public readonly channel: string,
     public ws: WebSocket,
     public info: PluginInfo,
+    /** Secret required to replace this connection on reconnect. */
+    public readonly resumeToken: string,
   ) {}
 
   get open(): boolean {
@@ -238,7 +282,13 @@ class PluginConnection {
         new OpError(
           ErrorCode.PLUGIN_TIMEOUT,
           `Operation "${op}" timed out after ${timeoutMs}ms.`,
-          "The Figma plugin did not respond in time — check figma_status; the window may be minimized or the op may be very large.",
+          mutates(op)
+            ? // The plugin is not cancelled by this timeout — it keeps going and
+              // usually finishes. Saying only "timed out" invites a retry, and a
+              // retry of a draw that actually landed is how a page ends up with
+              // every diagram on it twice. Ask before repeating the work.
+              `The Figma plugin did not answer in time, but it was NOT cancelled — "${op}" may well have completed. Do NOT simply retry: check with figma_read op:"get_page_model" (or get_design_context) first, and if the frame is there, use \`update\` with its id rather than drawing a second one. figma_status shows whether the window is throttled (lastHeartbeatMs well over ~2s means it is in the background).`
+            : "The Figma plugin did not respond in time — check figma_status; the window may be minimized or the op may be very large.",
         ),
       );
     }, timeoutMs);
@@ -296,10 +346,11 @@ export class Bridge {
   private readonly channels = new Map<string, PluginConnection>();
   /** Reverse lookup for socket events. */
   private readonly bySocket = new Map<WebSocket, PluginConnection>();
-  /** Sockets that have NOT yet completed their hello handshake. Kept apart
-   * from `channels` so a socket that dies before handshaking never disturbs
-   * established connections and their in-flight requests. */
-  private readonly stagedSockets = new Set<WebSocket>();
+  /** Sockets that have NOT yet completed their hello handshake, mapped to
+   * their hello deadline timer. Kept apart from `channels` so a socket that
+   * dies before handshaking never disturbs established connections and their
+   * in-flight requests. */
+  private readonly stagedSockets = new Map<WebSocket, NodeJS.Timeout>();
   /**
    * Ops dispatched with NO channel while NO plugin is connected. They wait
    * here (timers not armed — the clock starts at dispatch) and drain to the
@@ -321,7 +372,13 @@ export class Bridge {
   private authToken = "";
   private heartbeatTimer?: NodeJS.Timeout;
 
-  constructor(private readonly handlers: BridgeHandlers = {}) {}
+  private readonly helloTimeoutMs: number;
+  private readonly maxPayloadBytes: number;
+
+  constructor(private readonly handlers: BridgeHandlers = {}, opts: BridgeOptions = {}) {
+    this.helloTimeoutMs = opts.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
+    this.maxPayloadBytes = opts.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD;
+  }
 
   setSessionsProvider(fn: () => SessionSummaryWire[]): void {
     this.sessionsProvider = fn;
@@ -402,10 +459,28 @@ export class Bridge {
   private tryListen(port: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const http = createServer((req, res) => this.handleHttp(req, res));
-      const wss = new WebSocketServer({ noServer: true });
+      const wss = new WebSocketServer({ noServer: true, maxPayload: this.maxPayloadBytes });
 
       http.on("upgrade", (req, socket, head) => {
-        if (new URL(req.url ?? "/", "http://localhost").pathname !== "/ws") {
+        let pathname: string;
+        try {
+          pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+        } catch {
+          // Malformed request-target (e.g. absolute-form with an invalid
+          // port) — llhttp accepts it, URL does not. Never let it throw.
+          socket.destroy();
+          return;
+        }
+        if (pathname !== "/ws") {
+          socket.destroy();
+          return;
+        }
+        // CSWSH guard — see TRUSTED_WS_ORIGINS. A browser page may open a
+        // cross-origin WebSocket to this loopback port; only the Figma
+        // plugin's opaque origin ("null"), figma.com itself, and non-browser
+        // clients (no Origin header) are allowed through.
+        const origin = req.headers.origin;
+        if (origin !== undefined && origin !== "null" && !TRUSTED_WS_ORIGINS.has(origin)) {
           socket.destroy();
           return;
         }
@@ -435,7 +510,7 @@ export class Bridge {
     // may be staged at once (several Figma windows opening the plugin
     // together) — none of them disturbs an established connection until its
     // hello resolves a channel.
-    this.stagedSockets.add(client);
+    this.stagedSockets.set(client, this.armHelloDeadline(client));
 
     client.on("message", (data) => this.onWsMessage(client, data));
     client.on("close", () => this.onWsClose(client));
@@ -444,12 +519,33 @@ export class Bridge {
     });
   }
 
+  /** A staged socket gets one deadline: `hello` within helloTimeoutMs or the
+   * socket is terminated. Without it a connect-and-say-nothing client holds
+   * the slot forever — nothing else reaps staged sockets. */
+  private armHelloDeadline(client: WebSocket): NodeJS.Timeout {
+    const t = setTimeout(() => {
+      if (!this.stagedSockets.delete(client)) return;
+      try {
+        client.terminate();
+      } catch {
+        /* close handler cleans up */
+      }
+    }, this.helloTimeoutMs);
+    t.unref?.();
+    return t;
+  }
+
   private onWsMessage(client: WebSocket, data: RawData): void {
     let msg: WireMessage;
     try {
       msg = JSON.parse(data.toString()) as WireMessage;
     } catch {
       return; // ignore malformed frames
+    }
+    // JSON.parse can yield null / primitives — a bare `null` or `"5"` frame
+    // must not reach `msg.type` and crash the listener.
+    if (!msg || typeof msg !== "object" || typeof msg.type !== "string") {
+      return;
     }
 
     const conn = this.bySocket.get(client);
@@ -472,7 +568,9 @@ export class Bridge {
       }
       case "response": {
         if (!conn) break; // ignore responses from a stale/staged socket
-        conn.onResponse(msg.payload);
+        const payload = msg.payload;
+        if (!payload || typeof payload !== "object" || typeof payload.id !== "string") break;
+        conn.onResponse(payload);
         break;
       }
       case "bind": {
@@ -480,7 +578,14 @@ export class Bridge {
         // the session to this channel. The session's next op carries a
         // warning so the agent learns about the pairing immediately.
         if (!conn) break;
-        if (typeof msg.sessionId !== "string" || msg.sessionId.length === 0) break;
+        if (typeof msg.sessionId !== "string" || msg.sessionId.length === 0 || msg.sessionId.length > 128) break;
+        // Unbounded growth guard: any client can mint session ids — cap the
+        // map and evict the oldest binding first (Map iterates in insertion
+        // order).
+        if (this.sessionBindings.size >= 512 && !this.sessionBindings.has(msg.sessionId)) {
+          const oldest = this.sessionBindings.keys().next().value;
+          if (oldest !== undefined) this.sessionBindings.delete(oldest);
+        }
         this.sessionBindings.set(msg.sessionId, { channel: conn.channel, notified: false });
         this.broadcastChannels();
         break;
@@ -516,6 +621,7 @@ export class Bridge {
       established.info = {
         ...established.info,
         version: hello.pluginVersion,
+        ...(hello.pluginBuild ? { build: hello.pluginBuild } : {}),
         protocolVersion: hello.protocolVersion,
         fileKey: hello.fileKey,
         fileName: hello.fileName,
@@ -526,16 +632,52 @@ export class Bridge {
       return;
     }
 
-    if (!this.stagedSockets.has(client)) {
+    const staged = this.stagedSockets.get(client);
+    if (!staged) {
       return; // a hello from a socket we already discarded
     }
+    clearTimeout(staged);
     this.stagedSockets.delete(client);
 
     const requested = sanitizeChannel(hello.channel);
-    const channel = requested || this.generateChannel();
+    const offeredResume =
+      typeof hello.resumeToken === "string" && hello.resumeToken.length > 0
+        ? hello.resumeToken
+        : "";
+
+    // Reclaiming an existing channel requires the resume token issued on
+    // first assign. A hello that only knows the channel *name* (e.g. from
+    // unauthenticated GET /health) gets a fresh channel instead of stealing.
+    let channel = requested;
+    let resumeToken = newResumeToken();
+    const previous = channel ? this.channels.get(channel) : undefined;
+    if (previous) {
+      if (offeredResume && safeEqualString(offeredResume, previous.resumeToken)) {
+        resumeToken = previous.resumeToken;
+        previous.failAllPending(
+          new OpError(
+            ErrorCode.NOT_CONNECTED,
+            `Plugin connection on channel "${channel}" was replaced by a new Figma window.`,
+            "Retry the operation; the new plugin connection is now active.",
+          ),
+        );
+        this.bySocket.delete(previous.ws);
+        if (previous.ws !== client) {
+          try {
+            previous.ws.close(1000, "replaced");
+          } catch {
+            /* ignore */
+          }
+        }
+      } else {
+        channel = "";
+      }
+    }
+    if (!channel) channel = this.generateChannel();
 
     const info: PluginInfo = {
       version: hello.pluginVersion,
+      ...(hello.pluginBuild ? { build: hello.pluginBuild } : {}),
       protocolVersion: hello.protocolVersion,
       fileKey: hello.fileKey,
       fileName: hello.fileName,
@@ -544,36 +686,13 @@ export class Bridge {
       connectedAt: Date.now(),
     };
 
-    // A hello for an EXISTING channel replaces only that channel's connection
-    // (same window reloading, or the user deliberately moving the channel).
-    // Its in-flight requests are failed immediately with a clear error rather
-    // than left to time out. Other channels are untouched.
-    const previous = this.channels.get(channel);
-    if (previous) {
-      previous.failAllPending(
-        new OpError(
-          ErrorCode.NOT_CONNECTED,
-          `Plugin connection on channel "${channel}" was replaced by a new Figma window.`,
-          "Retry the operation; the new plugin connection is now active.",
-        ),
-      );
-      this.bySocket.delete(previous.ws);
-      if (previous.ws !== client) {
-        try {
-          previous.ws.close(1000, "replaced");
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-
-    const conn = new PluginConnection(channel, client, info);
+    const conn = new PluginConnection(channel, client, info, resumeToken);
     this.channels.set(channel, conn);
     this.bySocket.set(client, conn);
 
     // Tell the plugin which channel it is joined to (it shows this to the
     // user so they can point specific agents at specific windows).
-    conn.send({ type: "assigned", channel });
+    conn.send({ type: "assigned", channel, resumeToken });
 
     // Zero-config path: ops issued before any window connected wait in the
     // unrouted queue — hand them to this connection now.
@@ -588,7 +707,10 @@ export class Bridge {
   }
 
   private onWsClose(client: WebSocket): void {
-    if (this.stagedSockets.delete(client)) {
+    const staged = this.stagedSockets.get(client);
+    if (staged) {
+      clearTimeout(staged);
+      this.stagedSockets.delete(client);
       return; // a never-handshaked socket died; nothing else to do
     }
     const conn = this.bySocket.get(client);
@@ -724,9 +846,17 @@ export class Bridge {
   // ---- HTTP ----
 
   private handleHttp(req: IncomingMessage, res: ServerResponse): void {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", "http://localhost");
+    } catch {
+      // Absolute-form request-targets llhttp accepts but URL rejects (e.g. an
+      // out-of-range port) must not escape the 'request' listener.
+      this.respondJson(res, 400, { error: "bad request" });
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/health") {
-      this.respondJson(res, 200, this.healthPayload());
+      this.respondJson(res, 200, this.healthPayload(this.isAuthorized(req)));
       return;
     }
     if (req.method === "POST" && url.pathname === "/rpc") {
@@ -739,7 +869,7 @@ export class Bridge {
   private async handleRpc(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const auth = req.headers["authorization"];
     const token = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    if (!this.authToken || token !== this.authToken) {
+    if (!this.authToken || !token || !safeEqualString(token, this.authToken)) {
       this.respondJson(res, 401, {
         error: { code: ErrorCode.UNAUTHORIZED, message: "Invalid or missing bridge token.", hint: "Follower must send Authorization: Bearer <leader token from leader.json>." },
       });
@@ -773,17 +903,34 @@ export class Bridge {
     }
   }
 
-  private healthPayload(): Record<string, unknown> {
-    return {
+  /**
+   * Public /health stays minimal so channel names / file names are not an
+   * unauthenticated local oracle for WS hijacks. Pass the bridge Bearer
+   * token for the full diagnostics payload (followers that need detail use
+   * __status__ over /rpc instead).
+   */
+  private healthPayload(detailed: boolean): Record<string, unknown> {
+    const base: Record<string, unknown> = {
       ok: true,
       port: this.boundPort,
       pluginConnected: this.pluginConnected,
-      plugin: this.plugin ?? null,
-      channels: this.channelSummaries(),
       lastHeartbeatMs: this.lastHeartbeatMs,
       queueLength: this.queueLength,
       pendingCount: this.pendingCount,
+      channelCount: this.channels.size,
     };
+    if (!detailed) return base;
+    return {
+      ...base,
+      plugin: this.plugin ?? null,
+      channels: this.channelSummaries(),
+    };
+  }
+
+  private isAuthorized(req: IncomingMessage): boolean {
+    const auth = req.headers["authorization"];
+    const token = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    return Boolean(this.authToken && token && safeEqualString(token, this.authToken));
   }
 
   // ---- heartbeat monitor ----
@@ -841,6 +988,7 @@ export class Bridge {
     }
     this.channels.clear();
     this.bySocket.clear();
+    for (const t of this.stagedSockets.values()) clearTimeout(t);
     this.stagedSockets.clear();
     await new Promise<void>((resolve) => {
       if (!this.wss) return resolve();
@@ -873,7 +1021,10 @@ function readBody(req: IncomingMessage): Promise<string> {
     req.setEncoding("utf8");
     req.on("data", (c: string) => {
       data += c;
-      if (data.length > 8 * 1024 * 1024) reject(new Error("body too large"));
+      if (data.length > 8 * 1024 * 1024) {
+        reject(new Error("body too large"));
+        req.destroy(); // stop the client streaming into memory after the cap
+      }
     });
     req.on("end", () => resolve(data));
     req.on("error", reject);

@@ -42,7 +42,14 @@
     font: 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background: var(--bg); color: var(--fg);
   }
-  .wrap { padding: 14px; display: flex; flex-direction: column; gap: 12px; height: 100%; }
+  /* min-height + overflow, NOT height: a fixed-height flex column silently
+     SQUEEZES every child that can shrink, and a child with overflow:auto can
+     shrink to nothing — which is how the demo list ended up showing half a
+     line of clipped text instead of its own empty state. */
+  .wrap {
+    padding: 14px; display: flex; flex-direction: column; gap: 12px;
+    min-height: 100%; box-sizing: border-box; overflow-y: auto;
+  }
 
   .header { display: flex; align-items: center; gap: 10px; }
   .logo {
@@ -115,6 +122,7 @@
   .agents {
     border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
     max-height: 150px; overflow-y: auto; padding: 4px 6px;
+    flex: 0 0 auto; min-height: 30px;
   }
   .agents-empty { color: var(--muted); font-size: 11px; padding: 6px 2px; }
   .agent-row {
@@ -126,6 +134,14 @@
   .agent-meta { color: var(--muted); font-size: 10px; flex: 0 0 auto; }
   .agent-state-here { color: var(--ok); font-size: 10px; flex: 0 0 auto; font-weight: 600; }
   .agent-state-other { color: var(--warn); font-size: 10px; flex: 0 0 auto; }
+
+  button.icon {
+    flex: 0 0 auto; padding: 2px 7px; font-size: 11px; border-radius: 6px; line-height: 1.4;
+  }
+  button.icon.play {
+    border: none; color: #fff;
+    background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+  }
 
   .activity {
     flex: 1; min-height: 90px; max-height: 200px; overflow-y: auto;
@@ -161,6 +177,18 @@
   button.primary:hover { filter: brightness(1.08); }
 
   .foot { color: var(--muted); font-size: 9.5px; text-align: center; }
+
+  /* Corner grip — the panel is often opened on a laptop screen where 660px
+     of height does not exist. Dragging this posts the new size to the main
+     thread, which is the only side allowed to call figma.ui.resize(). It is
+     `fixed`, not in the flow, so it never scrolls away with .wrap. */
+  .grip {
+    position: fixed; right: 0; bottom: 0; width: 16px; height: 16px;
+    cursor: nwse-resize; z-index: 10; touch-action: none;
+    color: var(--muted); opacity: .55;
+  }
+  .grip:hover { opacity: 1; }
+  .grip svg { display: block; }
 </style>
 
 <div class="wrap">
@@ -194,6 +222,7 @@
     <div class="agents-empty" id="agents-empty">No AI sessions yet.</div>
   </div>
 
+
   <div class="stats">
     <div class="stat-card">
       <span class="stat-num writes" id="stat-writes">0</span>
@@ -223,6 +252,12 @@
   <div class="foot" id="foot">Connects to the local Reqwise bridge (localhost:38470 +9).</div>
 </div>
 
+<div class="grip" id="grip" title="Drag to resize">
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <path d="M15 6 L6 15 M15 11 L11 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  </svg>
+</div>
+
 <script>
 (function () {
   "use strict";
@@ -248,12 +283,16 @@
   // activity rows as write/read since BridgeResponse itself carries no kind.
   var WRITE_OPS = {
     create: 1, modify: 1, delete: 1, clone: 1, move: 1, resize: 1, group: 1,
-    ungroup: 1, flatten: 1, batch: 1, find_component: 1,
-    find_or_create_component: 1, instantiate: 1, create_variants: 1,
-    setup_tokens: 1, apply_variable: 1, set_text: 1, load_icon: 1,
-    load_image: 1, create_page: 1, create_overlay: 1, set_selection: 1,
-    zoom_to_fit: 1, get_instance_overrides: 1, set_instance_overrides: 1,
-    set_selection_colors: 1, set_gradient: 1, set_effects: 1
+    ungroup: 1, flatten: 1, batch: 1,
+    setup_tokens: 1, setup_text_styles: 1, setup_effect_styles: 1,
+    set_text_style: 1, apply_variable: 1, create_variable: 1,
+    update_variable: 1, rename_variable: 1, delete_variable: 1,
+    import_tokens: 1, set_text: 1, load_icon: 1,
+    load_image: 1, create_page: 1, delete_page: 1, delete_style: 1, delete_unused_styles: 1,
+    set_current_page: 1, create_overlay: 1, set_selection: 1, zoom_to_fit: 1,
+    set_selection_colors: 1, set_gradient: 1, set_effects: 1, set_reactions: 1,
+    create_userflow: 1, create_activity: 1, create_erd: 1, create_sequence: 1,
+    create_state: 1, create_sitemap: 1, reflow_diagram: 1
   };
 
   // ---- state ----
@@ -269,7 +308,8 @@
   var hello = null;                // hello data relayed from main thread
   var attemptCount = 0;
   var counts = { writes: 0, reads: 0, errors: 0 };
-  var channel = null;              // desired/joined channel; null → server assigns
+  var channel = null;
+  var resumeToken = null;              // desired/joined channel; null → server assigns
   var channelsUpdate = null;       // latest {self, channels, sessions} push
   var replacedByPeer = false;      // this window's channel was taken elsewhere
 
@@ -445,6 +485,53 @@
     parent.postMessage({ pluginMessage: msg }, "*");
   }
 
+  // ---- resize grip ----
+  // Figma only lets the MAIN thread resize the window, so the iframe measures
+  // the drag and posts the size; main.ts clamps and persists it. The pointer
+  // is captured, so the drag survives leaving the 16px grip.
+  var MIN_W = 280, MIN_H = 260, MAX_W = 1600, MAX_H = 1600;
+  var grip = document.getElementById("grip");
+  var dragFrom = null;   // offset of the pointer from the panel's bottom-right
+  var pendingSize = null;
+
+  function flushSize() {
+    if (!pendingSize) return;
+    var s = pendingSize;
+    pendingSize = null;
+    toMain({ kind: "resize", width: s.w, height: s.h });
+  }
+
+  function onGripMove(e) {
+    if (!dragFrom) return;
+    var w = Math.round(e.clientX + dragFrom.dx);
+    var h = Math.round(e.clientY + dragFrom.dy);
+    w = Math.max(MIN_W, Math.min(MAX_W, w));
+    h = Math.max(MIN_H, Math.min(MAX_H, h));
+    // One post per frame: a raw pointermove stream is ~10x more messages than
+    // the window can actually redraw.
+    var first = !pendingSize;
+    pendingSize = { w: w, h: h };
+    if (first) requestAnimationFrame(flushSize);
+  }
+
+  if (grip) {
+    grip.onpointerdown = function (e) {
+      dragFrom = {
+        dx: window.innerWidth - e.clientX,
+        dy: window.innerHeight - e.clientY,
+      };
+      grip.setPointerCapture(e.pointerId);
+      grip.onpointermove = onGripMove;
+      e.preventDefault();
+    };
+    grip.onpointerup = grip.onpointercancel = function (e) {
+      dragFrom = null;
+      grip.onpointermove = null;
+      flushSize();
+      try { grip.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
+    };
+  }
+
   // Ask the main thread for handshake + hello on load.
   toMain({ kind: "handshake" });
 
@@ -459,10 +546,19 @@
         hello = msg.hello;
         // Restore this file's persisted channel (main thread owns storage).
         if (hello.channel && !channel) channel = hello.channel;
+        if (hello.resumeToken && !resumeToken) resumeToken = hello.resumeToken;
         renderMeta();
         // If already connected, (re)send hello so the server has fresh file info.
         if (ws && ws.readyState === 1) sendHello();
         break;
+      case "local": {
+        var waiting = localPending[msg.id];
+        if (!waiting) break;
+        delete localPending[msg.id];
+        if (msg.ok) waiting.resolve(msg.result);
+        else waiting.reject(new Error((msg.error && msg.error.message) || "failed"));
+        break;
+      }
       case "response":
       case "progress": {
         // Relay main-thread → server over the WS.
@@ -477,6 +573,8 @@
           else counts.reads++;
           renderStats();
           logActivity(msg.op || "unknown", ok, isWrite);
+          // An agent just built or removed a demo — the list is stale.
+          if (ok && (msg.op === "build_demo" || msg.op === "delete_demo")) refreshDemos();
         }
         break;
       }
@@ -542,8 +640,9 @@
         // The server confirmed/assigned this window's channel. Persist it so
         // reopening the plugin in this file rejoins the same channel.
         channel = data.channel;
+        resumeToken = data.resumeToken || null;
         replacedByPeer = false;
-        toMain({ kind: "save-channel", channel: channel });
+        toMain({ kind: "save-channel", channel: channel, resumeToken: resumeToken });
         renderMeta();
         return;
       }
@@ -569,7 +668,8 @@
       if (event && event.reason === "replaced") {
         replacedByPeer = true;
         channel = null;
-        toMain({ kind: "save-channel", channel: null });
+        resumeToken = null;
+        toMain({ kind: "save-channel", channel: null, resumeToken: null });
         setState("connecting", "Channel moved to another window — rejoining…");
       } else {
         setState("bad", "Disconnected");
@@ -584,15 +684,20 @@
     var pv = (handshake && handshake.protocolVersion) || 1;
     var pluginVersion = (handshake && handshake.pluginVersion) || "0.0.0";
     var h = hello || {};
+    // Reconstructs the hello field-by-field. pluginBuild MUST be forwarded:
+    // the main thread already stamps the bundle, but dropping it here made
+    // every reload look like a plugin older than the stamp mechanism itself.
     ws.send(JSON.stringify({
       type: "hello",
       protocolVersion: pv,
       pluginVersion: pluginVersion,
+      pluginBuild: h.pluginBuild,
       fileKey: h.fileKey != null ? h.fileKey : null,
       fileName: h.fileName || "",
       pageName: h.pageName || "",
       editorType: h.editorType || "figma",
-      channel: channel
+      channel: channel,
+      resumeToken: resumeToken
     }));
   }
 
@@ -673,7 +778,8 @@
       return;
     }
     channel = v;
-    toMain({ kind: "save-channel", channel: channel });
+    resumeToken = null; // reclaim only after server re-issues on assigned
+    toMain({ kind: "save-channel", channel: channel, resumeToken: null });
     el.channelEditor.className = "channel-editor";
     renderMeta();
     // Reconnect so the server re-handshakes us onto the new channel.

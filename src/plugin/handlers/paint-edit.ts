@@ -11,6 +11,8 @@ import {
   isValidGradientTransform,
   normalizeGradientStops,
   normalizeEffects,
+  normalizeReactions,
+  NormalizedReaction,
 } from "../edit-util.js";
 
 /**
@@ -105,7 +107,27 @@ function recolorPaintList(
 export async function setGradient(ctx: HandlerContext): Promise<unknown> {
   const p = ctx.params;
   const node = await requireNode(p.nodeId ?? p.id);
-  const target = p.target === "strokes" ? "strokes" : "fills";
+  // Singular and plural both land ("fill"/"fills", "stroke"/"strokes") —
+  // the docs spell it "stroke". Anything else is a param error, not a silent
+  // guess: before this, target:"stroke" quietly repainted the FILLS, the
+  // exact opposite of what was asked.
+  const targetRaw =
+    p.target === undefined || p.target === null
+      ? "fills"
+      : String(p.target).toLowerCase();
+  const target: "fills" | "strokes" | null =
+    targetRaw === "fill" || targetRaw === "fills"
+      ? "fills"
+      : targetRaw === "stroke" || targetRaw === "strokes"
+        ? "strokes"
+        : null;
+  if (!target) {
+    throw err(
+      ErrorCode.INVALID_PARAMS,
+      `set_gradient target must be "fill"/"fills" or "stroke"/"strokes" (got ${JSON.stringify(p.target)}).`,
+      'Omit target to paint fills, or pass target:"stroke" for the border.',
+    );
+  }
   if (!(target in node)) {
     throw err(
       ErrorCode.INVALID_PARAMS,
@@ -200,6 +222,67 @@ export async function setEffects(ctx: HandlerContext): Promise<unknown> {
   return {
     id: node.id,
     effects: normalized.length,
+    node: serializeNode(node, "compact"),
+  };
+}
+
+/**
+ * set_reactions: replace a node's prototype reactions (click→navigate wiring).
+ * Normalizes the flexible {trigger, action} input into Figma Reaction[] and
+ * verifies every NODE-action destination exists before writing — enum or
+ * destination mistakes throw INVALID_PARAMS, never a silent no-op.
+ */
+export async function setReactions(ctx: HandlerContext): Promise<unknown> {
+  const p = ctx.params;
+  const node = await requireNode(p.nodeId ?? p.id);
+  if (!("reactions" in node)) {
+    throw err(
+      ErrorCode.INVALID_PARAMS,
+      `Node type ${node.type} does not support reactions.`,
+      "Wire reactions on a frame, instance, group, or shape (any SceneNode with prototype support).",
+    );
+  }
+
+  let normalized: NormalizedReaction[];
+  try {
+    normalized = normalizeReactions(p.reactions);
+  } catch (e) {
+    throw err(
+      ErrorCode.INVALID_PARAMS,
+      e instanceof Error ? e.message : String(e),
+      'Pass reactions:[{trigger:{type:"ON_CLICK"}, action:{type:"NODE", destinationId, navigation:"NAVIGATE", transition?}}] — [] clears all.',
+    );
+  }
+
+  for (const reaction of normalized) {
+    for (const action of reaction.actions) {
+      if (action.type !== "NODE") continue;
+      const destId = String(action.destinationId);
+      const dest = await figma.getNodeByIdAsync(destId);
+      if (!dest) {
+        throw err(
+          ErrorCode.INVALID_PARAMS,
+          `Reaction destination "${destId}" does not exist.`,
+          "Pass the id of an existing node (usually a top-level frame) as destinationId — get ids via getDocumentInfo or searchNodes.",
+        );
+      }
+    }
+  }
+
+  // node.reactions is readonly under dynamic-page manifests — prefer the
+  // setReactionsAsync API and fall back to assignment on older runtimes.
+  const target = node as SceneNode & {
+    setReactionsAsync?: (reactions: unknown) => Promise<void>;
+    reactions?: unknown;
+  };
+  if (typeof target.setReactionsAsync === "function") {
+    await target.setReactionsAsync(normalized);
+  } else {
+    target.reactions = normalized;
+  }
+  return {
+    id: node.id,
+    reactions: normalized.length,
     node: serializeNode(node, "compact"),
   };
 }

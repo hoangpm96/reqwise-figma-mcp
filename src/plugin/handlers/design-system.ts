@@ -12,6 +12,7 @@ import { rgbToHex } from "../color-util.js";
 import { ErrorCode } from "../../shared/protocol.js";
 import {
   renderDesignMarkdown,
+  computeFingerprint,
   type DesignSystemKit,
   type DesignComponent,
   type DesignMarkdownOptions,
@@ -125,8 +126,36 @@ export async function getDesignSystemKit(ctx: HandlerContext): Promise<unknown> 
 export async function generateDesignMd(ctx: HandlerContext): Promise<unknown> {
   const kit = await collectDesignSystemKit(ctx);
   const markdown = renderDesignMarkdown(kit, markdownOptions(ctx.params));
-  const base = { markdown, extraction: kit.extraction };
+  const base = {
+    markdown,
+    fingerprint: computeFingerprint(kit),
+    extraction: kit.extraction,
+  };
   return ctx.params.includeJson === true ? { ...base, kit } : base;
+}
+
+/**
+ * design_fingerprint: cheap SHAPE hash of the current design system (token/
+ * style/component names + counts) WITHOUT rendering the whole design.md. A
+ * draw-time agent reads the `dsfp:` from the cached design-kit.md and compares
+ * it to this — mismatch means the Figma DS changed since the file was written,
+ * so regenerate before trusting it. Orders of magnitude cheaper than a full
+ * generate_design_md scan.
+ */
+export async function designFingerprint(ctx: HandlerContext): Promise<unknown> {
+  const kit = await collectDesignSystemKit({
+    ...ctx,
+    params: {
+      // The fingerprint only needs styles/variables/components — skip the
+      // expensive screen/instance evidence sweep.
+      ...ctx.params,
+      includeScreens: false,
+      includeComponentUsage: false,
+      includeInstances: false,
+      includeAnatomy: false,
+    },
+  });
+  return computeFingerprint(kit);
 }
 
 export async function listComponents(params: Record<string, unknown> = {}): Promise<{ count: number; total: number; omittedCount: number; components: DesignComponent[] }> {

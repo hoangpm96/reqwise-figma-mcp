@@ -18,7 +18,6 @@ Reqwise Figma MCP was designed from a failure analysis of `figma-ui-mcp` (and `f
 | Text wrapping | Manual `layoutAlign`/`textAutoResize`/`lineHeight` juggling | `create({ type: "TEXT", wrap: true, ... })` sets all three correctly and warns if the parent has no fixed width. |
 | Relative positioning | Manual `x`/`y` arithmetic from parent bounds | `inset: { left, right, top, bottom }` and `align: "center-x" \| "center-y" \| "center"` on `create` — the plugin computes the coordinates. |
 | Z-order | Relied on creation order | `insertAt: "top" \| "bottom" \| { above: nodeId } \| { below: nodeId } \| index` on `create`/`move`. |
-| Component reuse | Manual name search before creating | `findComponent` (fuzzy, path-aware, alias table) and `findOrCreateComponent(name, spec)` make reuse the default path. |
 | Cloning | Cloned nodes required re-searching descendants by name | `clone(nodeId, { parentId, insertAt })` returns `{ id, childMap }` mapping original child ids → cloned child ids — index straight into the clone's descendants. |
 | Multi-mode tokens | Only the current mode was set (a known bug — the other mode silently kept its default) | `setupTokens` sets values for **all modes** explicitly. |
 | Batch size | Hard-capped (e.g. 50 ops), all-or-nothing | **No hard cap** — streams in chunks of 20 with progress pings, partial commit, and exact per-index error reporting. 200+ ops work the same way as 10. |

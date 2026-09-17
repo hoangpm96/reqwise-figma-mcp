@@ -30,10 +30,12 @@ import {
   type BridgeResponse,
   type Operation,
 } from "../shared/protocol.js";
-import { ErrorCode, OpError } from "./errors.js";
+import { ErrorCode, OpError, toBridgeError } from "./errors.js";
+import { assertSafeImageUrl } from "./security.js";
 import type { Session } from "./session.js";
 import { validateOperation, isReadOp } from "./validate.js";
 import { loadIconSvg, searchIcons as searchIconsSvc, type Fetcher, type IconLibrary } from "./icons.js";
+import { runUserflow } from "./userflow.js";
 
 /**
  * A single op runner: validate → dispatch → unwrap. This IS the leader-direct
@@ -72,14 +74,10 @@ const METHOD_TO_OP: Record<string, AnyOperation> = {
   ungroup: "ungroup",
   flatten: "flatten",
   batch: "batch",
-  findComponent: "find_component",
-  findOrCreateComponent: "find_or_create_component",
-  instantiate: "instantiate",
-  createVariants: "create_variants",
-  arrangeComponentSet: "arrange_component_set",
-  setComponentDescription: "set_component_description",
-  componentize: "componentize",
   setupTokens: "setup_tokens",
+  setupTextStyles: "setup_text_styles",
+  setTextStyle: "set_text_style",
+  setupEffectStyles: "setup_effect_styles",
   applyVariable: "apply_variable",
   createVariable: "create_variable",
   updateVariable: "update_variable",
@@ -91,17 +89,19 @@ const METHOD_TO_OP: Record<string, AnyOperation> = {
   loadImage: "load_image",
   createPage: "create_page",
   setCurrentPage: "set_current_page",
+  deletePage: "delete_page",
+  deleteStyle: "delete_style",
+  deleteUnusedStyles: "delete_unused_styles",
   overlay: "create_overlay",
   zoomToFit: "zoom_to_fit",
   setSelection: "set_selection",
   // Edit-in-place composite write ops (business logic lives in the plugin).
-  getInstanceOverrides: "get_instance_overrides",
-  setInstanceOverrides: "set_instance_overrides",
-  detachInstance: "detach_instance",
-  resetInstanceOverrides: "reset_instance_overrides",
   setSelectionColors: "set_selection_colors",
   setGradient: "set_gradient",
   setEffects: "set_effects",
+  setReactions: "set_reactions",
+  // Put a drawn diagram's arrows back on its boxes after they were moved.
+  reflowDiagram: "reflow_diagram",
   // read ops usable from write code
   readSelection: "read_selection",
   getNodeById: "get_node",
@@ -121,6 +121,7 @@ const METHOD_TO_OP: Record<string, AnyOperation> = {
   getLibraryComponent: "get_library_component",
   getDesignSystemKit: "get_design_system_kit",
   generateDesignMd: "generate_design_md",
+  designFingerprint: "design_fingerprint",
   screenshot: "screenshot",
   exportNode: "export_node",
   getFonts: "get_fonts",
@@ -152,64 +153,312 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([p, deadline]).finally(() => clearTimeout(timer)) as Promise<T>;
 }
 
-export async function executeWrite(code: string, session: Session, deps: ExecutorDeps): Promise<WriteResult> {
+/**
+ * Per-session serialization of figma_write calls. The sandbox snapshots
+ * session.state on entry and REPLACES it on exit (__syncState), so two writes
+ * running concurrently on one session each overwrite the other's mutations —
+ * and mid-call host reads (setupTokens' token map) race the same way. MCP
+ * tool calls run concurrently, so the chain lives here, keyed by the Session
+ * object both call paths resolve through the same registry.
+ */
+const writeChains = new WeakMap<Session, Promise<unknown>>();
+
+export function executeWrite(code: string, session: Session, deps: ExecutorDeps): Promise<WriteResult> {
+  const prev = writeChains.get(session) ?? Promise.resolve();
+  const next = prev.then(() => executeWriteInner(code, session, deps));
+  // Store a rejection-proof tail so one failed write never wedges the chain.
+  writeChains.set(session, next.catch(() => undefined));
+  return next;
+}
+
+async function executeWriteInner(code: string, session: Session, deps: ExecutorDeps): Promise<WriteResult> {
   const logs: string[] = [];
   const warnings: string[] = [];
 
-  const console_ = {
-    log: (...a: unknown[]) => logs.push(fmt(a)),
-    info: (...a: unknown[]) => logs.push(fmt(a)),
-    warn: (...a: unknown[]) => logs.push(`WARN: ${fmt(a)}`),
-    error: (...a: unknown[]) => logs.push(`ERROR: ${fmt(a)}`),
-    debug: (...a: unknown[]) => logs.push(fmt(a)),
+  // Values crossing OUT of the context (console args, the result) are
+  // stringified INSIDE the context under a CPU budget — JSON.stringify runs
+  // caller-supplied toJSON/getters, which on the host would be unbounded (a
+  // `while(true){}` toJSON froze the server). Bound late: the context doesn't
+  // exist yet. The pre-context fallback is only reachable in tests.
+  let serToText: (v: unknown) => string = safeStringify;
+  let serResult: (v: unknown) => unknown = (v) => {
+    if (v === undefined) return undefined;
+    try {
+      return JSON.parse(JSON.stringify(v));
+    } catch {
+      return String(v);
+    }
   };
 
-  const figma = buildFigmaProxy(session, deps, warnings);
+  const console_ = {
+    log: (...a: unknown[]) => logs.push(fmt(a, serToText)),
+    info: (...a: unknown[]) => logs.push(fmt(a, serToText)),
+    warn: (...a: unknown[]) => logs.push(`WARN: ${fmt(a, serToText)}`),
+    error: (...a: unknown[]) => logs.push(`ERROR: ${fmt(a, serToText)}`),
+    debug: (...a: unknown[]) => logs.push(fmt(a, serToText)),
+  };
+
+  // Host-side writes to session.state made DURING this call (setupTokens'
+  // token map). The sandbox works on a context-realm copy of session.state
+  // that is synced back on exit; overlay keys re-apply on top of that copy so
+  // host-side writes survive the sync.
+  const stateOverlay: Record<string, unknown> = {};
+  const figmaProxy = buildFigmaProxy(session, deps, warnings, stateOverlay);
+
+  // ---- realm-boundary design (why this looks the way it does) ----
+  //
+  // node:vm gives a separate REALM, not a separate trust domain: any host
+  // object reachable from sandbox code hands it the host realm's Function
+  // through `value.constructor.constructor`, which then reads the real
+  // `process` — a full escape. Scrubbing the injected roots was not enough:
+  // values that cross the boundary AT RUNTIME leak the same way — the object
+  // a figma.* call resolves, the Error a failed op throws, the host Error a
+  // banned-global stub throws, even the Promise a call returns. So the rule:
+  //
+  //   NOTHING host-realm may become reachable from user code. Only
+  //   primitives (JSON strings) cross the boundary; everything else is
+  //   rebuilt inside the context realm by the bootstrap below.
+  //
+  // - `__invoke` always resolves a JSON envelope string (never rejects, never
+  //   returns objects) and is removed from the globals by the bootstrap —
+  //   user code can never hold its host Promise.
+  // - `figma` is rebuilt inside the context as async wrappers that `await`
+  //   the bridge internally and re-throw a context-realm Error (code/hint).
+  // - `state` is a JSON snapshot parsed inside the context; the wrapped IIFE
+  //   syncs it back through `__syncState` in `finally`.
+  // - banned globals are context stubs — a host-thrown Error would itself
+  //   leak the host realm.
+  // - `console` and `__syncState` are the only host values left reachable:
+  //   scrubbed by the bootstrap and returning only primitives.
+  const invoke = async (method: string, argsJson: string): Promise<string> => {
+    try {
+      // Reads go through the proxy's get-trap so unknown methods resolve to
+      // the DX stub (mapped suggestion / nearest-method hint), whose thrown
+      // OpError lands in the error envelope below.
+      const fn = (figmaProxy as Record<string, unknown>)[method];
+      if (typeof fn !== "function") {
+        return JSON.stringify({
+          ok: false,
+          error: { code: ErrorCode.INVALID_PARAMS, message: `figma.${method} is not a function.` },
+        });
+      }
+      const args: unknown = JSON.parse(argsJson);
+      const result = await (fn as (...a: unknown[]) => unknown)(...(Array.isArray(args) ? args : [args]));
+      return JSON.stringify({ ok: true, result });
+    } catch (err) {
+      const be = toBridgeError(err);
+      return JSON.stringify({
+        ok: false,
+        error: { code: be.code, message: be.message, ...(be.hint ? { hint: be.hint } : {}) },
+      });
+    }
+  };
+
+  const syncState = (json: string): void => {
+    try {
+      const parsed: unknown = JSON.parse(json);
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        session.state = { ...(parsed as Record<string, unknown>), ...stateOverlay };
+      }
+    } catch {
+      /* malformed state JSON — keep the last known-good session.state */
+    }
+  };
+
+  let stateJson = "{}";
+  try {
+    stateJson = JSON.stringify(session.state ?? {});
+  } catch {
+    /* unserializable prior state — this call starts from {} */
+  }
 
   // Explicit, minimal global surface. Anything not listed is undefined in the
-  // sandbox. Banned APIs are set to throwing stubs so the error is legible.
-  const banned = (name: string) => () => {
-    throw new OpError(
-      ErrorCode.SANDBOX_ERROR,
-      `"${name}" is not available in figma_write.`,
-      "Sandbox bans require/process/fetch/timers/eval. Use figma.* ops and plain JS only.",
-    );
-  };
-
-  // IMPORTANT: do NOT inject host built-ins (Object, Array, Function, …) into the
-  // sandbox. A vm context is its own realm and already provides all standard
-  // globals from THAT realm; injecting the host's versions was the root cause of
-  // the sandbox escape — `({}).constructor.constructor` then resolved to the
-  // HOST Function, which can read the real `process`/`process.env`. By leaving
-  // built-ins to the context realm, the Function constructor reachable via any
-  // prototype chain is the sandbox realm's, which has no `process`/`require`.
-  // We only inject non-standard globals (figma/state/console) and throwing stubs
-  // for the Node host APIs that a fresh realm would otherwise expose.
+  // sandbox. The __-prefixed entries are bootstrap inputs consumed below;
+  // figma/state and the banned globals are installed inside the context.
   const sandbox: Record<string, unknown> = {
-    figma,
-    state: session.state,
+    __invoke: invoke,
+    __syncState: syncState,
+    __stateData: stateJson,
+    __hostFigma: figmaProxy,
     console: console_,
-    // banned host APIs (these exist in a Node vm realm unless shadowed)
-    require: banned("require"),
-    process: banned("process"),
-    fetch: banned("fetch"),
-    setTimeout: banned("setTimeout"),
-    setInterval: banned("setInterval"),
-    setImmediate: banned("setImmediate"),
-    eval: banned("eval"),
-    Function: banned("Function"),
+    figma: undefined,
+    state: undefined,
+    require: undefined,
+    process: undefined,
+    fetch: undefined,
+    setTimeout: undefined,
+    setInterval: undefined,
+    setImmediate: undefined,
     globalThis: undefined,
+    // `eval`/`Function` are intentionally NOT pre-shadowed: the bootstrap
+    // needs the real context Function.prototype before installing its stubs.
   };
 
   const context = vm.createContext(sandbox, { name: "figma_write" });
 
-  // Wrap user code in an async IIFE so top-level await + returns work; capture
-  // its resolved value as `result`. Strict mode makes a bare call's `this`
-  // undefined. Combined with not injecting host built-ins (see sandbox above),
-  // `this.constructor.constructor` / `({}).constructor.constructor` resolve to
-  // the CONTEXT realm's Function — which has no host process/require — instead
-  // of the host realm's.
-  const wrapped = `(async function () {\n"use strict";\n${code}\n}).call(undefined)`;
+  const bootstrap = new vm.Script(
+    `(() => {
+      // Capture context intrinsics BEFORE they are shadowed below.
+      const CtxObjectProto = Object.prototype;
+      const CtxFunctionProto = Function.prototype;
+      const __inv = __invoke;
+      const hostFigma = __hostFigma;
+      const stateJson = __stateData;
+
+      // Host values that must not stay reachable — a host function's return
+      // value is a host object, and .constructor.constructor on any host
+      // value is the HOST Function (realm escape). __syncState is the only
+      // bridge left in place: the wrapper calls it in finally, it takes and
+      // returns only primitives, and it is scrubbed below.
+      __invoke = undefined;
+      __hostFigma = undefined;
+      __stateData = undefined;
+
+      // Banned globals as context-realm stubs — a host-thrown Error would
+      // itself leak the host realm.
+      const ban = (name) => () => {
+        const e = new Error('"' + name + '" is not available in figma_write.');
+        e.code = "SANDBOX_ERROR";
+        e.hint = "Sandbox bans require/process/fetch/timers/eval. Use figma.* ops and plain JS only.";
+        throw e;
+      };
+      require = ban("require");
+      process = ban("process");
+      fetch = ban("fetch");
+      setTimeout = ban("setTimeout");
+      setInterval = ban("setInterval");
+      setImmediate = ban("setImmediate");
+      eval = ban("eval");
+      Function = ban("Function");
+      globalThis = undefined;
+
+      // A poison constructor: '.constructor' reached on a scrubbed value
+      // lands here — a context-realm function, never the host one. The scrub
+      // recursion poisons Poison itself, so Poison.constructor is Poison and
+      // the chain dead-ends.
+      const Poison = function Poison() { throw new TypeError("blocked"); };
+      const seen = new Set();
+      const scrub = (v) => {
+        if (v === null || (typeof v !== "object" && typeof v !== "function")) return;
+        if (seen.has(v)) return;
+        seen.add(v);
+        // Reparent onto the context realm's prototype so the host realm is
+        // unreachable through [[Prototype]].
+        try { Object.setPrototypeOf(v, typeof v === "function" ? CtxFunctionProto : CtxObjectProto); } catch (_) {}
+        // Own, non-configurable 'constructor' — can't be redefined away.
+        try {
+          Object.defineProperty(v, "constructor", {
+            value: Poison, writable: false, enumerable: false, configurable: false,
+          });
+        } catch (_) {}
+        // Recurse into EVERY object/function-valued own prop plus accessors —
+        // a host object nested a level deep is the same escape hatch.
+        for (const k of Object.getOwnPropertyNames(v)) {
+          let d; try { d = Object.getOwnPropertyDescriptor(v, k); } catch (_) { continue; }
+          if (!d) continue;
+          if (d.value && (typeof d.value === "object" || typeof d.value === "function")) scrub(d.value);
+          if (typeof d.get === "function") scrub(d.get);
+          if (typeof d.set === "function") scrub(d.set);
+        }
+      };
+      scrub(console);
+      scrub(__syncState);
+      scrub(__inv);
+
+      // state: a context-realm copy of the session object. The wrapped IIFE
+      // syncs it back to the host in 'finally' via __syncState.
+      try { state = JSON.parse(stateJson || "{}"); } catch (_) { state = {}; }
+      if (state === null || typeof state !== "object" || Array.isArray(state)) state = {};
+
+      // figma: every method becomes a context-realm async wrapper around the
+      // host bridge. The host Promise returned by __inv is awaited INSIDE the
+      // wrapper and never reaches user code; only the resolved JSON string
+      // (a primitive — no prototype chain, nothing to escape through) crosses.
+      const callMethod = async (m, args) => {
+        const env = JSON.parse(await __inv(m, JSON.stringify(args)));
+        if (env && env.ok === true) return env.result;
+        const info = (env && env.error) || {};
+        const err = new Error(typeof info.message === "string" ? info.message : ("figma." + m + " failed"));
+        if (typeof info.code === "string") err.code = info.code;
+        if (typeof info.hint === "string") err.hint = info.hint;
+        throw err;
+      };
+      const rebuilt = {};
+      for (const name of Object.getOwnPropertyNames(hostFigma)) {
+        const v = hostFigma[name];
+        if (typeof v === "function") {
+          rebuilt[name] = ((m) => (...args) => callMethod(m, args))(name);
+        } else {
+          // Data props (the "mixed" sentinel) cross as a JSON copy.
+          try { rebuilt[name] = JSON.parse(JSON.stringify(v)); } catch (_) {}
+        }
+      }
+      try {
+        Object.defineProperty(rebuilt, "constructor", {
+          value: Poison, writable: false, enumerable: false, configurable: false,
+        });
+        Object.defineProperty(state, "constructor", {
+          value: Poison, writable: false, enumerable: false, configurable: false,
+        });
+      } catch (_) {}
+      // Unknown-method trap, mirroring the host proxy's DX guard: an unknown
+      // name resolves to a wrapper so the host-side stub produces the mapped,
+      // actionable error. Non-call probes (then/toJSON/symbols) stay
+      // undefined so normal JS semantics hold.
+      figma = new Proxy(rebuilt, {
+        get(t, prop) {
+          if (typeof prop === "symbol") return Reflect.get(t, prop);
+          const v = t[prop];
+          if (v !== undefined) return v;
+          if (prop === "then" || prop === "toJSON" || prop === "constructor" || prop === "inspect") {
+            return undefined;
+          }
+          return (...args) => callMethod(String(prop), args);
+        },
+      });
+    })();`,
+    { filename: "figma_write.bootstrap.js" },
+  );
+  bootstrap.runInContext(context);
+
+  // Bound the stringify of context values leaving the sandbox: a hostile
+  // toJSON/getter would otherwise run unbounded on the host event loop during
+  // JSON.stringify. Rebuilt per call because it needs this context.
+  const serScript = new vm.Script("JSON.stringify(__serArg)", { filename: "figma_write.serialize.js" });
+  const serInContext = (v: unknown): string | undefined => {
+    sandbox.__serArg = v;
+    try {
+      const s = serScript.runInContext(context, { timeout: VM_TIMEOUT_MS });
+      return typeof s === "string" ? s : undefined;
+    } finally {
+      sandbox.__serArg = undefined;
+    }
+  };
+  serToText = (v: unknown): string => {
+    try {
+      return serInContext(v) ?? "[unserializable value]";
+    } catch {
+      return "[unserializable value]";
+    }
+  };
+  serResult = (v: unknown): unknown => {
+    if (v === undefined) return undefined;
+    try {
+      const s = serInContext(v);
+      return s === undefined ? "[unserializable result]" : JSON.parse(s);
+    } catch {
+      return "[unserializable result]";
+    }
+  };
+
+  // Wrap user code in an async IIFE so top-level await + returns work; the
+  // outer try/finally syncs the mutated `state` back to the session even when
+  // the code throws. Strict mode makes a bare call's `this` undefined.
+  const wrapped =
+    `(async function () {\n"use strict";\n` +
+    `try {\nreturn await (async function () {\n${code}\n})();\n` +
+    `} finally {\ntry { __syncState(JSON.stringify(state)); } catch (_) {}\n}\n` +
+    `}).call(undefined)`;
 
   session.writeCount++;
 
@@ -239,33 +488,55 @@ export async function executeWrite(code: string, session: Session, deps: Executo
     // fails cleanly and in-budget instead of taking down the connection.
     const runResult = script.runInContext(context, { timeout: VM_TIMEOUT_MS }) as Promise<unknown>;
     const result = await withDeadline(runResult, VM_TIMEOUT_MS);
-    return { ok: true, result: safeSerialize(result), logs, warnings };
+    return { ok: true, result: serResult(result), logs, warnings };
   } catch (err) {
     if (err instanceof OpError) {
       return { ok: false, logs, warnings, error: { code: err.code, message: err.message, ...(err.hint ? { hint: err.hint } : {}) } };
     }
-    const message = err instanceof Error ? err.message : String(err);
+    // Context-realm errors are not `instanceof Error` in the host realm —
+    // read .message as a prop so the text doesn't come out "Error: ...".
+    // They also carry code/hint as own props (banned-global stubs, figma.*
+    // failures) — primitives, safe to read across the boundary.
+    const ce = err as { code?: unknown; hint?: unknown; message?: unknown } | null;
+    const message = ce && typeof ce.message === "string" ? ce.message : String(err);
+    const ctxCode = ce && typeof ce.code === "string" ? (ce.code as ErrorCode) : undefined;
+    const ctxHint = ce && typeof ce.hint === "string" ? ce.hint : undefined;
     const isTimeout = /Script execution timed out/i.test(message);
     return {
       ok: false,
       logs,
       warnings,
       error: {
-        code: isTimeout ? ErrorCode.PLUGIN_TIMEOUT : ErrorCode.SANDBOX_ERROR,
-        message: isTimeout ? `figma_write exceeded the ${VM_TIMEOUT_MS}ms budget.` : message,
-        hint: isTimeout
-          ? "Split the work across multiple figma_write calls or use figma.batch() for many similar ops."
-          : "The error is from your code or a figma op — check the message and figma_docs(section=\"api\").",
+        code: ctxCode ?? (isTimeout ? ErrorCode.PLUGIN_TIMEOUT : ErrorCode.SANDBOX_ERROR),
+        message: isTimeout && ctxCode === undefined ? `figma_write exceeded the ${VM_TIMEOUT_MS}ms budget.` : message,
+        hint:
+          ctxHint ??
+          (isTimeout
+            ? "Split the work across multiple figma_write calls or use figma.batch() for many similar ops."
+            : "The error is from your code or a figma op — check the message and figma_docs(section=\"api\")."),
       },
     };
   }
 }
 
-function buildFigmaProxy(session: Session, deps: ExecutorDeps, warnings: string[]): Record<string, unknown> {
+function buildFigmaProxy(
+  session: Session,
+  deps: ExecutorDeps,
+  warnings: string[],
+  stateOverlay: Record<string, unknown>,
+): Record<string, unknown> {
+  // One figma_write call is one placement group: when its screens have to
+  // move clear of existing work, they move together and stay a row.
+  const placeGroup = `w${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
   const call = async (op: AnyOperation, params: Record<string, unknown>): Promise<unknown> => {
     maybeNudgePalette(op, params, session, warnings);
-    const res = await deps.runOp(op, params);
-    if (res.warnings?.length) warnings.push(...res.warnings);
+    const res = await deps.runOp(op, withPlaceGroup(op, params, placeGroup));
+    // Dedupe: the same safe-default warning fires on every node of a large
+    // draw, and N identical copies teach the agent nothing the first one did
+    // not — they just cost tokens.
+    if (res.warnings?.length) {
+      for (const w of res.warnings) if (!warnings.includes(w)) warnings.push(w);
+    }
     if (!res.ok) {
       const e = res.error ?? { code: ErrorCode.INTERNAL, message: `Operation ${op} failed.` };
       throw new OpError(e.code, e.message, e.hint);
@@ -326,7 +597,13 @@ function buildFigmaProxy(session: Session, deps: ExecutorDeps, warnings: string[
   proxy["batch"] = async (
     ops: Array<{ op: string; params: Record<string, unknown> }>,
     opts: { resultDetail?: "full" | "ids" } = {},
-  ) => runBatch(ops, deps, warnings, opts.resultDetail === "ids" ? "ids" : "full");
+  ) =>
+    runBatch(
+      Array.isArray(ops) ? ops.map((o) => (o && isObj(o.params) ? { ...o, params: withPlaceGroup(o.op as AnyOperation, o.params, placeGroup) } : o)) : ops,
+      deps,
+      warnings,
+      opts.resultDetail === "ids" ? "ids" : "full",
+    );
 
   // setupTokens: run the plugin op, then cache the resulting token map into
   // session.state.tokens so later figma_write calls can look tokens up by name
@@ -340,6 +617,9 @@ function buildFigmaProxy(session: Session, deps: ExecutorDeps, warnings: string[
       (session.state.tokens as Record<string, unknown> | undefined) ?? {};
     const map = mergeTokenMap(existing, tokensJson, result);
     session.state.tokens = map;
+    // The sandbox works on a context-realm copy of state synced back on exit;
+    // record the host-side write so the sync does not lose it.
+    stateOverlay["tokens"] = map;
     return result;
   };
 
@@ -362,6 +642,24 @@ function buildFigmaProxy(session: Session, deps: ExecutorDeps, warnings: string[
     });
   };
 
+
+  // userflow: the graph is the AGENT's analysis of the spec (screens, happy
+  // path, error and edge cases). The layout runs server-side and the plugin
+  // only draws; graph findings come back as warnings so the next pass can fill
+  // the holes the arrows just made visible.
+  proxy["userflow"] = async (spec: unknown) => {
+    // `call` unwraps the bridge response, so plugin warnings land in the
+    // sandbox-wide sink rather than in the value returned here. Fold whatever
+    // this call added back into the result, so `figma.userflow(...)` and the
+    // figma_diagram tool report the same findings in the same place.
+    const before = warnings.length;
+    const res = await runUserflow(spec, call, warnings);
+    const merged = res.warnings.slice();
+    for (const w of warnings.slice(before)) if (!merged.includes(w)) merged.push(w);
+    return { ...res, warnings: merged };
+  };
+
+
   // loadImage: accept a URL (fetched server-side, like icons), a data: URI, or
   // raw base64. Previously only base64 worked and a URL crashed the plugin with
   // a cryptic atob() error; now the server resolves the URL to base64 before
@@ -374,7 +672,7 @@ function buildFigmaProxy(session: Session, deps: ExecutorDeps, warnings: string[
       throw new OpError(
         ErrorCode.INVALID_PARAMS,
         "loadImage requires a URL, a data: URI, or a base64 string.",
-        "Pass an https URL, a data:image/...;base64,... URI, or raw base64 bytes.",
+        "Pass an https URL (public hosts only), a data:image/...;base64,... URI, or raw base64 bytes.",
       );
     }
     let base64: string;
@@ -485,9 +783,10 @@ function mergeTokenMap(
 /** Fetch an image URL and return its base64 body. An optional imageFetcher on
  * deps lets tests supply bytes without hitting the network. */
 async function fetchImageAsBase64(url: string, deps: ExecutorDeps): Promise<string> {
+  const safe = assertSafeImageUrl(url);
   try {
-    if (deps.imageFetcher) return await deps.imageFetcher(url);
-    const res = await (globalThis.fetch as unknown as (u: string) => Promise<Response>)(url);
+    if (deps.imageFetcher) return await deps.imageFetcher(safe.href);
+    const res = await (globalThis.fetch as unknown as (u: string) => Promise<Response>)(safe.href);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     return buf.toString("base64");
@@ -521,8 +820,6 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
     case "zoom_to_fit":
     case "layout_audit":
     case "export_node":
-    case "arrange_component_set":
-    case "componentize":
       return { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
     case "get_node":
       return { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
@@ -532,37 +829,29 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
       return isObj(first) ? (first as Record<string, unknown>) : { componentId: first };
     case "get_library_component":
       return isObj(first) ? (first as Record<string, unknown>) : { key: first };
-    case "detach_instance":
-    case "reset_instance_overrides":
-      // (idOrIds) or ({nodeId|nodeIds, ...})
-      return Array.isArray(first)
-        ? { nodeIds: first }
-        : isObj(first)
-          ? (first as Record<string, unknown>)
-          : { nodeId: first };
     case "set_text":
       return { nodeId: first, content: second };
-    case "set_component_description":
-      // setComponentDescription(nodeId, "text") or (nodeId, {description, documentationLinks})
-      return isObj(second)
-        ? { nodeId: first, ...(second as object) }
-        : { nodeId: first, description: second };
     case "apply_variable":
       return { nodeId: first, field: second, tokenName: args[2] };
-    case "instantiate":
-      // instantiate(idOrName, opts) or instantiate({component|query|componentId, ...}, opts)
-      return isObj(first)
-        ? { ...(first as Record<string, unknown>), ...(isObj(second) ? (second as object) : {}) }
-        : { componentId: first, ...(isObj(second) ? (second as object) : {}) };
-    case "create_variants":
-      return { baseSpec: first, variants: second };
-    case "find_component":
-      return isObj(first) ? (first as Record<string, unknown>) : { query: first };
-    case "find_or_create_component":
-      // findOrCreateComponent(name, spec, {dryRun, threshold})
-      return { name: first, spec: second, ...(isObj(args[2]) ? (args[2] as object) : {}) };
     case "setup_tokens":
       return isObj(first) ? (first as Record<string, unknown>) : { tokens: first };
+    case "setup_text_styles":
+      // setupTextStyles(stylesArray) → {styles}; ({styles: [...]}) passes through.
+      return Array.isArray(first)
+        ? { styles: first }
+        : isObj(first)
+          ? (first as Record<string, unknown>)
+          : { styles: first };
+    case "set_text_style":
+      // setTextStyle(nodeId, styleNameOrId) → {nodeId, style}.
+      return { nodeId: first, style: second };
+    case "setup_effect_styles":
+      // setupEffectStyles(stylesArray) → {styles}; ({styles:[...]}) passes through.
+      return Array.isArray(first)
+        ? { styles: first }
+        : isObj(first)
+          ? (first as Record<string, unknown>)
+          : { styles: first };
     case "create_variable":
       // createVariable(name, valueOrOpts) or createVariable({name, ...})
       return isObj(first)
@@ -588,6 +877,20 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
         : { tokens: first, ...(isObj(second) ? (second as object) : {}) };
     case "create_page":
       return isObj(first) ? (first as Record<string, unknown>) : { name: first };
+    case "delete_page":
+      // deletePage(idOrName, {force}) or ({page, force})
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : { page: first, ...(isObj(second) ? (second as object) : {}) };
+    case "delete_style":
+      // deleteStyle(nameOrId, {type, replaceWith, force}) or ({style, ...})
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : { style: first, ...(isObj(second) ? (second as object) : {}) };
+    case "delete_unused_styles":
+      // deleteUnusedStyles() previews; ({confirm, types, keep}) deletes.
+      return isObj(first) ? (first as Record<string, unknown>) : {};
+    // Demo reels: deleteDemo("id") / getDemoSpec("id"), or the opts bag.
     case "set_current_page":
       return isObj(first) ? (first as Record<string, unknown>) : { pageId: first };
     case "load_image":
@@ -596,17 +899,69 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
       return isObj(first) ? (first as Record<string, unknown>) : { nodeIds: first };
     case "search_nodes":
       return isObj(first) ? (first as Record<string, unknown>) : { query: first };
-    // Edit-in-place composite ops — keep the (targetish, opts) ergonomics.
-    case "get_instance_overrides":
-      // getInstanceOverrides(nodeId?) → {nodeId?} (omit when absent).
+    case "get_fonts":
+      // getFonts(["Inter"]) — documented positional family list; also a bare
+      // family name or the {families} bag.
       return isObj(first)
         ? (first as Record<string, unknown>)
         : first === undefined
           ? {}
-          : { nodeId: first };
-    case "set_instance_overrides":
-      // setInstanceOverrides(sourceId, targetIds) → {sourceId, targetIds}.
-      return isObj(first) ? (first as Record<string, unknown>) : { sourceId: first, targetIds: second };
+          : { families: Array.isArray(first) ? first : [first] };
+    case "screenshot":
+      // screenshot({nodeId, scale}) documented; tolerate screenshot("1:2").
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : first === undefined
+          ? {}
+          : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+    case "reflow_diagram":
+      // reflowDiagram({frameId?}) — tolerate a bare frame id.
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : first === undefined
+          ? {}
+          : { frameId: first, ...(isObj(second) ? (second as object) : {}) };
+    case "get_design_context":
+      // getDesignContext({nodeId?, detail?, depth?}) — tolerate a bare nodeId.
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : first === undefined
+          ? {}
+          : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+    case "scan_text_nodes":
+      // scanTextNodes({nodeId?, limit?}) — tolerate a bare nodeId.
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : first === undefined
+          ? {}
+          : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+    case "scan_nodes_by_types":
+      // scanNodesByTypes({types?, nodeId?}) — an array arg is the type list,
+      // a string arg a scope nodeId.
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : Array.isArray(first)
+          ? { types: first, ...(isObj(second) ? (second as object) : {}) }
+          : first === undefined
+            ? {}
+            : { nodeId: first, ...(isObj(second) ? (second as object) : {}) };
+    case "read_selection":
+      // readSelection({detail?, depth?}) — tolerate a bare detail string.
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : first === undefined
+          ? {}
+          : { detail: first };
+    case "set_selection":
+      // setSelection(["1:2", "3:4"]) or setSelection({nodeIds}).
+      return isObj(first)
+        ? (first as Record<string, unknown>)
+        : Array.isArray(first)
+          ? { nodeIds: first }
+          : first === undefined
+            ? {}
+            : { nodeIds: [first] };
+    // Edit-in-place composite ops — keep the (targetish, opts) ergonomics.
     case "set_selection_colors":
       // setSelectionColors(nodeId, opts) → {nodeId, ...opts}. nodeId is
       // optional (defaults to current selection), so a single object arg is
@@ -620,6 +975,9 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
     case "set_effects":
       // setEffects(nodeId, effects) → {nodeId, effects}.
       return { nodeId: first, effects: second };
+    case "set_reactions":
+      // setReactions(nodeId, reactions) → {nodeId, reactions}.
+      return { nodeId: first, reactions: second };
     case "create":
     case "create_overlay": {
       // create(spec) — but also tolerate the natural two-arg shape
@@ -638,8 +996,19 @@ function argsToParams(op: AnyOperation, args: unknown[]): Record<string, unknown
       return spec;
     }
     default:
-      // screenshot, get_* etc → single object spec (or {})
-      return isObj(first) ? (first as Record<string, unknown>) : first === undefined ? {} : { value: first };
+      // get_document_info / get_selection / get_styles / get_variables /
+      // get_components / get_design_system_kit / generate_design_md /
+      // design_fingerprint / list_channels → single object spec (or {}).
+      // A stray scalar used to be wrapped into {value} — a param NO op reads,
+      // so the arg was silently dropped (figma.screenshot("1:2") screenshotted
+      // the whole page). Fail loud instead.
+      if (isObj(first)) return first as Record<string, unknown>;
+      if (first === undefined) return {};
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        `"${op}" takes an options object, not a bare ${Array.isArray(first) ? "array" : typeof first}.`,
+        "Pass the options as one object — see figma_docs(section=\"api\") for the call shape.",
+      );
   }
 }
 
@@ -691,7 +1060,12 @@ async function runBatch(
       ops: runnable.map((it) => ({ op: it.op, params: it.params })),
       chunk: { index: chunkIndex, total: chunkTotal },
     });
-    if (res.warnings?.length) warnings.push(...res.warnings);
+    // Dedupe: the same safe-default warning fires on every node of a large
+    // draw, and N identical copies teach the agent nothing the first one did
+    // not — they just cost tokens.
+    if (res.warnings?.length) {
+      for (const w of res.warnings) if (!warnings.includes(w)) warnings.push(w);
+    }
 
     if (!res.ok) {
       // Whole-chunk transport failure → mark every runnable item in this chunk
@@ -721,6 +1095,14 @@ async function runBatch(
   results.sort((a, b) => a.index - b.index);
   const okCount = results.filter((r) => r.ok).length;
   return { total, ok: okCount, failed: total - okCount, results };
+}
+
+/** Ops that can put a node straight onto the page, where it must keep clear. */
+const PLACED_OPS = new Set<string>(["create", "instantiate", "clone"]);
+
+function withPlaceGroup(op: AnyOperation, params: Record<string, unknown>, group: string): Record<string, unknown> {
+  if (!PLACED_OPS.has(op) || !isObj(params) || params.placeGroup !== undefined) return params;
+  return { ...params, placeGroup: group };
 }
 
 function bridgeErr(e: OpError): { code: ErrorCode; message: string; hint?: string } {
@@ -769,7 +1151,7 @@ function maybeNudgePalette(
   if (hasTokens) return;
   session.paletteNudged = true;
   warnings.push(
-    "First draw with literal colors and no session tokens. If this file has variables/styles, read figma_rules and reuse them (applyVariable). If it has none, propose a small palette to the user (primary/surface/text/muted/border), then figma.setupTokens({colors:{...}}) so all screens share one system. A design.md in the codebase, if present, is the source of truth. (Shown once per session.)",
+    "First draw with literal colors and no session tokens. If this file has variables/styles, read figma_rules and reuse them (applyVariable). If it has none and there is no design.md, read figma_docs(section=\"style\") for a ready default scale/palette/elevation instead of inventing values (inventing is what makes output look generic), then figma.setupTokens/setupTextStyles from it so all screens share one system. A design.md in the codebase, if present, is the source of truth. (Shown once per session.)",
   );
 }
 
@@ -789,25 +1171,15 @@ function flattenNodes(nodes: unknown[]): Record<string, unknown>[] {
   return nodes.filter(isObj).map((n) => flattenNode(n as Record<string, unknown>));
 }
 
-function fmt(args: unknown[]): string {
+function fmt(args: unknown[], ser: (v: unknown) => string): string {
   return args
-    .map((a) => (typeof a === "string" ? a : safeStringify(a)))
+    .map((a) => (typeof a === "string" ? a : ser(a)))
     .join(" ");
 }
 
 function safeStringify(v: unknown): string {
   try {
     return JSON.stringify(v);
-  } catch {
-    return String(v);
-  }
-}
-
-/** Ensure the returned value crosses the vm boundary as plain JSON data. */
-function safeSerialize(v: unknown): unknown {
-  if (v === undefined) return undefined;
-  try {
-    return JSON.parse(JSON.stringify(v));
   } catch {
     return String(v);
   }

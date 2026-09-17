@@ -61,6 +61,44 @@ export function clamp01(n: number): number {
   return n;
 }
 
+/**
+ * WCAG 2.x relative luminance of an sRGB color (channels 0..1).
+ * https://www.w3.org/TR/WCAG21/#dfn-relative-luminance — linearize each channel,
+ * then weight R/G/B by 0.2126 / 0.7152 / 0.0722.
+ */
+export function relativeLuminance(c: RGB): number {
+  const lin = (v: number): number =>
+    v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  return 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+}
+
+/**
+ * WCAG contrast ratio between two colors, 1..21. Order-independent.
+ * https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio — (L_lighter+0.05)/(L_darker+0.05).
+ * This is the REAL readability metric; naive RGB distance is not.
+ */
+export function contrastRatio(a: RGB, b: RGB): number {
+  const la = relativeLuminance(a);
+  const lb = relativeLuminance(b);
+  const lighter = Math.max(la, lb);
+  const darker = Math.min(la, lb);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+/**
+ * Composite a possibly-translucent foreground over an opaque background
+ * (both 0..1), returning the resulting opaque RGB. Lets contrast be judged on
+ * what the eye actually sees when fg alpha < 1.
+ */
+export function compositeOver(fg: RGBA, bg: RGB): RGB {
+  const a = clamp01(fg.a);
+  return {
+    r: fg.r * a + bg.r * (1 - a),
+    g: fg.g * a + bg.g * (1 - a),
+    b: fg.b * a + bg.b * (1 - a),
+  };
+}
+
 /** Is a string a hex color literal? */
 export function isHexColor(s: string): boolean {
   return /^#?([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(s.trim());

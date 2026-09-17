@@ -10,6 +10,8 @@ class FakePlugin {
   onRequest?: (req: BridgeRequest, ws: WebSocket) => void;
   /** Channel the server assigned/confirmed in the "assigned" message. */
   assignedChannel?: string;
+  /** Resume secret from "assigned" — required to reclaim the channel. */
+  resumeToken?: string;
   /** Latest "channels" snapshot pushed by the server. */
   lastChannelsUpdate?: { self: string; channels: Array<{ channel: string }>; sessions: Array<{ id: string }> };
 
@@ -24,7 +26,10 @@ class FakePlugin {
       const msg = JSON.parse(data.toString()) as WireMessage;
       if (msg.type === "request") this.onRequest?.(msg.payload, ws);
       if (msg.type === "ping") ws.send(JSON.stringify({ type: "pong", at: Date.now() }));
-      if (msg.type === "assigned") this.assignedChannel = msg.channel;
+      if (msg.type === "assigned") {
+        this.assignedChannel = msg.channel;
+        this.resumeToken = msg.resumeToken;
+      }
       if (msg.type === "channels") this.lastChannelsUpdate = msg;
     });
     const helloMsg: PluginHello = {
@@ -169,12 +174,33 @@ describe("bridge request/response correlation", () => {
     // A second connection joins the SAME channel (same window reconnecting /
     // the user moving the channel) → replaces p1 within that channel only.
     const p2 = new FakePlugin();
-    await p2.connect(port, { channel: p1.assignedChannel });
+    await p2.connect(port, {
+      channel: p1.assignedChannel,
+      resumeToken: p1.resumeToken,
+    });
     await inflight;
 
     expect(rejected?.code).toBe("NOT_CONNECTED");
     expect(bridge.pluginConnected).toBe(true);
     expect(bridge.channelCount).toBe(1);
+  });
+
+  it("refuses channel theft without resumeToken (assigns a fresh channel)", async () => {
+    const { bridge, port } = await newBridge();
+    const p1 = new FakePlugin();
+    p1.onRequest = (req) => p1.respond(req.id, { ok: true, result: { owner: 1 } });
+    await p1.connect(port, { channel: "keep-me" });
+    expect(p1.assignedChannel).toBe("keep-me");
+    expect(p1.resumeToken).toBeTruthy();
+
+    const thief = new FakePlugin();
+    await thief.connect(port, { channel: "keep-me" }); // no resumeToken
+    expect(thief.assignedChannel).not.toBe("keep-me");
+    expect(bridge.channelCount).toBe(2);
+
+    // Original channel still serves ops.
+    const res = await bridge.dispatch("get_selection", {}, { channel: "keep-me" });
+    expect((res.result as { owner: number }).owner).toBe(1);
   });
 
   it("QUEUE_FULL names the cause when no plugin is connected", async () => {
@@ -433,9 +459,9 @@ describe("multi-channel routing", () => {
     const bOp = bridge.dispatch("get_selection", {}, { channel: "chan-b", timeoutMs: 10_000 });
     await delay(30);
 
-    // A new window takes over chan-a → only chan-a's op fails.
+    // A new window takes over chan-a (with resume token) → only chan-a's op fails.
     const pA2 = new FakePlugin();
-    await pA2.connect(port, { channel: "chan-a" });
+    await pA2.connect(port, { channel: "chan-a", resumeToken: pA.resumeToken });
     await aOp;
     expect(aRejected?.code).toBe("NOT_CONNECTED");
 
@@ -525,6 +551,32 @@ describe("bridge /health + /rpc", () => {
     expect(json.port).toBe(port);
   });
 
+  it("redacts channel/file names on unauthenticated /health", async () => {
+    const { bridge, port } = await newBridge();
+    const token = "secret-token";
+    await bridge.close();
+    bridges.pop();
+    const b = new Bridge();
+    bridges.push(b);
+    const p = await b.listen(41850 + Math.floor(Math.random() * 80), token);
+    const plugin = new FakePlugin();
+    await plugin.connect(p, { channel: "secret-chan", fileName: "Secret File", pageName: "Hidden" });
+
+    const pub = (await (await fetch(`http://127.0.0.1:${p}/health`)).json()) as Record<string, unknown>;
+    expect(pub.pluginConnected).toBe(true);
+    expect(pub.channels).toBeUndefined();
+    expect(pub.plugin).toBeUndefined();
+    expect(pub.channelCount).toBe(1);
+
+    const full = (await (
+      await fetch(`http://127.0.0.1:${p}/health`, {
+        headers: { authorization: `Bearer ${token}` },
+      })
+    ).json()) as { channels: Array<{ channel: string }>; plugin: { fileName: string } };
+    expect(full.channels.map((c) => c.channel)).toContain("secret-chan");
+    expect(full.plugin.fileName).toBe("Secret File");
+  });
+
   it("rejects /rpc without a valid Bearer token (401)", async () => {
     const bridge = new Bridge({ onRpc: async () => ({ ran: true }) });
     bridges.push(bridge);
@@ -548,5 +600,59 @@ describe("bridge /health + /rpc", () => {
     const goodJson = (await good.json()) as { ok: boolean; result: { ran: boolean } };
     expect(goodJson.ok).toBe(true);
     expect(goodJson.result.ran).toBe(true);
+  });
+});
+
+describe("bridge hardening", () => {
+  it("refuses WS upgrades presenting a browser http(s) Origin (CSWSH)", async () => {
+    const { port } = await newBridge();
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { origin: "https://evil.example" });
+        ws.once("open", () => {
+          ws.close();
+          resolve();
+        });
+        ws.once("error", reject);
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("accepts the Figma plugin's opaque origin (Origin: null)", async () => {
+    const { bridge, port } = await newBridge();
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { origin: "null" });
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    });
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        protocolVersion: 1,
+        pluginVersion: "1.0.0",
+        fileKey: null,
+        fileName: "F",
+        pageName: "P",
+        editorType: "figma",
+      } satisfies PluginHello),
+    );
+    await delay(30);
+    expect(bridge.channelCount).toBe(1);
+    ws.close();
+  });
+
+  it("terminates a staged socket that never sends hello", async () => {
+    const bridge = new Bridge({}, { helloTimeoutMs: 60 });
+    bridges.push(bridge);
+    const port = await bridge.listen(41900 + Math.floor(Math.random() * 80), "t");
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    });
+    // Never send hello — the server must reap the staged socket itself.
+    await new Promise<void>((resolve) => ws.once("close", () => resolve()));
+    expect(bridge.channelCount).toBe(0);
   });
 });

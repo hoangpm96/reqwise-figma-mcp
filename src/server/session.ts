@@ -9,6 +9,13 @@
 
 export const DEFAULT_SESSION = "default";
 
+/**
+ * Cap on live sessions. Any caller (or a follower via __register__/__write__)
+ * can mint unlimited session ids; without a bound the map grows forever.
+ * Eviction drops the least-recently-used session — never the default one.
+ */
+const MAX_SESSIONS = 256;
+
 export interface Session {
   id: string;
   /** Persistent, mutable state object exposed as global `state` in the vm. */
@@ -28,6 +35,7 @@ export class SessionRegistry {
     const id = sessionId && sessionId.length > 0 ? sessionId : DEFAULT_SESSION;
     let session = this.sessions.get(id);
     if (!session) {
+      if (this.sessions.size >= MAX_SESSIONS) this.evictIdle();
       session = {
         id,
         state: {},
@@ -39,6 +47,20 @@ export class SessionRegistry {
     }
     session.lastUsedAt = Date.now();
     return session;
+  }
+
+  /** Drop the least-recently-used session (never the default). */
+  private evictIdle(): void {
+    let oldestId: string | undefined;
+    let oldestAt = Infinity;
+    for (const s of this.sessions.values()) {
+      if (s.id === DEFAULT_SESSION) continue;
+      if (s.lastUsedAt < oldestAt) {
+        oldestAt = s.lastUsedAt;
+        oldestId = s.id;
+      }
+    }
+    if (oldestId !== undefined) this.sessions.delete(oldestId);
   }
 
   has(sessionId: string): boolean {

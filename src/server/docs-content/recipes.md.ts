@@ -44,23 +44,46 @@ commit, no rollback); its error is reported at the exact index.
 await figma.create({ type: "RECTANGLE", parentId: screen.id, insertAt: { above: header.id } });
 \`\`\`
 
-## Reuse a component
+## Design system: two files, one direction
+Two SEPARATE files (like package.json vs package-lock.json):
+\`design.md\` = human intent (you read it only when BUILDING the DS);
+\`design-kit.md\` = machine snapshot of what's really in Figma (you read it when
+DRAWING). See the full convention in figma_docs(section="rules").
+
+### A. Build the design system (once), then snapshot it
 \`\`\`js
-const btn = await figma.findOrCreateComponent("Button/Primary", { type: "COMPONENT", /* spec */ });
-await figma.instantiate(btn.id, {
-  parentId: screen.id,
-  props: { "Label#1:2": "Save" }, // exact keys come from generateDesignMd/getComponent
-  overrides: { "Label": { text: "Save" } }, // fallback only
-});
+// If the codebase has a human-written design.md, build FROM it (ask the user
+// first — building edits the Figma file). Otherwise interview the user.
+await figma.setupTokens({ colors: { "color/primary": "#5865f2", /* ... */ },
+                          numbers: { "space/md": 16, "radius/sm": 12, /* ... */ } });
+await figma.setupTextStyles([
+  { name: "display-xl", fontSize: 82, weight: 800, fontFamily: "Space Grotesk" },
+  { name: "body", fontSize: 16, weight: 400, fontFamily: "Inter" },
+]);
+
+// Snapshot → save the markdown as design-kit.md (machine-generated, never
+// hand-edited). Its header carries a <!-- dsfp:HASH --> fingerprint.
+const kit = await figma.generateDesignMd({ depth: 3, includeAnatomy: true, includeScreens: true });
+return kit.markdown; // write to design-kit.md; kit.fingerprint.hash is the dsfp
 \`\`\`
 
-## Generate design.md before building UI
+### B. Draw a screen — trust the cached kit, but check the fingerprint first
 \`\`\`js
-const spec = await figma.generateDesignMd({ depth: 3, includeAnatomy: true, includeScreens: true });
-return spec.markdown; // save as design.md in the target codebase
+// Cheap check: does the live DS still match the cached design-kit.md?
+const live = await figma.designFingerprint();           // { hash, counts }
+// Compare live.hash to the dsfp: in design-kit.md's header (read from the repo).
+// Mismatch → someone changed the DS in Figma without regenerating; regenerate
+// (step A's snapshot) before trusting the file. Match → draw by NAME:
+await figma.create({ type: "FRAME", parentId: page.id, fill: "$color/canvas",
+  tokens: { padding: "space/section" } });
+await figma.create({ type: "TEXT", parentId: page.id, text: "Hi",
+  textStyle: "display-xl", fill: "$color/ink" });
+// Names resolve live, so a stale file fails LOUDLY (name miss + candidates),
+// never binds the wrong token. Recolouring a token does NOT change the hash;
+// adding/removing/renaming one does.
 \`\`\`
-What it captures and when to tune the limits: see \`generateDesignMd\` under
-figma_docs(section="api").
+What generateDesignMd captures and how the fingerprint invalidates: see
+\`generateDesignMd\` / \`designFingerprint\` under figma_docs(section="api").
 
 ## Clone and edit a descendant
 \`\`\`js
@@ -86,14 +109,6 @@ const audit = await figma.layoutAudit(target.id);
 if (audit.summary.issues.length) console.warn(audit.summary.issues);
 \`\`\`
 
-## Format-painter overrides (copy one instance onto many)
-\`\`\`js
-// Style one instance perfectly, then stamp its overrides onto siblings.
-const src = await figma.getInstanceOverrides("12:100"); // inspect first (optional)
-await figma.setInstanceOverrides("12:100", ["12:101", "12:102", "12:103"]);
-\`\`\`
-Source and targets must be instances of the same component.
-
 ## Recursive recolor
 \`\`\`js
 // Rebrand a subtree: swap one blue for another across every fill, incl. strokes.
@@ -116,6 +131,100 @@ await figma.setGradient(card.id, {
 \`type\` ∈ LINEAR | RADIAL | ANGULAR | DIAMOND; needs ≥2 stops. Pass a 2×3
 \`transform\` matrix to rotate/scale the gradient; \`target: "stroke"\` paints the
 stroke instead of the fill.
+
+## Typography ramp + draw by style/token names
+Define the type ramp ONCE as text styles, then every text layer references a
+style name — never raw font sizes. Same for colors: bind tokens at create time.
+\`\`\`js
+// 1. once per file: the ramp (idempotent — re-running updates in place)
+await figma.setupTextStyles([
+  { name: "Title 01", fontSize: 40, weight: 700, lineHeight: "120%" },
+  { name: "Title 02", fontSize: 30, weight: 700, lineHeight: "120%" },
+  { name: "Body",     fontSize: 14, weight: 400, lineHeight: "150%" },
+  { name: "Small",    fontSize: 12, weight: 400 },
+]);
+// 2. drawing: reference by NAME — style + token, no hardcoded values
+const title = await figma.create({
+  type: "TEXT", parentId: card.id, text: "Dashboard",
+  textStyle: "Title 02", fill: "$text/primary",
+});
+const surface = await figma.create({
+  type: "FRAME", parentId: page.id, layoutMode: "VERTICAL",
+  fill: "$surface/card", tokens: { cornerRadius: "radius/md", padding: "space/4" },
+});
+// 3. retrofit an existing text layer
+await figma.setTextStyle(oldTitle.id, "Title 02");
+\`\`\`
+Unknown token/style names throw with candidates BEFORE creating anything —
+a typo cannot silently produce an unstyled node.
+
+## Map the userflow before drawing the screens
+
+Ask the user first — *"map the userflow first, then draw the UI?"* — then derive
+the graph YOURSELF from the spec/PRD: the screens, the happy path, every error
+and edge case. Draw it, read the findings, fill the holes, draw the screens.
+
+\`\`\`js
+// 1. Check the graph before anything reaches the canvas.
+const check = await figma.userflow({ title: "Checkout", options: { dryRun: true },
+  nodes: [
+    { id: "cart",  label: "Cart",        kind: "screen",   screenId: "2.1", slug: "cart" },
+    { id: "pay",   label: "Payment ok?", kind: "decision" },
+    { id: "done",  label: "Order placed", kind: "terminal" },
+    { id: "err",   label: "E-402 · declined", kind: "state", cls: "error" },
+  ],
+  edges: [
+    { from: "cart", to: "pay",  label: "Pay" },
+    { from: "pay",  to: "done", label: "yes" },
+    { from: "pay",  to: "err",  label: "no" },
+    { from: "err",  to: "cart", label: "Try another card", kind: "return" },
+  ],
+});
+check.warnings; // "Decision … has 1 way out", "Dead end …", "no entry point", …
+
+// 2. Draw it once the graph holds up.
+const flow = await figma.userflow({ title: "Checkout", x: 80, y: 200, nodes, edges,
+  options: { linkScreens: true } });
+
+// 3. Draw the screens, naming each artboard after its screenId.
+await figma.create({ type: "FRAME", name: "2.1 · cart", x: 80, y: 200 + flow.stats.h + 120,
+  width: 390, height: 844, fill: "#ffffff" });
+\`\`\`
+
+- \`kind\`: \`screen\` · \`state\` · \`decision\` (needs ≥2 labelled branches) ·
+  \`external\`/\`terminal\` (the only legitimate dead ends).
+- \`kind:"return"\` on an edge = cancel / retry / back: drawn dashed in a side
+  gutter and kept out of the rank maths.
+- Name each artboard so it contains the \`screenId\` as a whole token
+  ("2.1 · cart"), then \`options.linkScreens\` clicks through from flow to design.
+- CJK/Hangul labels need \`options.font\` (Inter draws them blank).
+- Adding screens later? \`create\` warns you when the page's flow does not contain
+  the screen you just drew — ask the user whether to update the flow too.
+- The arrows stay attached to the boxes: while the plugin is open, dragging or
+  resizing a box re-routes every line touching it. Rearranged with the plugin
+  closed? \`await figma.reflowDiagram()\` puts them back.
+- Full reference: figma_docs(section="userflow").
+
+## Prototype: wire click → navigate
+Turn static frames into a clickable prototype. \`setReactions\` REPLACES the
+node's reactions (like setEffects replaces effects); \`[]\` clears them.
+\`\`\`js
+// Wire the Login button to the dashboard screen (Smart Animate).
+await figma.setReactions(loginBtn.id, [{
+  trigger: { type: "ON_CLICK" },
+  action: {
+    type: "NODE",
+    navigation: "NAVIGATE",
+    destinationId: dashboardFrame.id,
+    transition: { type: "SMART_ANIMATE", easing: { type: "EASE_IN_AND_OUT" }, duration: 0.3 },
+  },
+}]);
+// Omit transition for the same smart-animate default; transition: null = instant.
+// Close an overlay/dialog from its Cancel button:
+await figma.setReactions(cancelBtn.id, [{ trigger: { type: "ON_CLICK" }, action: { type: "CLOSE" } }]);
+\`\`\`
+\`destinationId\` must be an existing node (usually a top-level frame) — a bad
+id, trigger, or navigation enum throws INVALID_PARAMS instead of no-op'ing.
 
 ## Making it look good (không chỉ đúng cấu trúc)
 A "correct" tree can still look unfinished. The palette-first rule and the

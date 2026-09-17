@@ -5,9 +5,12 @@ import {
   resolveInsertIndex,
   overflowsParent,
   wrapLineHeight,
+  defaultLineHeight,
+  round,
   normalizePadding,
   resolveUniformCornerRadius,
   usesTransparentContainerDefault,
+  boxesOverlap,
 } from "../../src/plugin/layout-math.js";
 
 describe("resolveGeometry", () => {
@@ -126,10 +129,32 @@ describe("overflowsParent", () => {
   });
 });
 
-describe("wrapLineHeight", () => {
-  it("1.45x", () => {
-    expect(wrapLineHeight(16)).toBe(23.2);
-    expect(wrapLineHeight(20)).toBe(29);
+describe("defaultLineHeight (size-aware)", () => {
+  it("loosens small/body text and tightens as size grows", () => {
+    expect(defaultLineHeight(12)).toBe(round(12 * 1.45)); // small
+    expect(defaultLineHeight(16)).toBe(24); // body 1.5×
+    expect(defaultLineHeight(20)).toBe(27); // subhead 1.35×
+    expect(defaultLineHeight(32)).toBe(40); // title 1.25×
+    expect(defaultLineHeight(48)).toBe(round(48 * 1.15)); // display 1.15×
+    expect(defaultLineHeight(64)).toBe(round(64 * 1.05)); // hero 1.05×
+  });
+  it("ratio is non-increasing from body size up (the anti-'AI tell' property)", () => {
+    // Small text (≤14px) is intentionally a touch tighter than body so it stays
+    // readable — matching Tailwind (14px≈1.43 < 16px=1.5). From body (16px) up,
+    // the ratio only shrinks, which is what keeps large headings from looking loose.
+    const sizes = [16, 18, 20, 24, 32, 48, 64];
+    let prev = Infinity;
+    for (const s of sizes) {
+      const ratio = defaultLineHeight(s) / s;
+      expect(ratio).toBeLessThanOrEqual(prev + 1e-9);
+      prev = ratio;
+    }
+    // Display is far tighter than body — the property that actually matters.
+    expect(defaultLineHeight(48) / 48).toBeLessThan(defaultLineHeight(16) / 16);
+  });
+  it("wrapLineHeight is a back-compat alias of defaultLineHeight", () => {
+    expect(wrapLineHeight(16)).toBe(defaultLineHeight(16));
+    expect(wrapLineHeight(48)).toBe(defaultLineHeight(48));
   });
 });
 
@@ -176,5 +201,52 @@ describe("container surface defaults", () => {
     expect(resolveUniformCornerRadius({ borderRadius: 12 })).toBe(12);
     expect(resolveUniformCornerRadius({ radius: 10 })).toBe(10);
     expect(resolveUniformCornerRadius({})).toBeUndefined();
+  });
+});
+
+describe("boxesOverlap", () => {
+  const home = { x: 0, y: 0, w: 390, h: 844 };
+
+  it("flags a component dropped at (0,0) over an existing screen", () => {
+    // The exact trap: a new COMPONENT parented to the page defaults to (0,0)
+    // and overlaps the Home screen already sitting there.
+    const comp = { x: 0, y: 0, w: 342, h: 68 };
+    expect(boxesOverlap(comp, home)).toBe(true);
+  });
+
+  it("does not flag a component parked in the negative-y DS strip", () => {
+    const comp = { x: 0, y: -900, w: 342, h: 68 };
+    expect(boxesOverlap(comp, home)).toBe(false);
+  });
+
+  it("does not flag boxes that merely touch edges", () => {
+    const a = { x: 0, y: 0, w: 100, h: 100 };
+    const b = { x: 100, y: 0, w: 100, h: 100 };
+    expect(boxesOverlap(a, b)).toBe(false);
+  });
+
+  it("flags partial overlap", () => {
+    const a = { x: 0, y: 0, w: 100, h: 100 };
+    const b = { x: 50, y: 50, w: 100, h: 100 };
+    expect(boxesOverlap(a, b)).toBe(true);
+  });
+});
+
+describe("padding round-trip", () => {
+  it("accepts the {l,r,t,b} shape a read hands back", () => {
+    // serializeNode reports padding as {l,r,t,b}; feeding that straight back
+    // into create/modify used to drop it silently, which is how an ERD's rows
+    // came out with no padding and their text clipped.
+    expect(normalizePadding({ padding: { l: 12, r: 12, t: 4, b: 4 } })).toEqual({
+      left: 12,
+      right: 12,
+      top: 4,
+      bottom: 4,
+    });
+  });
+
+  it("still takes Figma's own spelling, and lets the flat fields win", () => {
+    expect(normalizePadding({ padding: { left: 8, top: 2 } })).toEqual({ left: 8, top: 2 });
+    expect(normalizePadding({ padding: { l: 8 }, paddingLeft: 20 })).toEqual({ left: 20 });
   });
 });

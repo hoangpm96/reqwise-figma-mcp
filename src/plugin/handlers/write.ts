@@ -1,5 +1,5 @@
 /// <reference types="@figma/plugin-typings" />
-import { HandlerContext, requireNode, isParentNode } from "../context.js";
+import { HandlerContext, requireNode, findNode, isParentNode } from "../context.js";
 import { resolveParent, insertInto } from "../insert.js";
 import { toPaints, toEffects } from "../paints.js";
 import { loadNodeFonts, loadFontWithFallback, DEFAULT_FONT } from "../fonts.js";
@@ -12,7 +12,8 @@ import {
   normalizePadding,
   resolveUniformCornerRadius,
 } from "../layout-math.js";
-import { isHexColor } from "../color-util.js";
+import { isHexColor, isRgbObject } from "../color-util.js";
+import { setArrowPolyline, setPolyline, toPoints } from "../vector-path.js";
 
 /**
  * General property setter: fills/strokes/effects, auto-layout, text, geometry.
@@ -36,14 +37,24 @@ export async function modify(ctx: HandlerContext): Promise<unknown> {
   if (props.fills !== undefined && "fills" in node) {
     (node as GeometryMixin).fills = toPaints(props.fills);
   } else if (
-    typeof props.fill === "string" &&
-    isHexColor(props.fill) &&
+    // `fill`/`stroke` are the single-colour aliases create() also takes: a
+    // hex string or the Figma {r,g,b[,a]} object.
+    ((typeof props.fill === "string" && isHexColor(props.fill)) ||
+      isRgbObject(props.fill)) &&
     "fills" in node
   ) {
     (node as GeometryMixin).fills = toPaints(props.fill);
   }
   if (props.strokes !== undefined && "strokes" in node) {
     (node as GeometryMixin).strokes = toPaints(props.strokes);
+  } else if (
+    // The `stroke` alias used to be read only on create — modify() silently
+    // dropped it, so an outline update had to go through `strokes`.
+    ((typeof props.stroke === "string" && isHexColor(props.stroke)) ||
+      isRgbObject(props.stroke)) &&
+    "strokes" in node
+  ) {
+    (node as GeometryMixin).strokes = toPaints(props.stroke);
   }
   if (typeof props.strokeWeight === "number" && "strokeWeight" in node) {
     (node as MinimalStrokesMixin).strokeWeight = props.strokeWeight;
@@ -54,7 +65,22 @@ export async function modify(ctx: HandlerContext): Promise<unknown> {
   if (typeof props.opacity === "number" && "opacity" in node) {
     (node as BlendMixin).opacity = props.opacity;
   }
+  // VECTOR geometry: the same `points` shorthand create takes, so a caller can
+  // adjust a line it already drew (and `endArrow` keeps the head on its end).
+  if (node.type === "VECTOR" && Array.isArray(props.points)) {
+    const pts = toPoints(props.points);
+    if (pts.length < 2) {
+      ctx.warn("points needs at least two [x,y] pairs — the vector was left alone.");
+    } else if (props.endArrow === false) {
+      setPolyline(node as VectorNode, pts, props.closed === true);
+    } else {
+      await setArrowPolyline(node as VectorNode, pts);
+    }
+  }
   applyCornerRadii(node, props);
+  if (typeof props.clipsContent === "boolean" && "clipsContent" in node) {
+    (node as FrameNode).clipsContent = props.clipsContent;
+  }
   if (typeof props.visible === "boolean") node.visible = props.visible;
   if (typeof props.rotation === "number" && "rotation" in node) {
     (node as LayoutMixin).rotation = props.rotation;
@@ -199,33 +225,76 @@ function applyCornerRadii(
 
 export async function deleteNode(ctx: HandlerContext): Promise<unknown> {
   const p = ctx.params;
+  const target = await findNode(p.nodeId ?? p.id);
+  if (target?.type === "PAGE") {
+    throw err(
+      ErrorCode.INVALID_PARAMS,
+      `"${target.name}" is a page — delete() removes layers.`,
+      `Use deletePage("${target.id}") to remove a whole page.`,
+    );
+  }
   const node = await requireNode(p.nodeId ?? p.id);
   const force = p.force === true;
-  if (node.type === "COMPONENT" || node.type === "COMPONENT_SET") {
-    const instances = await (node as ComponentNode).getInstancesAsync?.();
-    const count = instances ? instances.length : 0;
-    if (count > 0 && !force) {
+  const isComponent = node.type === "COMPONENT" || node.type === "COMPONENT_SET";
+  let instances = 0;
+  if (isComponent) {
+    if ((node as ComponentNode).remote) {
+      throw err(
+        ErrorCode.UNSUPPORTED_OPERATION,
+        `Component "${node.name}" comes from a library and is read-only here.`,
+        "Delete it in the file that publishes the library.",
+      );
+    }
+    const found = await (node as ComponentNode).getInstancesAsync?.();
+    instances = found ? found.length : 0;
+    if (instances > 0 && !force) {
       throw err(
         ErrorCode.COMPONENT_IN_USE,
-        `Component "${node.name}" has ${count} instance(s).`,
-        "Deleting it will detach or break those instances. Re-run with force:true to proceed.",
+        `Component "${node.name}" has ${instances} instance(s).`,
+        "The instances stay on the canvas and can \"Restore component\" from the right sidebar. Re-run with force:true to proceed.",
       );
     }
   }
   const id = node.id;
+  const parent = node.parent;
+  // Removing the last variant makes Figma delete the set with it.
+  const lastVariantOf =
+    node.type === "COMPONENT" && parent?.type === "COMPONENT_SET" && parent.children.length === 1
+      ? parent.name
+      : undefined;
   node.remove();
-  // Verify the removal actually took effect instead of reporting a blind
-  // success — node.remove() can be a silent no-op for some nodes (e.g. a
-  // component still referenced), which previously returned {deleted:true}
-  // while the node lived on.
-  if (!node.removed) {
+  if (!isDetached(node)) {
     throw err(
       ErrorCode.INTERNAL,
       `Node "${id}" could not be removed (still present after remove()).`,
-      "It may be a published/locked component or otherwise protected. Delete it in the Figma UI, or detach its instances first.",
+      "It may be locked or otherwise protected. Delete it in the Figma UI.",
     );
   }
-  return { id, deleted: true };
+  if (!isComponent) return { id, deleted: true };
+  return {
+    id,
+    deleted: true,
+    instancesLeft: instances,
+    ...(instances > 0
+      ? { note: `${instances} instance(s) stay on the canvas; each can "Restore component" from the right sidebar.` }
+      : {}),
+    ...(lastVariantOf ? { componentSetDeleted: lastVariantOf } : {}),
+  };
+}
+
+/**
+ * Is a node gone from the document? `removed` alone lies for a main
+ * component: Figma soft-deletes it so its instances can restore it, so the
+ * node object stays alive with `removed === false` — but it no longer has a
+ * parent. Checking only `removed` reported every component delete as failed
+ * while the component had in fact left the canvas.
+ */
+function isDetached(node: SceneNode): boolean {
+  try {
+    return node.removed || node.parent === null;
+  } catch {
+    return true; // a fully destroyed node throws on property access
+  }
 }
 
 export async function move(ctx: HandlerContext): Promise<unknown> {

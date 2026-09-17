@@ -9,6 +9,7 @@
 3. **Session-stateful** — design tokens and variable maps are set up once per session, not re-declared per call.
 4. **Resilient connection** — WebSocket + heartbeat + auto-reconnect + leader/follower for multi-window; `figma_status` returns actionable diagnostics, never just a boolean.
 5. **Compatible** — tool names (`figma_status`, `figma_read`, `figma_write`, `figma_rules`, `figma_docs`) are a superset of `figma-ui-mcp`, so existing orchestration code and prompts that call these tools migrate with minimal changes.
+6. **A drawing that remembers its model** — every diagram frame stores the model it was drawn from, so a diagram can be patched rather than re-authored, and the diagrams in a file can be checked against *each other* — the one thing text-to-image diagramming cannot do, because there every diagram is an island.
 
 ## Topology
 
@@ -31,6 +32,7 @@ MCP clients (N × Claude Code / Codex / Cursor — one server process each)
 
 - **Leader/follower** (from `figma-mcp-go`): first server process binds the port → leader. Later processes (other IDE windows) detect `EADDRINUSE`, verify leader via `/health`, and forward all operations via `POST /rpc`. Auth: leader writes a random token to `$TMPDIR/reqwise-figma-mcp/leader-<port>.json` (`{port, token, pid, startedAt}`); followers read it and send `Authorization: Bearer <token>`. `/rpc` without valid token → 401; on 401 the follower re-reads the discovery file and retries once (leader restarted with a fresh token). Discovery is per-port so several legitimate leaders (custom `FIGMA_MCP_PORT` cohorts) never contend for one file; the legacy global `leader.json` is still written best-effort for old-version followers, deferring to a live incumbent on another port. Health monitor: followers poll `/health` every 3–5 s (jittered); on leader death, attempt takeover (each takeover gets a fresh bounded election-attempt budget). On start, a follower registers its session with the leader (synthetic `__register__` op) so the plugin UI picker lists it immediately.
 - **Validation choke point**: every operation — leader-direct or follower-forwarded — passes through one `validateOperation()` before hitting the bridge (fixes the figma-mcp-go bypass bug).
+- **Local threat model**: the bridge binds `127.0.0.1` only. Same-OS-user processes that can read `$TMPDIR/reqwise-figma-mcp/leader-*.json` (mode `0600`) may call `/rpc` — that is how followers work. Unauthenticated `GET /health` is intentionally minimal (no channel/file names). Reclaiming a live WS channel requires the `resumeToken` from `assigned` (stops name-only hijacks). `loadImage` only fetches public `https` URLs.
 - **WebSocket bridge, multi-channel**: each plugin window connects to `/ws` and joins a **channel** (requested in `hello`, or generated and confirmed with an `assigned` message). Connections live in a per-channel map — multiple Figma windows stay connected simultaneously. A new `hello` on an existing channel replaces only THAT channel's connection (same window reloading / user moving the channel); its pending requests fail fast with a clear error, other channels are untouched. The replaced window does not auto-rejoin its old channel (no tug-of-war) — it reconnects and gets a fresh one. Heartbeat ping/pong every 10 s per connection; plugin reconnects with backoff (0.5 s → 8 s cap) and re-joins its persisted channel.
 
 ### Channel routing (multi-window, multi-agent)
@@ -57,7 +59,8 @@ Each MCP server process generates a private default sessionId (`s-xxxxxxxx`) for
 | `figma_read` | Read operations (enum), token-frugal responses. |
 | `figma_write` | Execute modern-ES JS in a Node `vm` sandbox against the `figma.*` proxy API. |
 | `figma_rules` | One-call design-system rule sheet: styles + variables + components, as markdown. |
-| `figma_docs` | On-demand docs: `rules` \| `layout` \| `api` \| `tokens` \| `icons` \| `recipes`. |
+| `figma_diagram` | Draw an activity diagram (with or without swimlanes), a sequence diagram, a state machine, an ERD, a userflow or a sitemap from a model the agent derived from the spec, and report the holes in that model. Six kinds behind one `type`, because a tool description is paid for in every session. Takes the arrays or the compact `text` form, draws a placed set from `diagrams: [...]`, and redraws a frame in place from `update` + `patch`. Each draw is cross-checked against the other diagrams on its page. |
+| `figma_docs` | On-demand docs: `rules` \| `layout` \| `api` \| `tokens` \| `icons` \| `recipes` \| `style` \| `userflow` \| `activity` \| `erd` \| `sequence` \| `sitemap` \| `state`. |
 
 ### `figma_status` — diagnostics, not a boolean
 
@@ -70,11 +73,12 @@ Returns JSON: `{ pluginConnected, statusSource, statusError?, mode: "leader"|"fo
 
 ### `figma_read` operations
 
-`get_document_info`, `get_selection`, `read_selection` (deep-read the current selection in one call — the selection-first editing entry point), `get_design_context` (depth-limited, `detail: sparse|compact|full|design`; sparse = id/name/type/x/y/w/h only; whole-page reads default to sparse, scoped reads to compact), `get_node`, `get_nodes`, `search_nodes` (capped at 50, `hasMore`/`totalMatched` when truncated), `scan_text_nodes`, `scan_nodes_by_types`, `get_styles`, `get_variables`, `get_components`, `get_component` (rich single-component read: property definitions, variants, text layers, anatomy), `get_library_component` (import by key from a published shared library; rich serialization doubles as a reconstruction spec), `get_design_system_kit` / `generate_design_md` (bounded whole-file design-system extraction with explicit coverage metadata), `export_tokens` (variables → DTCG/CSS/Tailwind), `screenshot` (real MCP image block, `scale` default 0.6 for verify), `export_node` (PNG/SVG/JPG/PDF), `get_fonts` (availability check for a list of families), **`layout_audit`**, `list_channels` (server-answered: connected Figma windows).
 
 At `design` detail, paints/effects/typography are compacted for token economy: a solid fill serializes as `{type:"SOLID", hex:"#101827"}` instead of raw full-precision float channels, Figma-default fields (`visible:true`, `opacity:1`, `blendMode:"NORMAL"`, AUTO line-height, zero letter-spacing, …) are omitted, and empty `strokes`/`effects` arrays are dropped.
 
 **`layout_audit(nodeId)`** is the structured verify tool: walks the subtree and returns per-node `{id, name, declared: {x,y,w,h}, rendered: absoluteBoundingBox, overflowsParent: bool, clippedBy: parentId|null, textTruncated: bool, zIndexWarnings: [...], styleWarnings: [...]}` plus a summary `{issues, styleHints}`. Token-frugal by default: only records that carry a finding are returned (`nodeCount`/`reportedCount` make the filtering visible; `verbose: true` restores the full per-node dump). Agents call this after drawing instead of eyeballing screenshots; screenshots remain for final human review.
+
+
 
 ### `figma_write` — code execution model
 
@@ -86,10 +90,7 @@ At `design` detail, paints/effects/typography are compacted for token economy: a
 
 Reqwise supports two workflows, not just create-from-scratch:
 
-1. **Create-from-scratch**: `create`/`instantiate` with explicit `parentId` + `inset`/`align` → `layout_audit`.
-2. **Edit-in-place**: `readSelection()` (deep-read whatever the user has selected on the canvas) → `modify`/`setGradient`/`setEffects`/`setSelectionColors`/`setInstanceOverrides` on those nodes → `layout_audit` → `setSelection`/`zoomToFit` so the user sees what changed.
 
-Write handlers fall into two kinds. **Property-set** ops (`modify`) map 1:1 to Figma node properties. **Composite write handlers** carry business logic that has no single property equivalent — `setInstanceOverrides` (swap main + copy overrides across existing instances, the "format painter"), `setSelectionColors` (recursive recolor of a subtree), mixed-font-safe `setText` (load every range's font before writing), `setGradient`/`setEffects` (package the tricky gradientTransform matrix / shadow shape). These live as dedicated handlers in `src/plugin/handlers/`, not forced into `modify`.
 
 ### Per-connection write serialization
 
@@ -98,10 +99,26 @@ The Figma Plugin API races and times out when two mutations overlap. The leader'
 ### Proxy API (what the sandbox `figma.*` exposes)
 
 Creation/mutation: `create(spec)`, `modify(nodeId, props)`, `delete(nodeId, {force})`, `clone(nodeId, {parentId, insertAt})` → **returns `{id, childMap}`** mapping original child ids → cloned child ids, `move`, `resize`, `group`, `ungroup`, `flatten`, `batch(ops)`.
-Components: `findComponent(query)` (fuzzy: normalized name, `/`-path aware, alias table), `findOrCreateComponent(name, spec, {dryRun, threshold})` (returns `decision: reuse|create` + score + reason), `instantiate(componentIdOrName, {parentId, props, overrides})` (resolves names via the same fuzzy match; text overrides wired to a component property go through `setProperties` so auto-layout reflows — reported per-override as `appliedVia: property|name`), `createVariants(baseSpec, variantsOrAxes)` (multi-axis matrix `{Size: [...], State: [...]}` → real component set, max 50 combos), `arrangeComponentSet(setId, {gap, padding, columnsBy})` (variant grid), `setComponentDescription(id, text|{description, documentationLinks})`, `getInstanceOverrides(nodeId?)` / `setInstanceOverrides(sourceId, targetIds[])` (copy overrides from one existing instance onto many), `getLibraryComponent(key)` (import from a published shared library; rich serialization doubles as a reconstruction spec), `detachInstance(idOrIds)` / `resetInstanceOverrides(idOrIds)` (per-target try/catch batches), `componentize(nodeId, {name, replaceCopies, scope})` (drawn tree → COMPONENT in place; structural copies become instances).
 Edit-in-place: `readSelection({detail, depth})` (deep-read the current selection), `setSelectionColors(nodeId?, {from?, to, includeStrokes?})` (recursive recolor), `setGradient(nodeId, {type, stops, transform?, target?})`, `setEffects(nodeId, effects[])`.
 Tokens: `setupTokens(tokensJson)` (DTCG-ish `{colors, numbers, strings}` → Figma Variables; idempotent; stores map in `session.state.tokens`), `applyVariable(nodeId, field, tokenName)`, variable CRUD — `createVariable(name, {value|valuesByMode, type?, collection?})` (value → all modes explicitly), `updateVariable`, `renameVariable` (bindings follow the id), `deleteVariable(nameOrId, {replaceWith?, force?})` (replace-gated: scans document usages, rebinds via `replaceWith` before removal), `exportTokens({format: "dtcg"|"css"|"tailwind", mode?, allModes?})` / `importTokens(dtcgTree | {modes})` (two-way tokens; pure serialization in `shared/token-format.ts`).
 Text/assets: `setText(nodeId, content)`, `loadIcon(name, {library, size, color, parentId})`, `searchIcons(query)` → candidates with canonical names (server-side alias map: material→ionicons→lucide synonyms; results cached on disk), `loadImage(url|base64)`.
+Userflow: `userflow(spec)` — the agent supplies the graph (screens, happy path, error and edge cases, or a `mermaid` source); the SERVER lays it out (dagre + one-port-per-edge orthogonal routing, return edges in outer gutters) and the plugin only draws it, the same split as `loadIcon`. Returns the flow-id → node-id map plus `warnings` about the graph's shape (a decision with one way out, a dead end, an unreachable node, a screen with no `screenId`). `create` in turn warns when a page-level screen is drawn while the page has no userflow, or has one that does not contain it — so the agent asks the user instead of quietly letting flow and design drift apart.
+
+The other five kinds share that split and most of that code. `src/shared/diagram/` holds what every diagram needs (text metrics, the (along, cross) axis projection, the palette, arrow emission, graph checks); each kind adds only what is genuinely its own — lane-constrained placement for an activity, columns and rows for a sequence, — and `src/plugin/diagram-reflow.ts` is the one door the live watcher and the `reflow_diagram` op come through, so adding a kind means adding it in one place rather than teaching every caller a new marker.
+
+The orthogonal router in `src/shared/activity/route.ts` is the shared one: it is a pure function of WHERE THE BOXES ARE, with no dagre in it, so re-running it over canvas positions reproduces the layout exactly and needs no stored waypoints. With `lanes: []` it is simply a graph router, which is why the state machine gets self-loops, branch spreading and hand-dragged connection points for almost no new code. What each kind tunes is which compromises it will accept: an activity sends an unroutable arrow around the outside of every lane, because cutting back across three lanes is unreadable; a use case diagram forbids that gutter and threads between two rows instead, because there an association that crosses another line is normal and a detour around the whole picture reads as a mistake.
+
+Every kind is a **proof-reader first**. The checkers report the model, not the drawing — a use case nobody can start, two state transitions racing on one event, a call nobody answers — and the use case checker goes further and drops a link UML has no meaning for, because a diagram that shows one is lying. The bar, learned by shipping a checker that cried wolf: a proof-reader is only worth having if it is silent when the model is right, so every rule carries the exemption that makes its silence deliberate.
+
+**The frame stores the model it was drawn from**, and that one decision is what the rest of the diagram layer is built on. It buys three things no text-to-image diagram tool can offer:
+
+- **Patching instead of re-authoring.** `figma_read get_diagram_spec` hands the model back, and `figma_diagram { update, patch }` changes it in place — the frame keeps its id, so comments, prototype links and wherever the user dragged it all survive. `src/server/patch.ts` is deliberately kind-agnostic: a collection is just an array on the spec, so `messages`, `entities`, `transitions` and `links` all work without that module knowing what any of them mean. A patch may only produce a spec — the rebuild and the checker then run exactly as they would on a fresh call, so there is no path that skips proof-reading. On the ticket-booking set, 73% of the JSON an agent emitted was spec it had already emitted once; that number is what this measures.
+- **Asking whether the diagrams agree with each other.** Every checker above reads ONE model. The mistake none of them can see is two views of the same business that are each perfectly well-formed and say different things — the sequence retries three times and the state machine guards on `n < 5`; the ERD stores `cancelled` and the lifecycle cannot reach it. `src/shared/model/facts.ts` reads the models back off the frames (`get_page_model`) and answers only two questions per kind — who appears, and what values an entity can hold — so a seventh kind costs one `case`, not a redesign; `check.ts` compares them. The findings are advisory and never block a draw, because a page mid-way through being drawn is *supposed* to disagree with itself.
+- **A business rule that cannot drift.** `options.policies` holds the numbers (`{"hold-minutes": 10}`) and labels reference them (`"Giữ ghế @hold-minutes phút"`). Substitution happens on the way to the LAYOUT, never on the way to the model, so the reference survives into what the frame stores: the page can be asked which frames depend on `hold-minutes`, and two diagrams quoting one rule differently is a finding rather than a thing nobody notices.
+
+Since a frame remembers its model, a Figma file is already a machine-readable record of everything anybody has drawn in it — no glossary to maintain by hand, and no dependence on one chat session remembering what another one did last week.
+
+Figma Design has no connector node (`figma.createConnector()` is FigJam-only), so the arrows are plain vectors and something has to move them when a box moves. The orthogonal router therefore lives in `src/shared/userflow/route.ts`, free of dagre, and runs in BOTH places: on the server after dagre has placed the ranks, and in the plugin — from a `PageNode.on("nodechange")` listener — with the box positions read straight off the canvas. The drawn frame stores its own graph in plugin data, which is what makes the second pass possible; `reflow_diagram` is the same pass on demand, for a flow rearranged while the plugin was closed. A reflow re-routes lines only: re-running the layout would undo the drag it is answering.
 Misc: `getNodeById`, `getChildren`, `currentPage()`, `createPage(name)` (preflights plan limit; on failure returns `{fallback: "current-page", reason}` instead of throwing mid-flow), `zoomToFit(nodeId)`, `overlay(spec)`.
 
 ### Safe defaults & validations (the 15 root-cause fixes)
@@ -112,7 +129,6 @@ Implemented in **plugin handlers** (single source of truth), documented in `figm
 2. **Overlay**: `figma.overlay({color, opacity, parentId})` creates a RECTANGLE (never a FRAME) sized to parent, inserted at the right layer. Passing `opacity < 1` on a FRAME create emits a warning ("opacity applies to entire subtree — use overlay()").
 3. **Text wrap**: `create({type:"TEXT", wrap:true, …})` sets `layoutAlign: STRETCH` + `textAutoResize: HEIGHT` + default `lineHeight` (≈1.45 × fontSize) and verifies parent has a fixed width (else warning).
 4. **Relative layout**: `inset: {left, right, top, bottom}` and `align: "center-x"|"center-y"|"center"` on create — plugin computes x/y/w/h from parent, no manual math.
-5. **Component reuse**: `findComponent` fuzzy-matches before any create; `findOrCreateComponent` makes reuse the default path.
 6. **Variants/clone**: `clone` always available (native `node.clone()`), returns child id mapping so callers edit the right descendant without name-based search.
 7. **Batch**: chunked streaming + partial commit, described above.
 8. **Connection**: heartbeat + reconnect + handshake + rich `figma_status`.
@@ -166,3 +182,24 @@ reqwise-figma-mcp/
 - Tests run in CI before any release; `npm test` must exist and pass.
 - No `lsof`/`kill -9` process management — stale leader detection is done via `/health` + token file staleness only.
 - External fetches (icon CDNs) are cached under `$TMPDIR/reqwise-figma-mcp/cache/` and documented — the "localhost-only" claim applies to the Figma bridge, not icon/image loading.
+- **Audit the node builder that cannot use the shared one, first.** Almost everything that
+  creates a node goes through `createTree`, which applies the whole pipeline — geometry,
+  paints, text, tokens, and the keys `create()` knows. A handful of things cannot: SVG has no
+  node type, so an avatar or an icon must go through `figma.createNodeFromSvg`, and variants
+  must go through `figma.combineAsVariants`. Every bypass found so far has carried the same
+  defect, and it is not the obvious one. The node is not missing a value — it is wearing a
+  value **some other code picked**: an 88.91px group inside the 88px clipping frame the SVG
+  import returns, `cornerRadius: 5` on the set `combineAsVariants` creates. Nothing in the
+  generator chose either, nothing in the generator can see either, and `layout_audit` /
+  as false positives right up until somebody checks. Two independent finds (an SVG import's clipping group,\n  a component set's corner radius) and in both cases the bypass list was two entries long, so the
+  check is cheap: grep the handler for `figma.create*` / `figma.combine*`, and look at what
+  came back with defaults nobody asked for.
+- **Both halves go stale independently, and the symptom is identical.** The server process
+  loads `dist/server/index.js` once at startup and the plugin keeps the `plugin/code.js` it
+  was launched with, so after `npm run build` there are four possible states and all four look
+  like "I fixed it and nothing changed". The cycle is: build → restart the MCP server (a
+  reconnect in the client) → re-run the plugin from Figma's Plugins → Development → then draw.
+  A reconnect rotates the bridge channel, so a new channel id is NOT evidence that the plugin
+  restarted. When a new op comes back `UNSUPPORTED_OPERATION`, the hint discriminates: it
+  lists `list_channels` when the SERVER's operation set is old, and omits it when the PLUGIN's
+  handler registry is.

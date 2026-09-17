@@ -96,6 +96,121 @@ describe("executor sandbox", () => {
     }
   });
 
+  it("cannot reach host realm via INJECTED objects' constructor chain", async () => {
+    // Second escape class: `figma`, `state`, `console` are built in the HOST
+    // realm and injected, so their prototype chain used to terminate at the
+    // host Object/Function. `figma.constructor.constructor("return process")()`
+    // (and the same via state/console, or figma.create/console.log) reached the
+    // host Function constructor and evaluated code in the HOST realm with a real
+    // `process` — a native `process.binding('fs')` file-read / `spawn_sync`
+    // exec primitive. The bootstrap in executor.ts reparents + poisons these
+    // constructors; every probe below must NOT observe host data.
+    const sessions = new SessionRegistry();
+    const { runOp } = fakeRunner(() => okRes(null));
+    const hostPlatform = process.platform;
+
+    const probes = [
+      `return String(figma.constructor.constructor("return typeof process!=='undefined'?String(process.platform):'no-host'")());`,
+      `return String(state.constructor.constructor("return typeof process!=='undefined'?String(process.platform):'no-host'")());`,
+      `return String(console.log.constructor("return typeof process!=='undefined'?String(process.platform):'no-host'")());`,
+      `return String(figma.create.constructor("return typeof process!=='undefined'?String(process.platform):'no-host'")());`,
+      `return String(Object.getPrototypeOf(figma).constructor.constructor("return 1")());`,
+      // native-binding pivot that made it RCE-capable — must not yield a binding
+      `try { const b = figma.constructor.constructor("return process.binding('fs')")(); return 'GOT:'+typeof b; } catch(e){ return 'blocked'; }`,
+    ];
+    for (const code of probes) {
+      const res = await executeWrite(code, sessions.get(), { runOp });
+      if (res.ok) {
+        const val = String(res.result ?? "");
+        expect(val, `injected-object escape leaked host: ${code}`).not.toBe(hostPlatform);
+        expect(val, `injected-object escape reached native binding: ${code}`).not.toContain("GOT:object");
+      } else {
+        expect(res.error?.code, code).toBe("SANDBOX_ERROR");
+      }
+    }
+
+    // Restoring a benign prototype must not reopen the host path.
+    const restore = await executeWrite(
+      `try { Object.setPrototypeOf(figma, {}); } catch(e){} return String(figma.constructor.constructor);`,
+      sessions.get(),
+      { runOp },
+    );
+    if (restore.ok) {
+      expect(String(restore.result)).not.toContain("[native code]");
+    }
+  });
+
+  it("cannot reach host realm via values RETURNED or THROWN by figma.*", async () => {
+    // Third escape class — the runtime boundary. Scrubbing the injected roots
+    // left the values that cross when an op RUNS untouched: the resolved
+    // result object, the in-flight Promise itself, and the Error a failing op
+    // throws all used to arrive as host-realm values whose
+    // .constructor.constructor was the HOST Function (full escape to
+    // `process`). The bridge now crosses as JSON strings only, so every probe
+    // must resolve in the context realm and never observe host data.
+    const sessions = new SessionRegistry();
+    const { runOp } = fakeRunner(() => okRes({ id: "1:2" }));
+    const hostPlatform = process.platform;
+    const probes = [
+      // resolved result object
+      `const r = await figma.getNode("1:2"); return String(r.constructor.constructor("return typeof process!=='undefined'&&process.platform?String(process.platform):'no-host'")());`,
+      // the in-flight promise itself, before it resolves
+      `const p = figma.getNode("1:2"); return String(p.constructor.constructor("return typeof process!=='undefined'&&process.platform?String(process.platform):'no-host'")());`,
+      // Error thrown by a banned-global stub (was a host OpError)
+      `try { require("x") } catch (e) { return String(e.constructor.constructor("return typeof process!=='undefined'&&process.platform?String(process.platform):'no-host'")()); }`,
+    ];
+    for (const code of probes) {
+      const res = await executeWrite(code, sessions.get(), { runOp });
+      if (res.ok) {
+        expect(String(res.result), `returned-value escape leaked host: ${code}`).not.toBe(hostPlatform);
+      } else {
+        expect(res.error?.code, code).toBe("SANDBOX_ERROR");
+      }
+    }
+  });
+
+  it("cannot reach host realm via the Error a failing op throws", async () => {
+    const sessions = new SessionRegistry();
+    const runOp = async (): Promise<BridgeResponse> => ({
+      id: "x",
+      ok: false,
+      error: { code: "NODE_NOT_FOUND" as never, message: "nope" },
+    });
+    const res = await executeWrite(
+      `try { await figma.getNode("9:9"); } catch (e) {
+         return String(e.constructor.constructor("return typeof process!=='undefined'&&process.platform?String(process.platform):'no-host'")());
+       }
+       return "no-throw";`,
+      sessions.get(),
+      { runOp },
+    );
+    expect(res.ok).toBe(true);
+    expect(String(res.result)).not.toBe(process.platform);
+  });
+
+  it("state survives across calls and through the context-realm copy", async () => {
+    const sessions = new SessionRegistry();
+    const { runOp } = fakeRunner(() => okRes(null));
+    const s = sessions.get("persist");
+    await executeWrite(`state.tokens = { primary: "#fff" }; state.n = 1;`, s, { runOp });
+    const res = await executeWrite(`state.n += 1; return { n: state.n, t: state.tokens.primary };`, s, { runOp });
+    expect(res.result).toEqual({ n: 2, t: "#fff" });
+  });
+
+  it("still exposes figma ops and console after sandbox hardening", async () => {
+    const sessions = new SessionRegistry();
+    const { runOp, calls } = fakeRunner(() => okRes({ id: "1:1" }));
+    const res = await executeWrite(
+      `await figma.create({ type: "FRAME" }); console.log("ok"); return "done";`,
+      sessions.get(),
+      { runOp },
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toBe("done");
+    expect(res.logs).toContain("ok");
+    expect(calls.map((c) => c.op)).toContain("create");
+  });
+
   it("runs modern ES (optional chaining, nullish, spread, async/await)", async () => {
     const sessions = new SessionRegistry();
     const { runOp } = fakeRunner((op) => okRes({ echoed: op }));
@@ -160,24 +275,7 @@ describe("executor sandbox", () => {
 });
 
 describe("executor edit-in-place proxy → op mapping + arg normalization", () => {
-  it("maps getInstanceOverrides → get_instance_overrides (with and without nodeId)", async () => {
-    const sessions = new SessionRegistry();
-    const { runOp, calls } = fakeRunner(() => okRes({ overrides: [] }));
-    await executeWrite(`await figma.getInstanceOverrides("12:100");`, sessions.get(), { runOp });
-    await executeWrite(`await figma.getInstanceOverrides();`, sessions.get(), { runOp });
-    expect(calls[0]).toEqual({ op: "get_instance_overrides", params: { nodeId: "12:100" } });
-    expect(calls[1]).toEqual({ op: "get_instance_overrides", params: {} });
-  });
 
-  it("maps setInstanceOverrides(sourceId, targetIds) → {sourceId, targetIds}", async () => {
-    const sessions = new SessionRegistry();
-    const { runOp, calls } = fakeRunner(() => okRes({ applied: 2 }));
-    await executeWrite(`await figma.setInstanceOverrides("12:100", ["12:101", "12:102"]);`, sessions.get(), { runOp });
-    expect(calls[0]).toEqual({
-      op: "set_instance_overrides",
-      params: { sourceId: "12:100", targetIds: ["12:101", "12:102"] },
-    });
-  });
 
   it("maps setSelectionColors(nodeId, opts) → {nodeId, ...opts}", async () => {
     const sessions = new SessionRegistry();
@@ -528,7 +626,7 @@ describe("palette nudge (once per session)", () => {
       { runOp },
     );
     expect(first.ok).toBe(true);
-    expect(first.warnings.join(" ")).toContain("propose a small palette");
+    expect(first.warnings.join(" ")).toContain("a ready default scale");
 
     const second = await executeWrite(
       `return await figma.create({ type: "FRAME", fills: "#ffffff" });`,
@@ -536,7 +634,7 @@ describe("palette nudge (once per session)", () => {
       { runOp },
     );
     expect(second.ok).toBe(true);
-    expect(second.warnings.join(" ")).not.toContain("propose a small palette");
+    expect(second.warnings.join(" ")).not.toContain("a ready default scale");
   });
 
   it("does not nudge when the session already has tokens", async () => {
@@ -557,7 +655,7 @@ describe("palette nudge (once per session)", () => {
       { runOp },
     );
     expect(res.ok).toBe(true);
-    expect(res.warnings.join(" ")).not.toContain("propose a small palette");
+    expect(res.warnings.join(" ")).not.toContain("a ready default scale");
   });
 
   it("does not nudge paint-less creates (layout wrappers)", async () => {
@@ -570,94 +668,38 @@ describe("palette nudge (once per session)", () => {
       { runOp },
     );
     expect(res.ok).toBe(true);
-    expect(res.warnings.join(" ")).not.toContain("propose a small palette");
+    expect(res.warnings.join(" ")).not.toContain("a ready default scale");
   });
 });
 
-describe("executor — instantiate arg mapping", () => {
-  it("maps instantiate(idOrName, opts) to {componentId, ...opts}", async () => {
-    const sessions = new SessionRegistry();
-    const { runOp, calls } = fakeRunner(() => okRes({ id: "I1:2;0:1" }));
-    const res = await executeWrite(
-      `return await figma.instantiate("Button/Primary", { parentId: "9:9" });`,
-      sessions.get(),
-      { runOp },
-    );
-    expect(res.ok).toBe(true);
-    expect(calls[0]!.op).toBe("instantiate");
-    expect(calls[0]!.params).toMatchObject({ componentId: "Button/Primary", parentId: "9:9" });
-  });
 
-  it("maps instantiate({component, ...}, opts) by spreading the object", async () => {
-    const sessions = new SessionRegistry();
-    const { runOp, calls } = fakeRunner(() => okRes({ id: "I1:2;0:1" }));
-    const res = await executeWrite(
-      `return await figma.instantiate({ component: "Button" }, { parentId: "9:9" });`,
-      sessions.get(),
-      { runOp },
-    );
-    expect(res.ok).toBe(true);
-    expect(calls[0]!.params).toMatchObject({ component: "Button", parentId: "9:9" });
-    expect(calls[0]!.params["componentId"]).toBeUndefined();
-  });
-});
 
-describe("executor — findOrCreateComponent arg mapping", () => {
-  it("maps (name, spec, opts) to {name, spec, ...opts}", async () => {
-    const sessions = new SessionRegistry();
-    const { runOp, calls } = fakeRunner(() => okRes({ decision: "reuse", id: "1:2" }));
-    const res = await executeWrite(
-      `return await figma.findOrCreateComponent("Button", { type: "FRAME" }, { dryRun: true });`,
-      sessions.get(),
-      { runOp },
-    );
-    expect(res.ok).toBe(true);
-    expect(calls[0]!.params).toMatchObject({
-      name: "Button",
-      spec: { type: "FRAME" },
-      dryRun: true,
-    });
-  });
-});
 
-describe("executor — new component op mappings", () => {
-  it("maps setComponentDescription(nodeId, string) and arrangeComponentSet(nodeId, opts)", async () => {
+
+describe("executor — delete page/style mappings", () => {
+  it("maps deletePage/deleteStyle/deleteUnusedStyles ergonomics", async () => {
     const sessions = new SessionRegistry();
-    const { runOp, calls } = fakeRunner(() => okRes({ id: "5:0" }));
+    const { runOp, calls } = fakeRunner(() => okRes({}));
     const res = await executeWrite(
-      `await figma.setComponentDescription("1:2", "Primary action");
-       await figma.arrangeComponentSet("5:0", { gap: 32 });
+      `await figma.deletePage("Old", { force: true });
+       await figma.deleteStyle("brand/old", { replaceWith: "brand/new" });
+       await figma.deleteUnusedStyles();
+       await figma.deleteUnusedStyles({ confirm: "del-2-abc", types: ["PAINT"] });
        return true;`,
       sessions.get(),
       { runOp },
     );
     expect(res.ok).toBe(true);
-    expect(calls[0]!.op).toBe("set_component_description");
-    expect(calls[0]!.params).toMatchObject({ nodeId: "1:2", description: "Primary action" });
-    expect(calls[1]!.op).toBe("arrange_component_set");
-    expect(calls[1]!.params).toMatchObject({ nodeId: "5:0", gap: 32 });
-  });
-});
-
-describe("executor — library + instance lifecycle mappings", () => {
-  it("maps getLibraryComponent(key) and detachInstance(ids)", async () => {
-    const sessions = new SessionRegistry();
-    const { runOp, calls } = fakeRunner(() => okRes({ ok: true }));
-    const res = await executeWrite(
-      `await figma.getLibraryComponent("abc123");
-       await figma.detachInstance(["10:1", "10:2"]);
-       await figma.resetInstanceOverrides("10:3");
-       return true;`,
-      sessions.get(),
-      { runOp },
-    );
-    expect(res.ok).toBe(true);
-    expect(calls[0]!.op).toBe("get_library_component");
-    expect(calls[0]!.params).toMatchObject({ key: "abc123" });
-    expect(calls[1]!.op).toBe("detach_instance");
-    expect(calls[1]!.params).toMatchObject({ nodeIds: ["10:1", "10:2"] });
-    expect(calls[2]!.op).toBe("reset_instance_overrides");
-    expect(calls[2]!.params).toMatchObject({ nodeId: "10:3" });
+    expect(calls.map((c) => c.op)).toEqual([
+      "delete_page",
+      "delete_style",
+      "delete_unused_styles",
+      "delete_unused_styles",
+    ]);
+    expect(calls[0]!.params).toMatchObject({ page: "Old", force: true });
+    expect(calls[1]!.params).toMatchObject({ style: "brand/old", replaceWith: "brand/new" });
+    expect(calls[2]!.params).toEqual({});
+    expect(calls[3]!.params).toMatchObject({ confirm: "del-2-abc", types: ["PAINT"] });
   });
 });
 
@@ -702,5 +744,31 @@ describe("executor — token export/import mappings", () => {
       tokens: { color: { primary: { $value: "#36e" } } },
       mode: "light",
     });
+  });
+});
+
+describe("placement group", () => {
+  it("tags every node-placing op of ONE figma_write with one group, and the next call with another", async () => {
+    const sessions = new SessionRegistry();
+    const { runOp, calls } = fakeRunner((op) =>
+      op === "batch" ? okRes({ items: [{ ok: true, result: { id: "1:3" } }] }) : okRes({ id: "1:1" }),
+    );
+    await executeWrite(
+      `await figma.create({ type: "FRAME" });
+       await figma.clone("1:1");
+       await figma.batch([{ op: "create", params: { type: "FRAME" } }]);
+       await figma.modify("1:1", { name: "x" });`,
+      sessions.get(),
+      { runOp },
+    );
+    await executeWrite(`await figma.create({ type: "FRAME" });`, sessions.get(), { runOp });
+
+    const create1 = calls[0]!.params.placeGroup;
+    expect(typeof create1).toBe("string");
+    expect(calls[1]!.params.placeGroup).toBe(create1);
+    const batchOps = calls[2]!.params.ops as Array<{ params: Record<string, unknown> }>;
+    expect(batchOps[0]!.params.placeGroup).toBe(create1);
+    expect(calls[3]!.params.placeGroup).toBeUndefined();
+    expect(calls[4]!.params.placeGroup).not.toBe(create1);
   });
 });

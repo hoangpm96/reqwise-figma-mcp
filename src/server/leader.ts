@@ -138,12 +138,16 @@ export class Coordinator {
       });
       try {
         const bound = await bridge.listen(port, token);
+        const info: LeaderInfo = { port: bound, token, pid: process.pid, startedAt: Date.now(), version: VERSION };
+        // Commit role state only AFTER the post-bind steps succeed — a throw
+        // here used to leave role:"leader" bound to a bridge the catch then
+        // closed, parking every later op in the unrouted queue forever.
+        await this.writeLeaderFile(info);
+        this.deps.onBridgeCreated?.(bridge);
         this.bridge = bridge;
         this.role = "leader";
-        this.leaderInfo = { port: bound, token, pid: process.pid, startedAt: Date.now(), version: VERSION };
-        await this.writeLeaderFile(this.leaderInfo);
+        this.leaderInfo = info;
         this.electionAttempts = 0;
-        this.deps.onBridgeCreated?.(bridge);
         return "leader";
       } catch (err) {
         await bridge.close().catch(() => {});
@@ -230,12 +234,24 @@ export class Coordinator {
     const [lo, hi] = this.deps.healthIntervalMs ?? [3000, 5000];
     const tick = async () => {
       if (this.closed || this.role !== "follower" || !this.follower) return;
-      const alive = await Follower.checkHealth(this.follower.info.port).catch(() => false);
+      let alive = await Follower.checkHealth(this.follower.info.port).catch(() => false);
+      if (!alive) {
+        // A single dropped /health request does not prove that the leader is
+        // dead. In particular, deleting its discovery file after one miss
+        // strands a still-listening leader: new MCP processes can see the
+        // healthy port but have no token with which to follow it.
+        await delay(250);
+        alive = await Follower.checkHealth(this.follower.info.port).catch(() => false);
+      }
       if (!alive) {
         // Leader looks dead — attempt takeover by re-electing.
         this.stopHealthMonitor();
         try {
-          await this.removeLeaderFileIfStale(this.follower.info);
+          // Do not remove another process's discovery file here. If the
+          // leader really died, binding its now-free port and publishing our
+          // own token replaces the stale file atomically. If this was merely
+          // a transient health failure, leaving the file alone keeps the live
+          // leader discoverable.
           await this.start();
         } catch {
           // Election lost the race (someone else took over) → resume follow.
@@ -370,8 +386,7 @@ async function writeInfoFileAtomic(path: string, info: LeaderInfo): Promise<void
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => {
-    const t = setTimeout(r, ms);
-    t.unref?.();
+    setTimeout(r, ms);
   });
 }
 

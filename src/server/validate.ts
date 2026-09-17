@@ -30,6 +30,11 @@ const nodeId = z.string().trim().min(1, "nodeId must be a non-empty string");
 
 const params = z.record(z.unknown());
 
+const styleKind = z
+  .string()
+  .transform((s) => s.toUpperCase())
+  .pipe(z.enum(["PAINT", "TEXT", "EFFECT", "GRID"]));
+
 const designEvidenceParams = z
   .object({
     detail: z.enum(["sparse", "compact", "full", "design"]).optional(),
@@ -66,6 +71,8 @@ const needsNodeId: Record<string, true> = {
   export_node: true,
   set_gradient: true,
   set_effects: true,
+  set_reactions: true,
+  set_text_style: true,
 };
 
 /** Per-op refinements layered on top of the base params object. */
@@ -146,76 +153,117 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
     .refine((p) => p.variable || p.name || p.variableId, {
       message: "delete_variable requires variable (name or id).",
     }),
-  componentize: z
+  delete_page: z
     .object({
-      nodeId,
+      page: z.string().trim().min(1).optional(),
+      pageId: z.string().trim().min(1).optional(),
       name: z.string().trim().min(1).optional(),
-      replaceCopies: z.boolean().optional(),
-      scope: z.enum(["page", "document"]).optional(),
+      force: z.boolean().optional(),
+    })
+    .passthrough()
+    .refine((p) => p.page || p.pageId || p.name, {
+      message: "delete_page requires page (name or id).",
+    }),
+  delete_style: z
+    .object({
+      style: z.string().trim().min(1).optional(),
+      name: z.string().trim().min(1).optional(),
+      styleId: z.string().trim().min(1).optional(),
+      type: styleKind.optional(),
+      replaceWith: z.string().trim().min(1).optional(),
+      force: z.boolean().optional(),
+    })
+    .passthrough()
+    .refine((p) => p.style || p.name || p.styleId, {
+      message: "delete_style requires style (name or id).",
+    }),
+  delete_unused_styles: z
+    .object({
+      types: z.union([styleKind, z.array(styleKind).min(1)]).optional(),
+      keep: z.array(z.string().trim().min(1)).optional(),
+      confirm: z.string().trim().min(1).optional(),
     })
     .passthrough(),
-  set_component_description: z
+  // The draw data is produced by the server's own layout pass, so this schema
+  // guards against a hand-rolled call rather than against the layout engine.
+  create_userflow: z
     .object({
-      nodeId,
-      description: z.string().optional(),
-      documentationLinks: z
-        .array(z.object({ uri: z.string().trim().min(1) }).passthrough())
-        .optional(),
-    })
-    .passthrough()
-    .refine((p) => p.description !== undefined || p.documentationLinks !== undefined, {
-      message: "set_component_description requires description and/or documentationLinks.",
-    }),
-  arrange_component_set: z
-    .object({
-      nodeId,
-      gap: z.number().min(0).optional(),
-      padding: z.number().min(0).optional(),
-      columnsBy: z.string().trim().min(1).optional(),
+      name: z.string().trim().min(1),
+      title: z.string(),
+      w: z.number().positive(),
+      h: z.number().positive(),
+      boxes: z.array(z.record(z.unknown())),
+      diamonds: z.array(z.record(z.unknown())),
+      edges: z.array(z.record(z.unknown())),
     })
     .passthrough(),
-  create_variants: z
+  // Everything is optional: with no frameId every diagram on the page is
+  // re-routed, which is what "put the arrows back" usually means.
+  reflow_diagram: z
     .object({
-      baseSpec: z.record(z.unknown()).optional(),
-      name: z.string().trim().min(1).optional(),
-      axes: z
-        .record(
-          z
-            .array(z.union([z.string(), z.number(), z.boolean()]))
-            .min(1, "each axis needs at least one value"),
-        )
-        .optional(),
+      frameId: z.string().trim().min(1).optional(),
+      nodeId: z.string().trim().min(1).optional(),
+      // Arrows moved by hand are left alone unless this says otherwise.
+      force: z.boolean().optional(),
     })
-    .passthrough()
-    .refine(
-      (p) =>
-        p.axes !== undefined ||
-        (p as Record<string, unknown>).variants !== undefined ||
-        (p as Record<string, unknown>).states !== undefined,
-      { message: "create_variants requires axes or variants/states." },
-    ),
-  find_or_create_component: z
+    .passthrough(),
+  // Draw data from the server's own activity layout pass.
+  create_activity: z
     .object({
-      name: z.string().trim().min(1).optional(),
-      query: z.string().trim().min(1).optional(),
-      spec: z.record(z.unknown()).optional(),
-      dryRun: z.boolean().optional(),
-      threshold: z.number().positive().optional(),
+      name: z.string().trim().min(1),
+      title: z.string(),
+      w: z.number().positive(),
+      h: z.number().positive(),
+      lanes: z.array(z.record(z.unknown())),
+      steps: z.array(z.record(z.unknown())),
+      edges: z.array(z.record(z.unknown())),
     })
-    .passthrough()
-    .refine((p) => p.name || p.query, {
-      message: "find_or_create_component requires name or query.",
-    }),
-  instantiate: z
+    .passthrough(),
+  // Draw data from the server's own ERD layout pass.
+  create_erd: z
     .object({
-      componentId: z.string().trim().min(1).optional(),
-      component: z.string().trim().min(1).optional(),
-      query: z.string().trim().min(1).optional(),
+      name: z.string().trim().min(1),
+      title: z.string(),
+      w: z.number().positive(),
+      h: z.number().positive(),
+      entities: z.array(z.record(z.unknown())),
+      edges: z.array(z.record(z.unknown())),
+      markers: z.array(z.record(z.unknown())),
     })
-    .passthrough()
-    .refine((p) => p.componentId || p.component || p.query, {
-      message: "instantiate requires one of: componentId, component, query.",
-    }),
+    .passthrough(),
+  // Draw data from the server's own sequence layout pass.
+  create_sequence: z
+    .object({
+      name: z.string().trim().min(1),
+      title: z.string(),
+      w: z.number().positive(),
+      h: z.number().positive(),
+      participants: z.array(z.record(z.unknown())),
+      messages: z.array(z.record(z.unknown())),
+    })
+    .passthrough(),
+  // Draw data from the server's own state layout pass.
+  create_state: z
+    .object({
+      name: z.string().trim().min(1),
+      title: z.string(),
+      w: z.number().positive(),
+      h: z.number().positive(),
+      states: z.array(z.record(z.unknown())),
+      edges: z.array(z.record(z.unknown())),
+    })
+    .passthrough(),
+  // Draw data from the server's own sitemap tidy-tree pass.
+  create_sitemap: z
+    .object({
+      name: z.string().trim().min(1),
+      title: z.string(),
+      w: z.number().positive(),
+      h: z.number().positive(),
+      pages: z.array(z.record(z.unknown())),
+      edges: z.array(z.record(z.unknown())),
+    })
+    .passthrough(),
   apply_variable: z
     .object({ nodeId, field: z.string().trim().min(1), tokenName: z.string().trim().min(1) })
     .passthrough(),
@@ -231,6 +279,14 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
     ),
   zoom_to_fit: z.object({ nodeId }).passthrough(),
   layout_audit: z.object({ nodeId }).passthrough(),
+  get_diagram_spec: z.object({ nodeId }).passthrough(),
+  get_page_model: z
+    .object({
+      /** "page" (default, free) or "file" — every page, at the cost of loading them. */
+      scope: z.enum(["page", "file"]).optional(),
+      pageId: z.string().trim().min(1).optional(),
+    })
+    .passthrough(),
   export_node: z.object({ nodeId }).passthrough(),
   create: z.object({ type: z.string().trim().min(1).optional() }).passthrough(),
   group: z.object({ nodeIds: z.array(nodeId).min(1) }).passthrough(),
@@ -265,30 +321,8 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
     .passthrough(),
   get_design_system_kit: designEvidenceParams,
   generate_design_md: designEvidenceParams,
+  design_fingerprint: params,
 
-  // ---- Edit-in-place composite ops ----
-  // Read the overrides of an instance. nodeId optional (defaults to selection).
-  get_instance_overrides: z.object({ nodeId: nodeId.optional() }).passthrough(),
-  // Format-painter: copy overrides from one instance to N target instances.
-  set_instance_overrides: z
-    .object({
-      sourceId: z.string().trim().min(1, "sourceId must be a non-empty string"),
-      targetIds: z.array(nodeId).min(1, "targetIds must list at least one target instance"),
-    })
-    .passthrough(),
-  // Detach/reset accept one nodeId or a nodeIds batch.
-  detach_instance: z
-    .object({ nodeId: nodeId.optional(), nodeIds: z.array(nodeId).min(1).optional() })
-    .passthrough()
-    .refine((p) => p.nodeId || p.nodeIds, {
-      message: "detach_instance requires nodeId or nodeIds.",
-    }),
-  reset_instance_overrides: z
-    .object({ nodeId: nodeId.optional(), nodeIds: z.array(nodeId).min(1).optional() })
-    .passthrough()
-    .refine((p) => p.nodeId || p.nodeIds, {
-      message: "reset_instance_overrides requires nodeId or nodeIds.",
-    }),
   // Recursive recolor: swap `from` → `to` across the subtree (fills + strokes).
   set_selection_colors: z
     .object({
@@ -327,6 +361,42 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
           })
           .passthrough(),
       ),
+    })
+    .passthrough(),
+  // Typography ramp → local text styles (upsert by name). Deep validation
+  // (weights, lineHeight shapes, fonts) happens in the plugin.
+  setup_text_styles: z
+    .object({
+      styles: z
+        .array(z.object({ name: z.string().trim().min(1) }).passthrough())
+        .min(1, "setup_text_styles needs at least one style"),
+    })
+    .passthrough(),
+  // Elevation ramp → local effect styles (upsert by name). Deep validation of
+  // each shadow/blur happens in the plugin.
+  setup_effect_styles: z
+    .object({
+      styles: z
+        .array(
+          z
+            .object({
+              name: z.string().trim().min(1),
+              effects: z.array(z.unknown()).min(1),
+            })
+            .passthrough(),
+        )
+        .min(1, "setup_effect_styles needs at least one style"),
+    })
+    .passthrough(),
+  // Apply a local text style to a TEXT node by name or id.
+  set_text_style: z.object({ nodeId }).passthrough(),
+  // Replace a node's prototype reactions. Coarse shape only — trigger/action
+  // enums and destination existence are validated in the plugin
+  // (normalizeReactions), which throws INVALID_PARAMS with a precise hint.
+  set_reactions: z
+    .object({
+      nodeId,
+      reactions: z.array(z.object({}).passthrough()),
     })
     .passthrough(),
   // Deep read of the current selection in one call.
@@ -401,6 +471,509 @@ function hintFor(op: Operation): string {
     return "batch expects { ops: [{ op, params }, ...] }.";
   }
   return "See figma_docs(section=\"api\") for the exact parameter shape.";
+}
+
+/**
+ * The user-facing userflow spec (what an agent writes), validated BEFORE the
+ * layout pass. Kept separate from OP_SCHEMAS because the op itself carries the
+ * laid-out draw data, not this.
+ */
+const flowNode = z
+  .object({
+    // The id becomes part of the drawn layer's name, which is how the created
+    // nodes are matched back to the graph. Whitespace there truncated the key
+    // and returned a `nodes` map that did not match the graph.
+    id: z
+      .string()
+      .trim()
+      .min(1)
+      .regex(/^\S+$/, "node id must not contain whitespace — it is the handle the drawn layer is named with"),
+    label: z.string(),
+    detail: z.string().optional(),
+    kind: z.enum(["screen", "state", "decision", "external", "terminal"]).optional(),
+    cls: z.enum(["happy", "error", "edge", "plain", "decision"]).optional(),
+    screenId: z.string().trim().min(1).optional(),
+    slug: z.string().trim().min(1).optional(),
+  })
+  .passthrough();
+
+/** Where along a box's face an arrow attaches: 0 = one corner, 1 = the other. */
+const portAt = z.number().min(0).max(1).optional();
+/** Which face an arrow attaches to. */
+const portSide = z.enum(["top", "right", "bottom", "left"]).optional();
+
+const flowEdge = z
+  .object({
+    from: z.string().trim().min(1).regex(/^\S+$/, "edge `from` must be a node id (no whitespace)"),
+    to: z.string().trim().min(1).regex(/^\S+$/, "edge `to` must be a node id (no whitespace)"),
+    label: z.string().optional(),
+    kind: z.enum(["forward", "return"]).optional(),
+    fromAt: portAt,
+    toAt: portAt,
+    fromSide: portSide,
+    toSide: portSide,
+  })
+  .passthrough();
+
+export const userflowSpecSchema = z
+  .object({
+    title: z.string().trim().min(1),
+    subtitle: z.string().optional(),
+    /** The compact line form; parsed in src/shared/<kind>/text.ts. */
+    text: z.string().optional(),
+    parentId: z.string().trim().min(1).optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    nodes: z.array(flowNode).optional(),
+    edges: z.array(flowEdge).optional(),
+    mermaid: z.string().optional(),
+    options: z
+      .object({
+        rankdir: z.enum(["TB", "LR"]).optional(),
+        font: z.string().trim().min(1).optional(),
+        colorByTarget: z.boolean().optional(),
+        linkScreens: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
+        checkFirst: z.boolean().optional(),
+        verify: z.boolean().optional(),
+        crossCheck: z.boolean().optional(),
+        policies: z.record(z.union([z.string(), z.number()])).optional(),
+        liveRoute: z.boolean().optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough()
+  .refine((p) => (p.nodes && p.nodes.length > 0) || (p.mermaid && p.mermaid.trim().length > 0), {
+    message:
+      "userflow needs nodes[] (with edges[]) or a mermaid source — the graph comes from YOUR analysis of the spec, not from the tool.",
+  });
+
+/** Parse a userflow spec or throw the standard INVALID_PARAMS OpError. */
+export function validateUserflowSpec(spec: unknown): Record<string, unknown> {
+  const parsed = userflowSpecSchema.safeParse(spec ?? {});
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const path = first?.path.join(".") || "(root)";
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Invalid userflow spec: ${first?.message ?? "validation failed"} at ${path}.`,
+      'Shape: { title, nodes:[{id,label,kind,cls,screenId}], edges:[{from,to,label,kind}] } or { title, mermaid }. See figma_docs(section="userflow").',
+    );
+  }
+  return parsed.data as Record<string, unknown>;
+}
+
+// ---- the user-facing activity spec (what an agent writes) ----
+
+const laneSpec = z
+  .object({
+    id: z.string().trim().min(1),
+    label: z.string().trim().min(1),
+    detail: z.string().optional(),
+  })
+  .passthrough();
+
+const activityNode = z
+  .object({
+    id: z.string().trim().min(1),
+    label: z.string(),
+    detail: z.string().optional(),
+    // Required as soon as the diagram has lanes — an unowned step is the
+    // drawing this tool exists to prevent. Omitted on EVERY step, it is a
+    // plain activity diagram with no swimlanes, which is a real thing to want.
+    lane: z.string().trim().min(1).optional(),
+    kind: z
+      .enum(["action", "decision", "start", "end", "fork", "join", "event", "external"])
+      .optional(),
+    cls: z.enum(["happy", "error", "edge", "plain", "decision"]).optional(),
+  })
+  .passthrough();
+
+const activityEdge = z
+  .object({
+    from: z.string().trim().min(1),
+    to: z.string().trim().min(1),
+    label: z.string().optional(),
+    kind: z.enum(["forward", "return"]).optional(),
+    fromAt: portAt,
+    toAt: portAt,
+    fromSide: portSide,
+    toSide: portSide,
+  })
+  .passthrough();
+
+export const activitySpecSchema = z
+  .object({
+    title: z.string().trim().min(1),
+    subtitle: z.string().optional(),
+    /** The compact line form; parsed in src/shared/<kind>/text.ts. */
+    text: z.string().optional(),
+    parentId: z.string().trim().min(1).optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    lanes: z.array(laneSpec).optional().optional(),
+    nodes: z.array(activityNode).optional(),
+    edges: z.array(activityEdge).optional().optional(),
+    options: z
+      .object({
+        rankdir: z.enum(["TB", "LR"]).optional(),
+        font: z.string().trim().min(1).optional(),
+        colorByTarget: z.boolean().optional(),
+        liveRoute: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
+        checkFirst: z.boolean().optional(),
+        verify: z.boolean().optional(),
+        crossCheck: z.boolean().optional(),
+        policies: z.record(z.union([z.string(), z.number()])).optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough()
+  .refine((sp) => typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.nodes) && sp.nodes.length > 0, {
+    message: "Pass either `text` (the compact line form, e.g. `sys: pay ? 'Paid?'`) or lanes / nodes / edges. `text` is roughly a third of the tokens; figma_docs({ section, level: 'cheat' }) has the grammar.",
+  });
+
+/** Parse an activity spec or throw the standard INVALID_PARAMS OpError. */
+export function validateActivitySpec(spec: unknown): Record<string, unknown> {
+  const parsed = activitySpecSchema.safeParse(spec ?? {});
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const path = first?.path.join(".") || "(root)";
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Invalid activity spec: ${first?.message ?? "validation failed"} at ${path}.`,
+      'Shape: { title, lanes:[{id,label}], nodes:[{id,label,lane,kind,cls}], edges:[{from,to,label,kind}] }. With lanes[], every node needs its `lane`; drop both for a plain activity diagram with no swimlanes. See figma_docs(section="activity").',
+    );
+  }
+  return parsed.data as Record<string, unknown>;
+}
+
+// ---- the user-facing state-machine spec ----
+
+const stateNode = z
+  .object({
+    id: z.string().trim().min(1),
+    label: z.string().optional(),
+    kind: z.enum(["state", "initial", "final", "choice", "fork", "join"]).optional(),
+    entry: z.string().optional(),
+    do: z.string().optional(),
+    exit: z.string().optional(),
+    detail: z.string().optional(),
+    cls: z.enum(["happy", "error", "edge", "plain", "decision"]).optional(),
+  })
+  .passthrough();
+
+const transition = z
+  .object({
+    from: z.string().trim().min(1),
+    to: z.string().trim().min(1),
+    event: z.string().optional(),
+    guard: z.string().optional(),
+    action: z.string().optional(),
+    kind: z.enum(["forward", "return"]).optional(),
+    cls: z.enum(["happy", "error", "edge", "plain", "decision"]).optional(),
+    fromAt: z.number().optional(),
+    toAt: z.number().optional(),
+    fromSide: portSide,
+    toSide: portSide,
+  })
+  .passthrough();
+
+export const stateSpecSchema = z
+  .object({
+    title: z.string().trim().min(1),
+    subtitle: z.string().optional(),
+    /** The compact line form; parsed in src/shared/<kind>/text.ts. */
+    text: z.string().optional(),
+    parentId: z.string().trim().min(1).optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    states: z.array(stateNode).optional(),
+    transitions: z.array(transition).optional().optional(),
+    options: z
+      .object({
+        rankdir: z.enum(["TB", "LR"]).optional(),
+        font: z.string().trim().min(1).optional(),
+        colorByTarget: z.boolean().optional(),
+        liveRoute: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
+        checkFirst: z.boolean().optional(),
+        verify: z.boolean().optional(),
+        crossCheck: z.boolean().optional(),
+        policies: z.record(z.union([z.string(), z.number()])).optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough()
+  .refine((sp) => typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.states) && sp.states.length > 0, {
+    message: "Pass either `text` (the compact line form, e.g. `held -> paying: Confirm [guard] / action`) or states / transitions. `text` is roughly a third of the tokens; figma_docs({ section, level: 'cheat' }) has the grammar.",
+  });
+
+/** Parse a state spec or throw the standard INVALID_PARAMS OpError. */
+export function validateStateSpec(spec: unknown): Record<string, unknown> {
+  const parsed = stateSpecSchema.safeParse(spec ?? {});
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const path = first?.path.join(".") || "(root)";
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Invalid state spec: ${first?.message ?? "validation failed"} at ${path}.`,
+      'Shape: { title, states:[{id,label,kind,entry,do,exit}], transitions:[{from,to,event,guard,action}] }. One state must be kind:"initial". See figma_docs(section="state").',
+    );
+  }
+  return parsed.data as Record<string, unknown>;
+}
+
+// ---- the user-facing ERD spec ----
+
+const cardinality = z.enum(["one", "many", "zero-one", "zero-many", "one-many"]).optional();
+
+const erdAttribute = z
+  .object({
+    name: z.string().trim().min(1),
+    type: z.string().optional(),
+    key: z.enum(["pk", "fk", "pfk"]).optional(),
+    required: z.boolean().optional(),
+  })
+  .passthrough();
+
+const erdEntity = z
+  .object({
+    id: z.string().trim().min(1),
+    name: z.string().trim().min(1),
+    detail: z.string().optional(),
+    attributes: z.array(erdAttribute),
+    cls: z.enum(["happy", "error", "edge", "plain", "decision"]).optional(),
+    external: z.boolean().optional(),
+  })
+  .passthrough();
+
+const erdRelation = z
+  .object({
+    from: z.string().trim().min(1),
+    to: z.string().trim().min(1),
+    fromCard: cardinality,
+    toCard: cardinality,
+    label: z.string().optional(),
+    fromField: z.string().optional(),
+    toField: z.string().optional(),
+    identifying: z.boolean().optional(),
+    fromSide: portSide,
+    toSide: portSide,
+  })
+  .passthrough();
+
+export const erdSpecSchema = z
+  .object({
+    title: z.string().trim().min(1),
+    subtitle: z.string().optional(),
+    /** The compact line form; parsed in src/shared/<kind>/text.ts. */
+    text: z.string().optional(),
+    parentId: z.string().trim().min(1).optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    entities: z.array(erdEntity).optional(),
+    relations: z.array(erdRelation).optional().optional(),
+    options: z
+      .object({
+        rankdir: z.enum(["TB", "LR"]).optional(),
+        font: z.string().trim().min(1).optional(),
+        liveRoute: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
+        checkFirst: z.boolean().optional(),
+        verify: z.boolean().optional(),
+        crossCheck: z.boolean().optional(),
+        policies: z.record(z.union([z.string(), z.number()])).optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough()
+  .refine((sp) => typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.entities) && sp.entities.length > 0, {
+    message: "Pass either `text` (the compact line form, e.g. `users.id 1-* bookings.user_id 'books'`) or entities / relations. `text` is roughly a third of the tokens; figma_docs({ section, level: 'cheat' }) has the grammar.",
+  });
+
+/** Parse an ERD spec or throw the standard INVALID_PARAMS OpError. */
+export function validateErdSpec(spec: unknown): Record<string, unknown> {
+  const parsed = erdSpecSchema.safeParse(spec ?? {});
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const path = first?.path.join(".") || "(root)";
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Invalid ERD spec: ${first?.message ?? "validation failed"} at ${path}.`,
+      'Shape: { title, entities:[{id,name,attributes:[{name,type,key}]}], relations:[{from,to,fromField,toField,toCard}] }. See figma_docs(section="erd").',
+    );
+  }
+  return parsed.data as Record<string, unknown>;
+}
+
+// ---- the user-facing sequence spec ----
+
+const seqParticipant = z
+  .object({
+    id: z.string().trim().min(1),
+    name: z.string().trim().min(1),
+    detail: z.string().optional(),
+    kind: z.enum(["actor", "system", "external", "queue", "db"]).optional(),
+    cls: z.enum(["happy", "error", "edge", "plain", "decision"]).optional(),
+  })
+  .passthrough();
+
+const seqMessage = z
+  .object({
+    id: z.string().trim().min(1),
+    from: z.string().trim().min(1),
+    to: z.string().trim().min(1),
+    label: z.string(),
+    kind: z.enum(["sync", "async", "return"]).optional(),
+    note: z.string().optional(),
+    cls: z.enum(["happy", "error", "edge", "plain", "decision"]).optional(),
+  })
+  .passthrough();
+
+const seqFragment = z
+  .object({
+    kind: z.enum(["alt", "opt", "loop", "par", "break"]),
+    label: z.string(),
+    messages: z.array(z.string().trim().min(1)).min(1),
+    else: z
+      .object({ label: z.string().optional(), messages: z.array(z.string().trim().min(1)).min(1) })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+
+export const sequenceSpecSchema = z
+  .object({
+    title: z.string().trim().min(1),
+    subtitle: z.string().optional(),
+    /** The compact line form; parsed in src/shared/<kind>/text.ts. */
+    text: z.string().optional(),
+    parentId: z.string().trim().min(1).optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    participants: z.array(seqParticipant).optional(),
+    messages: z.array(seqMessage).optional(),
+    fragments: z.array(seqFragment).optional().optional(),
+    options: z
+      .object({
+        font: z.string().trim().min(1).optional(),
+        liveRoute: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
+        checkFirst: z.boolean().optional(),
+        verify: z.boolean().optional(),
+        crossCheck: z.boolean().optional(),
+        policies: z.record(z.union([z.string(), z.number()])).optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough()
+  .refine((sp) => typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.messages) && sp.messages.length > 0, {
+    message: "Pass either `text` (the compact line form, e.g. `u ->> api: POST /pay`) or participants / messages / fragments. `text` is roughly a third of the tokens; figma_docs({ section, level: 'cheat' }) has the grammar.",
+  });
+
+/** Parse a sequence spec or throw the standard INVALID_PARAMS OpError. */
+export function validateSequenceSpec(spec: unknown): Record<string, unknown> {
+  const parsed = sequenceSpecSchema.safeParse(spec ?? {});
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const path = first?.path.join(".") || "(root)";
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Invalid sequence spec: ${first?.message ?? "validation failed"} at ${path}.`,
+      'Shape: { title, participants:[{id,name,kind}], messages:[{id,from,to,label,kind}], fragments:[{kind,label,messages}] }. Messages are drawn in the order given — that IS the time order. See figma_docs(section="sequence").',
+    );
+  }
+  return parsed.data as Record<string, unknown>;
+}
+
+// ---- the user-facing sitemap spec ----
+
+const sitemapPage = z
+  .object({
+    // The id becomes part of the drawn layer's name, which is how the created
+    // boxes are matched back to the tree and how a reflow finds them again.
+    id: z
+      .string()
+      .trim()
+      .min(1)
+      .regex(/^\S+$/, "page id must not contain whitespace — it is the handle the drawn layer is named with"),
+    label: z.string().optional(),
+    // The page this one LIVES UNDER. Not the page you came from: a sitemap
+    // edge is containment, and there is deliberately no edge array to write a
+    // navigation step into.
+    parent: z.string().trim().min(1).optional(),
+    kind: z.enum(["page", "section", "modal", "external"]).optional(),
+    detail: z.string().optional(),
+    // A page is usually several artboards — itself plus its states. A bare
+    // string is one artboard and stays valid; see PageSpec for why the list.
+    screenId: z
+      .union([z.string().trim().min(1), z.array(z.string().trim().min(1)).min(1)])
+      .optional(),
+    cls: z.enum(["happy", "error", "edge", "plain", "decision"]).optional(),
+  })
+  .passthrough();
+
+export const sitemapSpecSchema = z
+  .object({
+    title: z.string().trim().min(1),
+    subtitle: z.string().optional(),
+    /** The compact line form; parsed in src/shared/sitemap/text.ts. */
+    text: z.string().optional(),
+    parentId: z.string().trim().min(1).optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    pages: z.array(sitemapPage).optional(),
+    options: z
+      .object({
+        rankdir: z.enum(["TB", "LR"]).optional(),
+        // `options.layout` is ONE field in the tool schema, shared with other
+        // kinds whose values mean nothing here. The JSON enum is the union of
+        // every kind's values and this is the only thing that knows which ones
+        // are legal for a sitemap — so another kind's shape passed to a
+        // sitemap is refused here rather than silently drawing a tree.
+        layout: z.enum(["tree", "dagre"]).optional(),
+        font: z.string().trim().min(1).optional(),
+        colorByTarget: z.boolean().optional(),
+        liveRoute: z.boolean().optional(),
+        maxDepth: z.number().int().min(1).max(12).optional(),
+        dryRun: z.boolean().optional(),
+        checkFirst: z.boolean().optional(),
+        verify: z.boolean().optional(),
+        crossCheck: z.boolean().optional(),
+        policies: z.record(z.union([z.string(), z.number()])).optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough()
+  .refine(
+    (sp) =>
+      typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.pages) && sp.pages.length > 0,
+    {
+      message:
+        "Pass either `text` (the compact line form — one line per page, INDENTED under the page that contains it) or `pages`. `text` is roughly a third of the tokens; figma_docs({ section: \"sitemap\", level: \"cheat\" }) has the grammar.",
+    },
+  );
+
+/** Parse a sitemap spec or throw the standard INVALID_PARAMS OpError. */
+export function validateSitemapSpec(spec: unknown): Record<string, unknown> {
+  const parsed = sitemapSpecSchema.safeParse(spec ?? {});
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const path = first?.path.join(".") || "(root)";
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Invalid sitemap spec: ${first?.message ?? "validation failed"} at ${path}.`,
+      'Shape: { title, pages:[{id, label, parent, kind, screenId}] }. `parent` is the page this one LIVES UNDER — a sitemap edge is containment, not navigation, and there is no edges array. See figma_docs(section="sitemap").',
+    );
+  }
+  return parsed.data as Record<string, unknown>;
 }
 
 export function isReadOp(op: string): boolean {

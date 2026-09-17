@@ -1,7 +1,7 @@
 /**
  * Pure parallel tree-walk to build a childMap from an original subtree to a
  * cloned subtree. NO figma globals — operates on a minimal tree shape so it is
- * unit-testable and reused by clone / create_variants.
+ * unit-testable and reused wherever a subtree is copied.
  */
 
 export interface MiniNode {

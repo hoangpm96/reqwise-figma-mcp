@@ -11,10 +11,19 @@ import {
 import { makeContext } from "./context.js";
 import { toBridgeError, err } from "./errors.js";
 import { HANDLERS, assertRegistryComplete, Handler } from "./handlers/registry.js";
+import { installDiagramLive } from "./diagram-live.js";
 
 declare const __VERSION__: string;
+declare const __BUILD__: string;
 const PLUGIN_VERSION =
   typeof __VERSION__ === "string" ? __VERSION__ : "0.0.0-dev";
+/**
+ * When THIS bundle was built. Figma keeps the code a plugin was launched
+ * with, so a rebuild is invisible here until somebody re-runs the plugin —
+ * and that is indistinguishable, from the outside, from a fix that did not
+ * work. The stamp travels in the handshake so figma_status can say which.
+ */
+const PLUGIN_BUILD = typeof __BUILD__ === "string" ? __BUILD__ : "dev";
 
 /**
  * Messages exchanged with ui.html (postMessage). The UI relays WS traffic to
@@ -24,23 +33,51 @@ type UiToMain =
   | { kind: "handshake" }
   | { kind: "request"; payload: BridgeRequest }
   | { kind: "hello-request" }
-  | { kind: "save-channel"; channel: string | null };
+  | { kind: "save-channel"; channel: string | null; resumeToken?: string | null }
+  // The panel is resizable: only the main thread may call figma.ui.resize(),
+  // so the iframe measures the drag and sends the size here.
+  | { kind: "resize"; width: number; height: number }
+  // The panel driving the plugin directly, with no server in the loop: the
+  // demo list and its Play button have to work when no agent is running.
+  | { kind: "local"; id: string; op: string; params?: Record<string, unknown> };
 
 type MainToUi =
   | { kind: "handshake"; pluginVersion: string; protocolVersion: number }
   | { kind: "hello"; hello: HelloData }
   | { kind: "response"; payload: BridgeResponse; op: Operation }
-  | { kind: "progress"; payload: BridgeResponse; op: Operation };
+  | { kind: "progress"; payload: BridgeResponse; op: Operation }
+  | {
+      kind: "local";
+      id: string;
+      ok: boolean;
+      result?: unknown;
+      error?: { code: string; message: string; hint?: string };
+      warnings?: string[];
+    };
+
+/**
+ * The ops the PANEL may run on its own. Deliberately tiny: everything here is
+ * about replaying a demo that already exists, which is the one job that must
+ * not depend on an agent being connected. Authoring still goes through the
+ * bridge, where it is validated.
+ */
+const LOCAL_OPS: Record<string, true> = {
+  set_current_page: true,
+};
 
 interface HelloData {
   protocolVersion: number;
   pluginVersion: string;
+  /** When this bundle was built — see PLUGIN_BUILD. */
+  pluginBuild: string;
   fileKey: string | null;
   fileName: string;
   pageName: string;
   editorType: string;
   /** Channel persisted for this file (clientStorage); null on first run. */
   channel: string | null;
+  /** Resume secret for reclaiming the channel after reload. */
+  resumeToken: string | null;
 }
 
 function post(msg: MainToUi): void {
@@ -56,16 +93,19 @@ function channelStorageKey(): string {
 
 /** Loaded once at startup; kept in sync by the save-channel message. */
 let storedChannel: string | null = null;
+let storedResumeToken: string | null = null;
 
 function helloData(): HelloData {
   return {
     protocolVersion: PROTOCOL_VERSION,
     pluginVersion: PLUGIN_VERSION,
+    pluginBuild: PLUGIN_BUILD,
     fileKey: (figma as unknown as { fileKey?: string }).fileKey ?? null,
     fileName: figma.root.name,
     pageName: figma.currentPage.name,
     editorType: figma.editorType,
     channel: storedChannel,
+    resumeToken: storedResumeToken,
   };
 }
 
@@ -151,17 +191,24 @@ async function runBatch(
   let failCount = 0;
 
   for (let i = 0; i < items.length; i++) {
-    const item = items[i]!;
-    const localWarnings: string[] = [];
-    const subCtx = makeContext(item.params ?? {}, progress);
-    // capture warnings from the sub-context
-    const origWarn = subCtx.warn;
-    subCtx.warn = (m: string) => {
-      origWarn(m);
-      if (!localWarnings.includes(m)) localWarnings.push(m);
-    };
+    const item = items[i];
 
     try {
+      // Everything that touches `item` stays INSIDE the per-item try: a
+      // malformed entry (null, a bare string) must fail this index and no
+      // more — thrown outside, it would sink the batch and every result
+      // already collected, and partial commit is the point of the op.
+      if (!item || typeof item !== "object") {
+        throw err(
+          ErrorCode.INVALID_PARAMS,
+          `Batch item ${i} is not an { op, params } object.`,
+        );
+      }
+      const subCtx = makeContext(
+        item.params && typeof item.params === "object" ? item.params : {},
+        progress,
+      );
+
       if (!isOperation(item.op)) {
         throw err(
           ErrorCode.UNSUPPORTED_OPERATION,
@@ -192,7 +239,44 @@ async function runBatch(
 }
 
 // ---- wire-up ----
-figma.showUI(__html__, { visible: true, width: 320, height: 560 });
+// The panel grew a Demo section; 560 made the lists fight for the same
+// pixels. The wrap scrolls either way, but a panel you have to scroll to see
+// the Play button is a panel nobody presses.
+const PANEL_DEFAULT = { width: 320, height: 660 };
+/** Small enough for a 13" laptop with the toolbar open; the wrap scrolls. */
+const PANEL_MIN = { width: 280, height: 260 };
+const PANEL_MAX = { width: 1600, height: 1600 };
+const PANEL_SIZE_KEY = "reqwise:panel-size";
+let panelSizeSave: ReturnType<typeof setTimeout> | null = null;
+
+function clampPanel(width: number, height: number): { width: number; height: number } {
+  const w = Math.round(Number(width));
+  const h = Math.round(Number(height));
+  return {
+    width: Number.isFinite(w) ? Math.min(PANEL_MAX.width, Math.max(PANEL_MIN.width, w)) : PANEL_DEFAULT.width,
+    height: Number.isFinite(h) ? Math.min(PANEL_MAX.height, Math.max(PANEL_MIN.height, h)) : PANEL_DEFAULT.height,
+  };
+}
+
+figma.showUI(__html__, { visible: true, ...PANEL_DEFAULT });
+
+// Reopen at the size the user dragged it to last time. showUI cannot wait for
+// clientStorage (it is async), so the default paints first and the stored size
+// is applied a tick later.
+figma.clientStorage
+  .getAsync(PANEL_SIZE_KEY)
+  .then((v) => {
+    if (!v || typeof v !== "object") return;
+    const { width, height } = v as { width?: number; height?: number };
+    if (typeof width !== "number" || typeof height !== "number") return;
+    const size = clampPanel(width, height);
+    if (size.width !== PANEL_DEFAULT.width || size.height !== PANEL_DEFAULT.height) {
+      figma.ui.resize(size.width, size.height);
+    }
+  })
+  .catch(() => {
+    /* first run / storage unavailable — the default size stands */
+  });
 
 const missing = assertRegistryComplete();
 if (missing.length > 0) {
@@ -205,7 +289,18 @@ if (missing.length > 0) {
 const channelLoaded: Promise<void> = figma.clientStorage
   .getAsync(channelStorageKey())
   .then((v) => {
-    if (typeof v === "string" && v.length > 0) storedChannel = v;
+    // Legacy: plain channel string. Current: { channel, resumeToken }.
+    if (typeof v === "string" && v.length > 0) {
+      storedChannel = v;
+      return;
+    }
+    if (v && typeof v === "object") {
+      const o = v as { channel?: unknown; resumeToken?: unknown };
+      if (typeof o.channel === "string" && o.channel.length > 0) storedChannel = o.channel;
+      if (typeof o.resumeToken === "string" && o.resumeToken.length > 0) {
+        storedResumeToken = o.resumeToken;
+      }
+    }
   })
   .catch(() => {
     /* first run / storage unavailable — server will assign a channel */
@@ -230,10 +325,18 @@ figma.ui.onmessage = async (msg: UiToMain) => {
       break;
     case "save-channel": {
       storedChannel = msg.channel;
+      storedResumeToken =
+        typeof msg.resumeToken === "string" && msg.resumeToken.length > 0
+          ? msg.resumeToken
+          : null;
       try {
         if (msg.channel) {
-          await figma.clientStorage.setAsync(channelStorageKey(), msg.channel);
+          await figma.clientStorage.setAsync(channelStorageKey(), {
+            channel: msg.channel,
+            ...(storedResumeToken ? { resumeToken: storedResumeToken } : {}),
+          });
         } else {
+          storedResumeToken = null;
           await figma.clientStorage.deleteAsync(channelStorageKey());
         }
       } catch {
@@ -241,9 +344,60 @@ figma.ui.onmessage = async (msg: UiToMain) => {
       }
       break;
     }
+    case "resize": {
+      const size = clampPanel(msg.width, msg.height);
+      figma.ui.resize(size.width, size.height);
+      // A drag posts one size per animation frame; storing each of them would
+      // be a clientStorage write per frame. Settle first, then remember.
+      if (panelSizeSave !== null) clearTimeout(panelSizeSave);
+      panelSizeSave = setTimeout(() => {
+        panelSizeSave = null;
+        figma.clientStorage.setAsync(PANEL_SIZE_KEY, size).catch(() => {
+          /* non-fatal: the size just won't survive a restart */
+        });
+      }, 250);
+      break;
+    }
     case "request": {
       const res = await dispatch(msg.payload);
       post({ kind: "response", payload: res, op: msg.payload.op });
+      break;
+    }
+    case "local": {
+      // Panel-initiated, never forwarded to the server.
+      if (!LOCAL_OPS[msg.op] || !isOperation(msg.op)) {
+        post({
+          kind: "local",
+          id: msg.id,
+          ok: false,
+          error: {
+            code: ErrorCode.UNSUPPORTED_OPERATION,
+            message: `"${String(msg.op)}" cannot be run from the plugin panel.`,
+            hint: `Panel ops: ${Object.keys(LOCAL_OPS).join(", ")}.`,
+          },
+        });
+        break;
+      }
+      const ctx = makeContext(msg.params ?? {}, () => {});
+      try {
+        const result = await HANDLERS[msg.op](ctx);
+        post({
+          kind: "local",
+          id: msg.id,
+          ok: true,
+          result,
+          ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
+        });
+      } catch (e) {
+        const bridgeError = toBridgeError(e);
+        post({
+          kind: "local",
+          id: msg.id,
+          ok: false,
+          error: bridgeError,
+          ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
+        });
+      }
       break;
     }
     default:
@@ -255,3 +409,8 @@ figma.ui.onmessage = async (msg: UiToMain) => {
 figma.on("currentpagechange", () => {
   post({ kind: "hello", hello: helloData() });
 });
+
+// A drawn diagram's arrows are plain vectors — Figma Design has no connector
+// node — so something has to move them when their boxes move. This listener is
+// that something, for as long as the plugin is open.
+installDiagramLive();

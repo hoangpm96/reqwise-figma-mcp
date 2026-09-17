@@ -2,8 +2,13 @@ import { describe, it, expect } from "vitest";
 import { collectModes, normalizeColorValue } from "../../src/plugin/tokens-util.js";
 
 describe("collectModes", () => {
-  it("defaults to single mode when no per-mode values", () => {
-    expect(collectModes({ primary: "#fff" })).toEqual(["Mode 1"]);
+  it("asks for NO mode when there are no per-mode values", () => {
+    // It used to answer ["Mode 1"], and that sentinel read as a demand: the
+    // caller sent plain hexes and was taken to be asking for a mode literally
+    // named "Mode 1". Once the first mode had been renamed, the next plain-hex
+    // call tried to ADD that name back — impossible on a single-mode plan.
+    // Empty means "write whatever modes the collection already has".
+    expect(collectModes({ primary: "#fff" })).toEqual([]);
   });
   it("collects modes from per-mode maps", () => {
     const m = collectModes({

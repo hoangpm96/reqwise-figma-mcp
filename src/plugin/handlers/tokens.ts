@@ -18,6 +18,62 @@ import {
 
 const COLLECTION_NAME = "Reqwise Tokens";
 
+/**
+ * Figma's own wording when the file's pricing tier caps modes:
+ * `in addMode: Limited to N modes only`. N is read out of it rather than
+ * hardcoded — it is 1 on Starter and ten-to-twenty on the paid tiers, it has
+ * changed before, and a wrong number in an error message is worse than none.
+ */
+const MODE_LIMIT_RE = /Limited to (\d+) modes? only/i;
+
+/** What Figma names the one mode a fresh collection comes with. */
+const UNCLAIMED_MODE = /^Mode \d+$/;
+
+/**
+ * Resolve a mode by name (or id), creating it if it is genuinely missing.
+ *
+ * The first column is FREE: every collection already has exactly one mode, so
+ * a caller asking for one mode should never spend a mode on it. Claim the
+ * untouched default by RENAMING it; only a second, third, fourth mode is an
+ * `addMode`, and only that is what a plan can refuse.
+ *
+ * `setupTokens` knew this trick and the other two callers did not, which is
+ * why `import_tokens({ tokens, mode: "light" })` failed on a single-mode plan
+ * while asking for a single mode.
+ *
+ * A mode the USER named is never renamed out from under them — only Figma's
+ * own `Mode 1` placeholder is treated as unclaimed.
+ */
+export function ensureMode(
+  collection: VariableCollection,
+  name: string,
+): { modeId: string; name: string } {
+  const found = collection.modes.find((m) => m.name === name || m.modeId === name);
+  if (found) return { modeId: found.modeId, name: found.name };
+
+  const only = collection.modes.length === 1 ? collection.modes[0] : undefined;
+  if (only && UNCLAIMED_MODE.test(only.name)) {
+    collection.renameMode(only.modeId, name);
+    return { modeId: only.modeId, name };
+  }
+
+  try {
+    return { modeId: collection.addMode(name), name };
+  } catch (e) {
+    const raw = e instanceof Error ? e.message : String(e);
+    const limit = MODE_LIMIT_RE.exec(raw)?.[1];
+    if (limit === undefined) throw e;
+    const have = collection.modes.map((m) => m.name).join(", ");
+    throw err(
+      ErrorCode.PLAN_LIMIT,
+      `This Figma plan allows ${limit} mode${limit === "1" ? "" : "s"} per collection. "${collection.name}" already has ${collection.modes.length} (${have}), so mode "${name}" was not created.`,
+      limit === "1"
+        ? `One mode means one value per token. Send a single value — "surface": "#FFFFFF" — instead of a per-mode map like { light, dark }; a light/dark pair needs a paid plan.`
+        : `Keep the modes that fit (${have}), or upgrade the plan. An existing mode is reused by name, so nothing is lost by sending fewer.`,
+    );
+  }
+}
+
 interface TokensInput {
   colors?: Record<string, string | { light?: string; dark?: string; [mode: string]: string | undefined }>;
   numbers?: Record<string, number>;
@@ -92,19 +148,9 @@ async function getOrCreateCollection(
   if (!collection) {
     collection = figma.variables.createVariableCollection(COLLECTION_NAME);
   }
-  // Ensure every referenced mode exists; rename the default when appropriate.
-  const existingNames = new Set(collection.modes.map((m) => m.name));
-  for (let i = 0; i < modeNames.length; i++) {
-    const name = modeNames[i]!;
-    if (existingNames.has(name)) continue;
-    if (i === 0 && collection.modes.length === 1) {
-      // Rename the single default mode to the first requested name.
-      collection.renameMode(collection.modes[0]!.modeId, name);
-    } else {
-      collection.addMode(name);
-    }
-    existingNames.add(name);
-  }
+  // An EMPTY list means the caller sent plain values and has no opinion about
+  // modes, so whatever the collection already has is what gets written.
+  for (const name of modeNames) ensureMode(collection, name);
   return collection;
 }
 
@@ -145,6 +191,73 @@ function upsertVar(
   return v;
 }
 
+/**
+ * Friendly field aliases → the real bindable field list. cornerRadius is not
+ * itself a VariableBindableNodeField; it expands to the four corners (same for
+ * padding). Unknown fields pass through unchanged.
+ */
+export function expandBindableField(field: string): string[] {
+  switch (field) {
+    case "fill":
+      return ["fills"];
+    case "stroke":
+      return ["strokes"];
+    case "cornerRadius":
+      return [
+        "topLeftRadius",
+        "topRightRadius",
+        "bottomLeftRadius",
+        "bottomRightRadius",
+      ];
+    case "padding":
+      return ["paddingLeft", "paddingRight", "paddingTop", "paddingBottom"];
+    default:
+      return [field];
+  }
+}
+
+/**
+ * Bind an already-resolved variable to ONE concrete node field. Paint fields
+ * (fills/strokes) bind via setBoundVariableForPaint; everything else via
+ * setBoundVariable. Shared by apply_variable and create-time token binding.
+ */
+export function bindVariableToField(
+  node: SceneNode,
+  field: string,
+  variable: Variable,
+): void {
+  if (field === "fills" || field === "strokes") {
+    if (!("fills" in node)) {
+      throw err(ErrorCode.INVALID_PARAMS, `Node ${node.type} has no ${field}.`);
+    }
+    const geo = node as GeometryMixin;
+    const paints = (field === "fills" ? geo.fills : geo.strokes) as
+      | readonly Paint[]
+      | typeof figma.mixed;
+    // Reuse an existing solid paint's blendMode etc, but ALWAYS force a
+    // visible, opaque base: we are deliberately painting this token, and a
+    // freshly-created COMPONENT carries a default fill with visible:false —
+    // inheriting that produced a bound-but-invisible fill (the token was set
+    // yet nothing showed). Never inherit visible/opacity from the old paint.
+    const prev =
+      Array.isArray(paints) && paints[0]?.type === "SOLID"
+        ? (paints[0] as SolidPaint)
+        : null;
+    const base: SolidPaint = {
+      type: "SOLID",
+      color: prev?.color ?? { r: 0, g: 0, b: 0 },
+      visible: true,
+      opacity: 1,
+      ...(prev?.blendMode ? { blendMode: prev.blendMode } : {}),
+    };
+    const bound = figma.variables.setBoundVariableForPaint(base, "color", variable);
+    if (field === "fills") geo.fills = [bound];
+    else geo.strokes = [bound];
+  } else {
+    node.setBoundVariable(field as VariableBindableNodeField, variable);
+  }
+}
+
 /** Bind a variable (by name) to a node field via setBoundVariable. */
 export async function applyVariable(ctx: HandlerContext): Promise<unknown> {
   const p = ctx.params;
@@ -167,32 +280,13 @@ export async function applyVariable(ctx: HandlerContext): Promise<unknown> {
     );
   }
 
-  // Paint fields (fills/strokes) bind via setBoundVariableForPaint.
-  if (field === "fills" || field === "strokes") {
-    if (!("fills" in node)) {
-      throw err(ErrorCode.INVALID_PARAMS, `Node ${node.type} has no ${field}.`);
-    }
-    const geo = node as GeometryMixin;
-    const paints = (field === "fills" ? geo.fills : geo.strokes) as
-      | readonly Paint[]
-      | typeof figma.mixed;
-    const base: SolidPaint =
-      Array.isArray(paints) && paints[0]?.type === "SOLID"
-        ? (paints[0] as SolidPaint)
-        : { type: "SOLID", color: { r: 0, g: 0, b: 0 } };
-    const bound = figma.variables.setBoundVariableForPaint(base, "color", variable);
-    if (field === "fills") geo.fills = [bound];
-    else geo.strokes = [bound];
-  } else {
-    (node as SceneNode).setBoundVariable(
-      field as VariableBindableNodeField,
-      variable,
-    );
+  for (const f of expandBindableField(field)) {
+    bindVariableToField(node, f, variable);
   }
   return { id: node.id, bound: { field, tokenName, variableId: variable.id } };
 }
 
-async function findVariableByName(name: string): Promise<Variable | null> {
+export async function findVariableByName(name: string): Promise<Variable | null> {
   const collections = await figma.variables.getLocalVariableCollectionsAsync();
   for (const c of collections) {
     for (const id of c.variableIds) {
@@ -285,13 +379,7 @@ function writeVariableValues(
   const vbm = p.valuesByMode;
   if (vbm && typeof vbm === "object" && !Array.isArray(vbm)) {
     for (const [modeName, val] of Object.entries(vbm as Record<string, unknown>)) {
-      let mode = collection.modes.find(
-        (m) => m.name === modeName || m.modeId === modeName,
-      );
-      if (!mode) {
-        const modeId = collection.addMode(modeName);
-        mode = { modeId, name: modeName };
-      }
+      const mode = ensureMode(collection, modeName);
       variable.setValueForMode(mode.modeId, convertVarValue(val, type));
       written.push(mode.name);
     }
@@ -712,14 +800,7 @@ export async function importTokens(ctx: HandlerContext): Promise<unknown> {
 
   const modeIdsFor = (modeName: string | undefined): string[] => {
     if (modeName === undefined) return collection.modes.map((m) => m.modeId);
-    let mode = collection.modes.find(
-      (m) => m.name === modeName || m.modeId === modeName,
-    );
-    if (!mode) {
-      const modeId = collection.addMode(modeName);
-      mode = { modeId, name: modeName };
-    }
-    return [mode.modeId];
+    return [ensureMode(collection, modeName).modeId];
   };
 
   const aliasQueue: Array<{ token: FlatToken; modeIds: string[] }> = [];

@@ -4,7 +4,8 @@
  * icon SVG cache.
  */
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { LEADER_FILE } from "../shared/protocol.js";
 
 export function baseDir(): string {
@@ -31,4 +32,16 @@ export function leaderFilePathFor(port: number): string {
 
 export function cacheDir(): string {
   return join(baseDir(), "cache");
+}
+
+/**
+ * Committed assets that ship with the package (`assets/avatars/`).
+ *
+ * Resolved from THIS module's location, not from `process.cwd()`: the server
+ * is spawned by an MCP client whose working directory is whatever project the
+ * user happens to have open. `dist/server/paths.js` → up two → the package
+ * root, which is where `assets/` sits in both the repo and the zip.
+ */
+export function assetsDir(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "assets");
 }

@@ -125,6 +125,8 @@ export function renderDesignMarkdown(kit: DesignSystemKit, options: DesignMarkdo
     maxOutputChars: finiteLimit(options.maxOutputChars),
   };
 
+  lines.push(renderFingerprintBlock(computeFingerprint(kit)));
+  lines.push("");
   lines.push(`# ${fileName} Design System`);
   lines.push("");
   lines.push(`Extraction scope: ${kit.extraction?.scope === "page" ? "Current page" : "Entire document"}`);
@@ -806,6 +808,109 @@ function str(value: unknown, fallback: string): string {
 
 function truncate(value: string, max: number): string {
   return value.length > max ? value.slice(0, max - 3) + "..." : value;
+}
+
+// ---------------------------------------------------------------------------
+// Design-system fingerprint
+// ---------------------------------------------------------------------------
+
+export interface DesignFingerprint {
+  /** Counts per catalog so a human can eyeball what changed. */
+  counts: {
+    variables: number;
+    textStyles: number;
+    paintStyles: number;
+    effectStyles: number;
+    components: number;
+  };
+  /** Short stable hash of the sorted NAME sets (not ids, not values). */
+  hash: string;
+}
+
+/**
+ * Deterministic 8-char hash of a string (djb2 → base36). No crypto/Date, so it
+ * is safe in the plugin sandbox and identical across runs for identical input.
+ */
+export function stableHash(input: string): string {
+  let h = 5381;
+  for (let i = 0; i < input.length; i++) {
+    // h * 33 + c, kept in 32-bit range.
+    h = ((h << 5) + h + input.charCodeAt(i)) | 0;
+  }
+  // Unsigned, base36, padded to 8 chars.
+  return (h >>> 0).toString(36).padStart(8, "0");
+}
+
+/** Every variable NAME across all collections, sorted. */
+function variableNames(kit: DesignSystemKit): string[] {
+  const names: string[] = [];
+  for (const c of arr(kit.variables?.collections)) {
+    for (const v of arr(obj(c).variables)) {
+      const name = obj(v).name;
+      if (typeof name === "string") names.push(name);
+    }
+  }
+  return names.sort();
+}
+
+function styleNames(list: unknown): string[] {
+  return arr(list)
+    .map((s) => obj(s).name)
+    .filter((n): n is string => typeof n === "string")
+    .sort();
+}
+
+/**
+ * Fingerprint the design system's SHAPE — the sorted set of token/style/
+ * component NAMES plus counts. Names are the stable API (ids change per
+ * session, values may be tweaked), so a matching fingerprint means "the same
+ * catalog of things exists", which is exactly what a draw-time consumer needs
+ * to trust a cached design-kit.md. Add/remove/rename a token or component and
+ * the hash changes; recolouring an existing token does NOT.
+ */
+export function computeFingerprint(kit: DesignSystemKit): DesignFingerprint {
+  const vars = variableNames(kit);
+  const text = styleNames(kit.styles?.text);
+  const paint = styleNames(kit.styles?.paint);
+  const effect = styleNames(kit.styles?.effect);
+  const components = canonicalComponents(kit.components ?? [])
+    .map((c) => c.path || c.name)
+    .filter((n): n is string => typeof n === "string")
+    .sort();
+
+  // Namespaced so a token and a component of the same name can't collide.
+  const material = [
+    "V:" + vars.join(","),
+    "T:" + text.join(","),
+    "P:" + paint.join(","),
+    "E:" + effect.join(","),
+    "C:" + components.join(","),
+  ].join("|");
+
+  return {
+    counts: {
+      variables: vars.length,
+      textStyles: text.length,
+      paintStyles: paint.length,
+      effectStyles: effect.length,
+      components: components.length,
+    },
+    hash: stableHash(material),
+  };
+}
+
+/**
+ * Render the fingerprint as an HTML-comment block for the top of a generated
+ * design-kit.md. A comment so it never renders as visible prose, but a
+ * draw-time agent (or a diff) can read it back and compare `dsfp:` cheaply
+ * instead of re-scanning Figma.
+ */
+export function renderFingerprintBlock(fp: DesignFingerprint): string {
+  const c = fp.counts;
+  return [
+    "<!-- design-kit:generated — do not edit by hand; regenerate with generate_design_md -->",
+    `<!-- dsfp:${fp.hash} vars:${c.variables} text:${c.textStyles} paint:${c.paintStyles} effect:${c.effectStyles} components:${c.components} -->`,
+  ].join("\n");
 }
 
 function trimTrailingBlank(lines: string[]): string[] {

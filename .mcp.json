@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "reqwise-figma": {
+      "type": "stdio",
+      "command": "./scripts/reqwise-mcp.sh",
+      "args": []
+    }
+  }
+}

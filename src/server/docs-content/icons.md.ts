@@ -14,7 +14,7 @@ names so you can pick before paying for a fetch.
 
 ## Common aliases
 \`visibility → eye\`, \`delete → trash\`, \`done/checkmark → check\`,
-\`close/cancel → x\`, \`add → plus\`, \`edit → pencil\`, \`settings → gear\`,
+\`close/cancel → x\`, \`add → plus\`, \`edit → pencil\`, \`gear → settings\`,
 \`more → more-horizontal\`, \`back → arrow-left\`, \`logout → log-out\`, and ~40
 more. Unknown names pass through unchanged.
 

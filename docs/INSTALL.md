@@ -1,4 +1,8 @@
-# Installation & Setup
+# Installation reference
+
+> **Setting up for the first time? Use [`SETUP.md`](./SETUP.md)** — it covers the whole flow, including the AI-driven install.
+>
+> This page is the deeper reference: environment variables, port behaviour, leader/follower details, and the full troubleshooting table.
 
 ## Prerequisites
 
@@ -8,9 +12,9 @@
 
 ## Build from source
 
+Unzip the distributed package, then inside that folder:
+
 ```bash
-git clone https://github.com/<you>/reqwise-figma-mcp.git
-cd reqwise-figma-mcp
 npm install
 npm run build
 ```
@@ -34,33 +38,53 @@ The server is also exposed as a bin: `reqwise-figma-mcp` → `dist/server/index.
 
 ## Registering the MCP server
 
-The server speaks MCP over **stdio**. Point your client at the built entry file.
+The server speaks MCP over **stdio**. Prefer the launcher script — it resolves `node` when the client's PATH is stripped, normalises `TMPDIR` so leader/follower discovery works across Cursor + Claude Code + Codex, and cleans orphan leaders:
+
+```
+/absolute/path/to/reqwise-figma-mcp/scripts/reqwise-mcp.sh
+```
+
+(`scripts/cursor-agent-mcp.sh` is a deprecated alias to the same script.)
 
 ### Claude Code
 
 ```bash
-claude mcp add reqwise-figma -- node /absolute/path/to/reqwise-figma-mcp/dist/server/index.js
+claude mcp add reqwise-figma -s user -- /absolute/path/to/reqwise-figma-mcp/scripts/reqwise-mcp.sh
 ```
 
-Verify it registered:
+`-s user` registers it for **all** your projects. Without it the scope defaults to `local` — the server then only resolves in the directory you ran the command from, which is almost never what you want here, since you install from the package folder but use it from your own projects.
+
+Verify it registered, and at which scope:
 
 ```bash
 claude mcp list
+claude mcp get reqwise-figma      # Scope: "User config (available in all your projects)"
 ```
 
 ### Cursor
 
-Add to `.cursor/mcp.json` (project) or the global Cursor MCP config:
+Add to `~/.cursor/mcp.json` (global — recommended) or `.cursor/mcp.json` (that project only):
 
 ```json
 {
   "mcpServers": {
     "reqwise-figma": {
-      "command": "node",
-      "args": ["/absolute/path/to/reqwise-figma-mcp/dist/server/index.js"]
+      "type": "stdio",
+      "command": "/absolute/path/to/reqwise-figma-mcp/scripts/reqwise-mcp.sh",
+      "args": []
     }
   }
 }
+```
+
+### Codex
+
+In `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.reqwise-figma]
+command = "/absolute/path/to/reqwise-figma-mcp/scripts/reqwise-mcp.sh"
+args = []
 ```
 
 ### Claude Desktop
@@ -71,14 +95,25 @@ Add to `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claud
 {
   "mcpServers": {
     "reqwise-figma": {
-      "command": "node",
-      "args": ["/absolute/path/to/reqwise-figma-mcp/dist/server/index.js"]
+      "type": "stdio",
+      "command": "/absolute/path/to/reqwise-figma-mcp/scripts/reqwise-mcp.sh",
+      "args": []
     }
   }
 }
 ```
 
 Restart the client after editing its config so it picks up the new server.
+
+### Sync every editor at once
+
+After `npm run build`, from the package folder:
+
+```bash
+npm run install:mcp
+```
+
+This merges `reqwise-figma` into `~/.cursor/mcp.json`, `~/.codex/config.toml`, and Claude Code user scope — all pointing at the same `reqwise-mcp.sh`. See [`MULTI-AGENT.md`](./MULTI-AGENT.md) for running Cursor, Claude Code, and Codex together.
 
 ### Running via npx (once published)
 
@@ -121,7 +156,7 @@ If the package is published to npm:
 
 1. Open Figma Desktop.
 2. Menu → **Plugins → Development → Import plugin from manifest…**
-3. Select `plugin/manifest.json` from this repo (built alongside `plugin/code.js` and `plugin/ui.html`).
+3. Select `plugin/manifest.json` from the unzipped folder (it sits alongside `plugin/code.js` and `plugin/ui.html`).
 4. Open any file, then **Plugins → Development → Reqwise Figma MCP** to launch it.
 5. **Keep the plugin window open.** The plugin's `ui.html` holds the WebSocket connection to the server; closing the plugin window drops the connection (the server will report `pluginConnected: false` and the heartbeat will go stale).
 
@@ -159,7 +194,8 @@ Once the server is registered and the plugin is running, ask your agent to call 
 | `pluginConnected: false` after opening the plugin | Plugin window was closed, or never finished its handshake | Reopen **Plugins → Development → Reqwise Figma MCP** and keep the window open (it can be minimized but not closed). |
 | `hints` mentions "No heartbeat for Ns" | The Figma window is minimized/backgrounded, or the machine went to sleep, and the ping/pong cadence (10 s) lapsed past the 30 s dead threshold | Bring Figma to the foreground; the plugin reconnects with backoff (0.5 s → 8 s cap) automatically. |
 | `hints` mentions a plugin/server version mismatch | You updated the server (new `PROTOCOL_VERSION`) but the Figma plugin still has the old bundle | Re-import the plugin: **Plugins → Development → Import plugin from manifest…** again, pointing at the freshly built `plugin/manifest.json`, or use **Plugins → Development → Reqwise Figma MCP → Update** if Figma offers it. |
-| Multiple IDE windows, unsure which owns the plugin | Only the **leader** holds the actual plugin WebSocket; followers forward via `/rpc` | Check `figma_status.mode`. Both leader and follower expose the same 5 tools; you don't need to target the leader specifically. |
+| Multiple IDE windows, unsure which owns the plugin | Only the **leader** holds the actual plugin WebSocket; followers forward via `/rpc` | Check `figma_status.mode`. Both leader and follower expose the same tools; you don't need to target the leader specifically. See [`MULTI-AGENT.md`](./MULTI-AGENT.md). |
+| MCP shows **0 tools** / "not connected" with another editor already running | Config still uses `node dist/…`, or `TMPDIR` discovery mismatch between clients | `npm run install:mcp` · restart **all** editors · `pkill -f reqwise-figma-mcp/dist/server` if needed |
 | `figma_write` throws `NOT_CONNECTED` | No plugin connected, or the bridge died mid-session | Call `figma_status` first; reopen the plugin if `pluginConnected` is `false`. |
 | `pluginConnected: null` with `"statusSource": "unknown"` | This process is a **follower** and could not query the leader for status (leader busy, restarting, or dead) | Nothing to do with the plugin — do **not** reopen or reinstall it. Just retry; the follower's health monitor takes over leadership if the leader is truly dead. |
 

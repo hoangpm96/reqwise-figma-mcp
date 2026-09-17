@@ -1,0 +1,317 @@
+/**
+ * Change one thing in a drawn diagram without re-authoring it.
+ *
+ * The frame stores the model it was made from, so "the finding says this
+ * handoff has no label" is a patch against that model rather than the whole
+ * spec sent again. On the ticket-booking set, 73% of the JSON an agent emitted
+ * was a spec it had already emitted; this is what that number was measuring.
+ *
+ * Deliberately kind-agnostic: a collection is just an array on the spec, so
+ * `messages`, `entities`, `transitions` and `links` all work here without this
+ * module knowing what any of them mean. The rebuild that follows is what
+ * decides whether the result is a legal diagram — a patch is only allowed to
+ * produce a spec, never to skip the checker.
+ */
+import { OpError } from "./errors.js";
+import { ErrorCode } from "../shared/protocol.js";
+
+/** How a patch names the member it acts on. */
+export interface PatchSelector {
+  /** Match `member.id`. The usual case, where the collection has ids. */
+  id?: string;
+  /** Match by position, 0-based. The fallback for collections without ids. */
+  at?: number;
+  /** Match the first member whose every listed field is equal. */
+  where?: Record<string, unknown>;
+}
+
+export interface PatchOp extends PatchSelector {
+  /** The array to act on. Omit to act on the spec itself (title, options, …). */
+  collection?: string;
+  /**
+   * Merge these fields into the selected member (or into the spec root).
+   *
+   * A dotted key reaches inside, through objects and through lists by index:
+   * `"options.policies.hold-minutes": 15` changes one rule without resending
+   * the rest of `options`, and `"attributes.2.type": "enum(a|b)"` changes one
+   * column without resending the table.
+   *
+   * `null` REMOVES a field, since JSON has no way to say `undefined` — which
+   * is how a state stops being `final`, or a message stops being a `return`.
+   */
+  set?: Record<string, unknown>;
+  /** Append a new member. `after` says where; the end, by default. */
+  add?: Record<string, unknown>;
+  after?: string | PatchSelector;
+  /** Drop a member: the id, or `true` with `at`/`where`. */
+  remove?: string | boolean;
+}
+
+export interface PatchResult {
+  spec: Record<string, unknown>;
+  /** One line per op, in order — what the agent asked for, as applied. */
+  applied: string[];
+}
+
+/**
+ * Apply the ops in order to a copy of the stored spec.
+ *
+ * In order matters and is not an implementation detail: `add` then `set` on the
+ * thing just added is the obvious way to write a two-step change, and an `at:`
+ * index means the position at the time that op runs.
+ */
+export function applyPatch(stored: unknown, ops: unknown): PatchResult {
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      "The frame did not give back a model to patch.",
+      "Redraw it once with the full spec and the frame will carry its model from then on.",
+    );
+  }
+  if (!Array.isArray(ops) || ops.length === 0) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      "`patch` must be a non-empty array of operations.",
+      'e.g. patch: [{ collection: "edges", where: { from: "draft", to: "review" }, set: { label: "the draft" } }].',
+    );
+  }
+
+  const spec = structuredClone(stored) as Record<string, unknown>;
+  const applied: string[] = [];
+  ops.forEach((raw, i) => applied.push(applyOne(spec, raw as PatchOp, i)));
+  return { spec, applied };
+}
+
+function applyOne(spec: Record<string, unknown>, op: PatchOp, i: number): string {
+  const at = `patch[${i}]`;
+  if (!op || typeof op !== "object") {
+    throw new OpError(ErrorCode.INVALID_PARAMS, `${at} is not an operation object.`, SHAPE);
+  }
+
+  const verbs = ["set", "add", "remove"].filter((v) => op[v as "set"] !== undefined);
+  if (verbs.length !== 1) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      verbs.length === 0
+        ? `${at} says nothing to do — it needs one of \`set\`, \`add\` or \`remove\`.`
+        : `${at} asks for ${verbs.join(" and ")} at once; each op does one thing.`,
+      SHAPE,
+    );
+  }
+
+  // No collection: the op is about the spec itself — the title, the system
+  // boundary, an option. Only `set` makes sense there.
+  if (op.collection === undefined) {
+    if (!op.set) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        `${at} has no \`collection\`, so it can only \`set\` fields on the diagram itself.`,
+        'e.g. { set: { title: "Booking lifecycle" } }, or name a collection to change its members.',
+      );
+    }
+    assign(spec, op.set);
+    return `set ${Object.keys(op.set).join(", ")} on the diagram`;
+  }
+
+  const list = collectionOf(spec, op.collection, at);
+
+  if (op.add !== undefined) {
+    if (!op.add || typeof op.add !== "object" || Array.isArray(op.add)) {
+      throw new OpError(ErrorCode.INVALID_PARAMS, `${at}: \`add\` must be an object.`, SHAPE);
+    }
+    const where = op.after === undefined ? list.length : after(list, op.after, op.collection, at) + 1;
+    list.splice(where, 0, op.add);
+    return `added ${describe(op.add)} to ${op.collection} at ${where}`;
+  }
+
+  if (op.remove !== undefined) {
+    const sel: PatchSelector = typeof op.remove === "string" ? { id: op.remove } : op;
+    const idx = select(list, sel, op.collection, at);
+    const [gone] = list.splice(idx, 1);
+    return `removed ${describe(gone)} from ${op.collection}`;
+  }
+
+  if (!op.set || typeof op.set !== "object" || Array.isArray(op.set)) {
+    throw new OpError(ErrorCode.INVALID_PARAMS, `${at}: \`set\` must be an object of fields.`, SHAPE);
+  }
+  const idx = select(list, op, op.collection, at);
+  const member = list[idx];
+  if (!member || typeof member !== "object") {
+    throw new OpError(ErrorCode.INVALID_PARAMS, `${at}: ${op.collection}[${idx}] is not an object.`, SHAPE);
+  }
+  assign(member as Record<string, unknown>, op.set);
+  return `set ${Object.keys(op.set).join(", ")} on ${op.collection} ${describe(member)}`;
+}
+
+/**
+ * The named array, or an error that lists the ones this diagram actually has —
+ * the collections differ per kind, and guessing `nodes` on a sequence diagram
+ * is the mistake this message exists to answer.
+ */
+function collectionOf(
+  spec: Record<string, unknown>,
+  name: string,
+  at: string,
+): Array<unknown> {
+  const value = spec[name];
+  if (Array.isArray(value)) return value as unknown[];
+  const have = Object.keys(spec).filter((k) => Array.isArray(spec[k]));
+  throw new OpError(
+    ErrorCode.INVALID_PARAMS,
+    value === undefined
+      ? `${at}: this diagram has no \`${name}\` collection.`
+      : `${at}: \`${name}\` is not a collection on this diagram.`,
+    have.length
+      ? `It has: ${have.join(", ")}. Read the model first with figma_read op:"get_diagram_spec".`
+      : 'Read the model first with figma_read op:"get_diagram_spec".',
+  );
+}
+
+/** Resolve a selector to an index, or explain why it matched nothing. */
+function select(
+  list: unknown[],
+  sel: PatchSelector,
+  collection: string,
+  at: string,
+): number {
+  const given = ["id", "at", "where"].filter((k) => sel[k as "id"] !== undefined);
+  if (given.length !== 1) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      given.length === 0
+        ? `${at} does not say WHICH member of \`${collection}\` to change.`
+        : `${at} names the member ${given.length} ways (${given.join(", ")}); pick one.`,
+      'Use `id` when the members have ids, `where: { from, to }` to match on fields, or `at: <index>` for position.',
+    );
+  }
+
+  if (sel.at !== undefined) {
+    const i = sel.at;
+    if (!Number.isInteger(i) || i < 0 || i >= list.length) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        `${at}: \`at: ${i}\` is outside \`${collection}\`, which has ${list.length} member(s).`,
+        "Indices are 0-based, and shift as earlier ops in the same patch add or remove members.",
+      );
+    }
+    return i;
+  }
+
+  if (sel.id !== undefined) {
+    const i = list.findIndex((m) => isObj(m) && m.id === sel.id);
+    if (i >= 0) return i;
+    const ids = list.filter(isObj).map((m) => m.id).filter((v) => typeof v === "string");
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `${at}: no member of \`${collection}\` has id ${JSON.stringify(sel.id)}.`,
+      ids.length
+        ? `Ids here: ${ids.slice(0, 20).join(", ")}${ids.length > 20 ? ", …" : ""}.`
+        : `Members of \`${collection}\` have no ids — select them with \`where\` (e.g. { from, to }) or \`at\`.`,
+    );
+  }
+
+  const want = sel.where as Record<string, unknown>;
+  const keys = Object.keys(want);
+  if (!keys.length) {
+    throw new OpError(ErrorCode.INVALID_PARAMS, `${at}: \`where\` is empty.`, SHAPE);
+  }
+  const hits: number[] = [];
+  list.forEach((m, i) => {
+    if (isObj(m) && keys.every((k) => m[k] === want[k])) hits.push(i);
+  });
+  if (hits.length === 1) return hits[0]!;
+  throw new OpError(
+    ErrorCode.INVALID_PARAMS,
+    hits.length === 0
+      ? `${at}: nothing in \`${collection}\` matches ${JSON.stringify(want)}.`
+      : `${at}: ${hits.length} members of \`${collection}\` match ${JSON.stringify(want)}, so it is ambiguous.`,
+    hits.length === 0
+      ? 'Read the model back with figma_read op:"get_diagram_spec" and match on fields that are actually there.'
+      : `Add a field that tells them apart, or use \`at\` (they are at ${hits.join(", ")}).`,
+  );
+}
+
+function after(
+  list: unknown[],
+  sel: string | PatchSelector,
+  collection: string,
+  at: string,
+): number {
+  return select(list, typeof sel === "string" ? { id: sel } : sel, collection, `${at} \`after\``);
+}
+
+/** A member named the way the agent will recognise it in the result. */
+function describe(m: unknown): string {
+  if (!isObj(m)) return JSON.stringify(m);
+  if (typeof m.id === "string") return m.id;
+  if (typeof m.from === "string" && typeof m.to === "string") return `${m.from}→${m.to}`;
+  if (typeof m.label === "string") return JSON.stringify(m.label);
+  return JSON.stringify(m).slice(0, 60);
+}
+
+/**
+ * Merge fields in, following a dotted key into nested objects.
+ *
+ * A plain `Object.assign` on `{ options: {...} }` replaces the whole of
+ * `options`, so changing one rule would mean resending every other option —
+ * which is the re-emission this whole path exists to avoid. Missing levels are
+ * created; a level that exists but is not an object is refused rather than
+ * silently overwritten.
+ */
+function assign(target: Record<string, unknown>, fields: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(fields)) {
+    const path = key.split(".");
+    const last = path.pop()!;
+    // Prototype-pollution guard: "__proto__" as an intermediate step resolves
+    // to Object.prototype and the write lands globally; as a leaf it rewrites
+    // the spec object's own prototype. Both are refused (constructor/prototype
+    // too — a spec never has those fields).
+    if (path.concat(last).some((s) => FORBIDDEN_KEYS.has(s))) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        `Cannot set \`${key}\`: that path segment is not allowed.`,
+        "Keys may not walk into __proto__, constructor or prototype.",
+      );
+    }
+    let cur: Record<string, unknown> | unknown[] = target;
+
+    for (const step of path) {
+      const next = (cur as Record<string, unknown>)[step];
+      if (next === undefined || next === null) {
+        if (Array.isArray(cur)) {
+          throw new OpError(
+            ErrorCode.INVALID_PARAMS,
+            `Cannot set \`${key}\`: there is no index ${step} in that list.`,
+            "A list index has to already exist — use `add` to append a member, then set fields on it.",
+          );
+        }
+        const made: Record<string, unknown> = {};
+        (cur as Record<string, unknown>)[step] = made;
+        cur = made;
+      } else if (isObj(next) || Array.isArray(next)) {
+        cur = next as Record<string, unknown> | unknown[];
+      } else {
+        throw new OpError(
+          ErrorCode.INVALID_PARAMS,
+          `Cannot set \`${key}\`: \`${step}\` is a ${typeof next}, not an object or a list.`,
+          "A dotted key walks into nested objects and into lists by index. Set the whole field instead, or pick a path that exists.",
+        );
+      }
+    }
+
+    // `null` means REMOVE. JSON cannot carry `undefined`, so without this
+    // there is no way to make a state stop being `final` or a message stop
+    // being a `return` — the field could only ever be changed, never dropped.
+    if (value === null) delete (cur as Record<string, unknown>)[last];
+    else (cur as Record<string, unknown>)[last] = value;
+  }
+}
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+const SHAPE =
+  'Each op is one of: { collection, id|at|where, set:{…} }, { collection, add:{…}, after? } or { collection, remove: id }. Omit `collection` to set a field on the diagram itself. A dotted key in `set` reaches into nested objects and lists (`"attributes.2.type"`); `null` removes a field.';

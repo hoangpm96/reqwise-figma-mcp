@@ -69,6 +69,14 @@ export async function getDesignContext(ctx: HandlerContext): Promise<unknown> {
   } else {
     root = figma.currentPage;
   }
+  // A PAGE (or the DOCUMENT) resolves by id while its children are not in
+  // memory — under documentAccess:"dynamic-page" the walk then throws on
+  // page.children. Load before serializing; an already-loaded page no-ops.
+  if (root.type === "PAGE") {
+    await (root as PageNode).loadAsync?.();
+  } else if (root.type === "DOCUMENT") {
+    for (const pg of (root as DocumentNode).children) await pg.loadAsync?.();
+  }
   const tree = serializeTree(root, detail, maxDepth);
   return {
     tree,
@@ -82,7 +90,10 @@ export async function getDesignContext(ctx: HandlerContext): Promise<unknown> {
 
 export async function getNode(ctx: HandlerContext): Promise<unknown> {
   const node = await requireNode(ctx.params.nodeId ?? ctx.params.id);
-  const detail = normalizeDetail(ctx.params.detail) || "full";
+  // Single-node deep read: default to full detail like read_selection does.
+  // (`normalizeDetail` alone lands on "compact" — it never returns falsy, so
+  // the old `|| "full"` could never fire.)
+  const detail = normalizeDetail(ctx.params.detail ?? "full");
   const out: Record<string, unknown> = { node: serializeNode(node, detail) };
   // figma.getChildren() forwards get_node with includeChildren:true.
   if (ctx.params.includeChildren === true && "children" in node) {
@@ -101,6 +112,9 @@ export async function getNodes(ctx: HandlerContext): Promise<unknown> {
   const nodes: unknown[] = [];
   for (const id of ids) {
     const n = await findNode(id);
+    // A PAGE id resolves while the page is still unloaded — serializing it
+    // reads .children, which throws under documentAccess:"dynamic-page".
+    if (n && n.type === "PAGE") await (n as PageNode).loadAsync?.();
     if (n) nodes.push(serializeNode(n, detail));
     else nodes.push({ id, missing: true });
   }

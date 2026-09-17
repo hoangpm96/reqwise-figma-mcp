@@ -18,6 +18,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { cacheDir } from "./paths.js";
 import { ErrorCode, OpError } from "./errors.js";
+import { assertSafeIconName } from "./security.js";
 
 export type IconLibrary = "ionicons" | "lucide" | "tabler" | "bootstrap-icons";
 export const DEFAULT_LIBRARY: IconLibrary = "lucide";
@@ -155,7 +156,7 @@ export function searchIcons(query: string, limit = 8): Array<{ name: string; ali
   const push = (name: string, alias?: string) => {
     if (seen.has(name)) return;
     seen.add(name);
-    results.push({ name, ...(alias ? { alias } : {}), libraries: ["lucide", "ionicons", "tabler", "bootstrap-icons"] });
+    results.push({ name, ...(alias ? { alias } : {}), libraries: librariesFor(name) });
   };
 
   push(canonical, canonical !== norm ? norm : undefined);
@@ -183,20 +184,32 @@ const LIBRARIES: Record<IconLibrary, LibrarySpec> = {
 };
 
 /** Ionicons drop the -outline/-sharp suffix conventions; map a few basics. */
+const IONICON_MAP: Record<string, string> = {
+  trash: "trash-outline",
+  eye: "eye-outline",
+  "eye-off": "eye-off-outline",
+  check: "checkmark-outline",
+  x: "close-outline",
+  plus: "add-outline",
+  settings: "settings-outline",
+  search: "search-outline",
+  home: "home-outline",
+  user: "person-outline",
+};
+
 function toIonicon(name: string): string {
-  const map: Record<string, string> = {
-    trash: "trash-outline",
-    eye: "eye-outline",
-    "eye-off": "eye-off-outline",
-    check: "checkmark-outline",
-    x: "close-outline",
-    plus: "add-outline",
-    settings: "settings-outline",
-    search: "search-outline",
-    home: "home-outline",
-    user: "person-outline",
-  };
-  return map[name] ?? `${name}-outline`;
+  return IONICON_MAP[name] ?? `${name}-outline`;
+}
+
+/**
+ * Which libraries a canonical name is KNOWN to resolve in without a fetch:
+ * lucide (the namespace the aliases target), plus ionicons when the name has
+ * an explicit mapping. Tabler and bootstrap-icons take the name verbatim and
+ * may well ship it — but claiming all four made a "not found" look like a
+ * tool bug rather than a catalogue gap.
+ */
+function librariesFor(name: string): IconLibrary[] {
+  return name in IONICON_MAP ? ["lucide", "ionicons"] : ["lucide"];
 }
 
 const defaultFetcher: Fetcher = async (url) => {
@@ -218,7 +231,7 @@ export interface LoadIconOptions {
 export async function loadIconSvg(name: string, opts: LoadIconOptions = {}): Promise<{ svg: string; canonical: string; library: IconLibrary; cached: boolean }> {
   const library = opts.library ?? DEFAULT_LIBRARY;
   const fetcher = opts.fetcher ?? defaultFetcher;
-  const canonical = resolveAlias(name);
+  const canonical = assertSafeIconName(resolveAlias(name));
 
   const spec = LIBRARIES[library];
   const url = spec.url(canonical);

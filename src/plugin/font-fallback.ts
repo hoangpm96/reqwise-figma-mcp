@@ -43,6 +43,38 @@ export function indexAvailableFonts(
   return { byFamily };
 }
 
+/**
+ * Approximate numeric weight of a style name, so a missing weight can fall back
+ * to the NEAREST available weight in the same family rather than collapsing to
+ * Regular (which silently strips a bold display face down to book weight — the
+ * "loud headline became Regular" bug). Italic/oblique suffixes are ignored for
+ * weight ranking; the caller keeps whatever slant the picked style carries.
+ */
+const WEIGHT_OF: Array<[RegExp, number]> = [
+  [/thin|hairline/, 100],
+  [/extra[\s-]?light|ultra[\s-]?light/, 200],
+  [/light/, 300],
+  [/regular|normal|book|^$/, 400],
+  [/medium/, 500],
+  [/semi[\s-]?bold|demi[\s-]?bold/, 600],
+  [/extra[\s-]?bold|ultra[\s-]?bold/, 800],
+  [/black|heavy/, 900],
+  [/bold/, 700], // after extra/semi so those win their more specific match
+];
+
+export function styleWeight(style: string): number {
+  const s = style.toLowerCase();
+  for (const [re, w] of WEIGHT_OF) {
+    if (re.test(s)) return w;
+  }
+  return 400;
+}
+
+/** Is this style italic/oblique? Used to prefer same-slant matches. */
+function isItalic(style: string): boolean {
+  return /italic|oblique/i.test(style);
+}
+
 function pickStyle(styles: Set<string>, wanted: string): string | null {
   if (styles.has(wanted)) return wanted;
   // Case-insensitive style match.
@@ -50,10 +82,26 @@ function pickStyle(styles: Set<string>, wanted: string): string | null {
   for (const s of styles) {
     if (s.toLowerCase() === lw) return s;
   }
-  // Fall back to Regular, else the first available style.
-  if (styles.has(DEFAULT_STYLE)) return DEFAULT_STYLE;
-  const first = styles.values().next();
-  return first.done ? null : first.value;
+  if (styles.size === 0) return null;
+
+  // Nearest-weight match within the family, preferring the same slant. This is
+  // what keeps a requested "ExtraBold" landing on "Bold" instead of "Regular".
+  const wantWeight = styleWeight(wanted);
+  const wantItalic = isItalic(wanted);
+  let best: string | null = null;
+  let bestScore = Infinity;
+  for (const s of styles) {
+    // Weight gap dominates; a slant mismatch adds a flat penalty large enough
+    // to break ties but never to override a closer weight.
+    const score =
+      Math.abs(styleWeight(s) - wantWeight) +
+      (isItalic(s) === wantItalic ? 0 : 50);
+    if (score < bestScore) {
+      bestScore = score;
+      best = s;
+    }
+  }
+  return best;
 }
 
 /**

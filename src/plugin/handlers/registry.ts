@@ -14,16 +14,7 @@ import {
   setSelection,
   zoomToFit,
 } from "./write.js";
-import {
-  clone,
-  findComponent,
-  findOrCreateComponent,
-  instantiate,
-  createVariants,
-  arrangeComponentSet,
-  setComponentDescription,
-  componentize,
-} from "./components.js";
+import { clone } from "./clone.js";
 import {
   setupTokens,
   applyVariable,
@@ -56,22 +47,53 @@ import {
   getLibraryComponent,
   getDesignSystemKit,
   generateDesignMd,
+  designFingerprint,
 } from "./design-system.js";
 import { screenshot, exportNode } from "./export.js";
 import { layoutAudit } from "./audit.js";
-import {
-  getInstanceOverrides,
-  setInstanceOverrides,
-  detachInstance,
-  resetInstanceOverrides,
-} from "./instance-overrides.js";
+import { getDiagramSpec } from "./diagram-spec.js";
+import { getPageModel } from "./page-model.js";
 import {
   setSelectionColors,
   setGradient,
   setEffects,
+  setReactions,
 } from "./paint-edit.js";
+import { setupTextStyles, setTextStyle, setupEffectStyles } from "./styles.js";
+import { createUserflow } from "./userflow.js";
+import { createActivity } from "./activity.js";
+import { createErd } from "./erd.js";
+import { createSequence } from "./sequence.js";
+import { createState } from "./state.js";
+import { createSitemap } from "./sitemap.js";
+import { reflowDiagram } from "./diagram.js";
+import { pauseLive, resumeLive } from "../diagram-live.js";
+import { deletePage, deleteStyle, deleteUnusedStyles } from "./cleanup.js";
 
 export type Handler = (ctx: HandlerContext) => Promise<unknown>;
+
+/**
+ * Hold the live re-router for the length of one draw.
+ *
+ * Wrapped HERE and not at the dispatcher because there are three places a
+ * handler gets called — the op path, the `batch` loop and the direct message
+ * path — and a guard that has to be remembered in three places is a guard that
+ * will be missed in one. Wrapping the registry entry covers every caller and
+ * every future one.
+ *
+ * `finally`, so a handler that throws still releases it. Counted inside
+ * diagram-live, so a `batch` of several draws nests correctly.
+ */
+function whileDrawing(handler: Handler): Handler {
+  return async (ctx: HandlerContext): Promise<unknown> => {
+    pauseLive();
+    try {
+      return await handler(ctx);
+    } finally {
+      resumeLive();
+    }
+  };
+}
 
 /**
  * The registry is keyed by every Operation in OPERATIONS. A completeness check
@@ -96,11 +118,14 @@ export const HANDLERS: Record<Operation, Handler> = {
   get_library_component: getLibraryComponent,
   get_design_system_kit: getDesignSystemKit,
   generate_design_md: generateDesignMd,
+  design_fingerprint: designFingerprint,
   screenshot: screenshot,
   export_node: exportNode,
   get_fonts: getFonts,
   export_tokens: exportTokens,
   layout_audit: layoutAudit,
+  get_diagram_spec: getDiagramSpec,
+  get_page_model: getPageModel,
   read_selection: readSelection,
   // writes
   create: create,
@@ -115,19 +140,18 @@ export const HANDLERS: Record<Operation, Handler> = {
   batch: async () => {
     throw new Error("batch handler must be provided by the dispatcher");
   },
-  find_component: findComponent,
-  find_or_create_component: findOrCreateComponent,
-  instantiate: instantiate,
-  create_variants: createVariants,
-  arrange_component_set: arrangeComponentSet,
-  set_component_description: setComponentDescription,
-  componentize: componentize,
   setup_tokens: setupTokens,
+  setup_text_styles: setupTextStyles,
+  set_text_style: setTextStyle,
+  setup_effect_styles: setupEffectStyles,
   apply_variable: applyVariable,
   create_variable: createVariable,
   update_variable: updateVariable,
   rename_variable: renameVariable,
   delete_variable: deleteVariable,
+  delete_page: deletePage,
+  delete_style: deleteStyle,
+  delete_unused_styles: deleteUnusedStyles,
   import_tokens: importTokens,
   set_text: setText,
   load_icon: loadIcon,
@@ -138,13 +162,17 @@ export const HANDLERS: Record<Operation, Handler> = {
   set_selection: setSelection,
   zoom_to_fit: zoomToFit,
   // composite edit-in-place ops
-  get_instance_overrides: getInstanceOverrides,
-  set_instance_overrides: setInstanceOverrides,
-  detach_instance: detachInstance,
-  reset_instance_overrides: resetInstanceOverrides,
   set_selection_colors: setSelectionColors,
   set_gradient: setGradient,
   set_effects: setEffects,
+  set_reactions: setReactions,
+  create_userflow: whileDrawing(createUserflow),
+  create_activity: whileDrawing(createActivity),
+  create_erd: whileDrawing(createErd),
+  create_sequence: whileDrawing(createSequence),
+  create_state: whileDrawing(createState),
+  create_sitemap: whileDrawing(createSitemap),
+  reflow_diagram: whileDrawing(reflowDiagram),
 };
 
 /** Compile-time-ish safety net: every declared op has a handler. */
