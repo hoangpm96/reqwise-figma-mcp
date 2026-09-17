@@ -37,6 +37,29 @@ export async function createState(ctx: HandlerContext): Promise<unknown> {
     );
   }
 
+  // Painting order = z-order: arrows underneath, states cover the lines that
+  // run into them, text and labels on top.
+  //
+  // Built BEFORE the frame is opened. Redrawing in place (intoFrameId) empties
+  // the frame as it opens it, so a malformed piece of draw data that threw
+  // here used to leave the user's diagram wiped with nothing drawn back.
+  // Anything wrong with the data now fails while the canvas is untouched.
+  let children: Spec[];
+  try {
+    children = [
+      headerSpecs(d, font),
+      edgeSpecs(d.edges),
+      stateSpecs(d.states, font),
+      labelSpecs(d.edges, font),
+    ].reduce<Spec[]>((all, part) => all.concat(part), []);
+  } catch (e) {
+    throw err(
+      ErrorCode.INVALID_PARAMS,
+      `create_state got malformed draw data (${e instanceof Error ? e.message : String(e)}) — nothing was changed.`,
+      'Call it through the figma_diagram tool with type:"state" — the server computes the layout.',
+    );
+  }
+
   await preloadDiagramFonts(ctx, font);
 
   const frame = await openDiagramFrame(
@@ -57,15 +80,6 @@ export async function createState(ctx: HandlerContext): Promise<unknown> {
     },
     d.intoFrameId,
   );
-
-  // Painting order = z-order: arrows underneath, states cover the lines that
-  // run into them, text and labels on top.
-  const children: Spec[] = [
-    headerSpecs(d, font),
-    edgeSpecs(d.edges),
-    stateSpecs(d.states, font),
-    labelSpecs(d.edges, font),
-  ].reduce<Spec[]>((all, part) => all.concat(part), []);
 
   let done = 0;
   for (const spec of children) {

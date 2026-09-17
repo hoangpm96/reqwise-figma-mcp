@@ -19,6 +19,7 @@ import {
   hideEdge,
   hideLayer,
   indexChildren,
+  restoreAutoHidden,
 } from "./diagram-apply.js";
 import { adoptHandEdits, type PortWish } from "./diagram-adopt.js";
 import { reflowErd } from "../shared/erd/route.js";
@@ -54,7 +55,7 @@ export function erdFrames(page: PageNode): FrameNode[] {
 
 export async function reflowErdFrame(
   frame: FrameNode,
-  opts?: { grow?: boolean; onlyIfMoved?: boolean; force?: boolean },
+  opts?: { grow?: boolean; onlyIfMoved?: boolean; force?: boolean; deleted?: boolean },
 ): Promise<ErdReflowReport | null> {
   const graph = erdGraphOf(frame);
   if (!graph) return null;
@@ -62,7 +63,7 @@ export async function reflowErdFrame(
   if (opts?.force === true && clearHandPorts(graph)) saveGraph(frame, graph);
 
   const byName = indexChildren(frame);
-  const scan = scanBoxes(frame, graph.entities, "entity:");
+  const scan = scanBoxes(frame, graph.entities, "entity:", opts?.deleted === true);
   const { placed, goneBoxes } = scan;
 
   // Not one box found, though the graph names some: this frame is being
@@ -101,6 +102,10 @@ export async function reflowErdFrame(
 
   const changed = moved.length > 0 || dropped.length > 0 || adopted.ports.size > 0;
   if (opts?.onlyIfMoved && !changed) {
+    // An undone delete brings its box back where it was, so nothing reads as
+    // moved — but the lines hidden when it went are still hidden. See
+    // restoreAutoHidden.
+    if (!goneBoxes.length) restoreAutoHidden(byName);
     return {
       frameId: frame.id,
       name: frame.name,

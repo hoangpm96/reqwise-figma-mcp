@@ -6,7 +6,7 @@
  * the same pass for a diagram that was rearranged with the plugin closed, one
  * whose `liveRoute` is off, or after a box was deleted.
  */
-import { HandlerContext } from "../context.js";
+import { HandlerContext, getNodeByIdSafe } from "../context.js";
 import { err, nodeNotFound } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
 import { hasDiagramMarker } from "../diagram-mark.js";
@@ -18,7 +18,7 @@ export async function reflowDiagram(ctx: HandlerContext): Promise<unknown> {
   const frames: FrameNode[] = [];
 
   if (typeof id === "string" && id) {
-    const node = await figma.getNodeByIdAsync(id);
+    const node = await getNodeByIdSafe(id);
     if (!node) throw nodeNotFound(id);
     // Point it at a box (or a label) and it still finds the diagram — the
     // caller should not have to know which layer holds the marker.
@@ -44,7 +44,9 @@ export async function reflowDiagram(ctx: HandlerContext): Promise<unknown> {
 
   const reports: DiagramReport[] = [];
   for (const frame of frames) {
-    const report = await reflowAnyFrame(frame, { force });
+    // `deleted`: an explicit call is never mid-write (plugin ops run one at a
+    // time), so a frame with no boxes left really was emptied.
+    const report = await reflowAnyFrame(frame, { force, deleted: true });
     if (!report) {
       ctx.warn(
         `"${frame.name}" has no stored routing graph (drawn by an older build) — redraw it to enable re-routing.`,
@@ -101,7 +103,10 @@ export async function reflowDiagram(ctx: HandlerContext): Promise<unknown> {
  */
 function owningMarkedFrame(node: BaseNode): FrameNode | null {
   let cur: BaseNode | null = node;
-  for (let hop = 0; cur && hop < 4; hop++) {
+  // No hop limit: an ERD column's text sits five levels down (text → cell →
+  // row → entity → diagram), and four hops refused it as "not a diagram".
+  // The nearest marked frame still wins, so a nested diagram resolves to itself.
+  while (cur && cur.type !== "PAGE") {
     if (cur.type === "FRAME" && hasDiagramMarker(cur)) return cur as FrameNode;
     cur = cur.parent;
   }

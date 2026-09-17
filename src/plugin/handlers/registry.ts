@@ -68,6 +68,7 @@ import { createState } from "./state.js";
 import { createSitemap } from "./sitemap.js";
 import { reflowDiagram } from "./diagram.js";
 import { pauseLive, resumeLive } from "../diagram-live.js";
+import { endDrawing } from "../diagram-apply.js";
 import { deletePage, deleteStyle, deleteUnusedStyles } from "./cleanup.js";
 
 export type Handler = (ctx: HandlerContext) => Promise<unknown>;
@@ -90,6 +91,8 @@ function whileDrawing(handler: Handler): Handler {
     try {
       return await handler(ctx);
     } finally {
+      // Before resuming, so the queued pass sees a frame that is finished.
+      endDrawing(ctx);
       resumeLive();
     }
   };

@@ -263,15 +263,15 @@ export async function handleRead(
   // from it is the server's job, and it is what makes "the hold becomes 15
   // minutes — what has to change?" a lookup instead of five diagrams read by
   // hand. The frames an entry names are the frames to patch.
-  if (op === "get_page_model" && result && typeof result === "object") {
-    const page = result as { diagrams?: Array<StoredDiagram & { unreadable?: boolean }> };
+  if (op === "get_page_model" && resultOf(result) && typeof resultOf(result) === "object") {
+    const page = resultOf(result) as { diagrams?: Array<StoredDiagram & { unreadable?: boolean }> };
     const all = page.diagrams ?? [];
     const usable = all.filter((d) => d && d.spec !== undefined);
 
     // Frames that are diagrams but cannot be read are counted, not buried. A
     // caller acting on this index needs to know the picture is incomplete.
     const unreadable = all.filter((d) => d?.unreadable);
-    const artboards = readArtboards(result);
+    const artboards = readArtboards(resultOf(result));
     const coverage = checkCoverage(usable, artboards);
     return {
       ...page,
@@ -382,12 +382,9 @@ async function handleDiagramUpdate(
   let applied: string[] | undefined;
 
   if (patch !== undefined) {
-    const stored = (await ctx.runValidated(
-      "get_diagram_spec",
-      { nodeId: update },
-      undefined,
-      channel,
-    )) as { kind?: string; spec?: unknown };
+    const stored = resultOf(
+      await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel),
+    ) as { kind?: string; spec?: unknown };
     const result = applyPatch(stored.spec, patch);
     // Anything else in the call would be a second, contradictory source for
     // the same fields, and silently picking one of them is how a patch stops
@@ -400,7 +397,7 @@ async function handleDiagramUpdate(
         "Either patch the stored model, or send a whole spec with `update` and no `patch` to redraw the frame from scratch.",
       );
     }
-    next = result.spec;
+    next = withCallOptions(result.spec, rest.options);
     applied = result.applied;
     if (kind === undefined) kind = stored.kind;
   }
@@ -421,6 +418,61 @@ async function handleDiagramUpdate(
 
 /** What may accompany a `patch` — placement and options, never model fields. */
 const PATCH_CALL_FIELDS = new Set(["type", "options"]);
+
+/**
+ * `options` beside a patch apply to THIS draw, over the ones the frame stored.
+ * PATCH_CALL_FIELDS always allowed them, but the patched spec replaced the
+ * call, so `{ update, patch, options: { verify: false } }` was silently ignored.
+ *
+ * `layers` go on in order, later ones winning: a batch passes its shared
+ * options and then the entry's own, so the frame's stored options are the
+ * floor and never outvote what this call asked for. A draw-only option the
+ * frame stored (an older build persisted them) is not carried forward — it
+ * belonged to the call that set it.
+ */
+function withCallOptions(spec: unknown, ...layers: unknown[]): unknown {
+  const base = (spec ?? {}) as Record<string, unknown>;
+  const stored = withoutDrawOnlyOptions(readOptions(base));
+  const hasLayer = layers.some((l) => l && typeof l === "object" && !Array.isArray(l));
+  if (!hasLayer && Object.keys(stored).length === Object.keys(readOptions(base)).length) return spec;
+  return { ...base, options: mergeOptionLayers(stored, ...layers) };
+}
+
+/**
+ * Options that steer one draw — whether to proof-read first, audit after,
+ * cross-check the page, or not draw at all. They are not part of the model:
+ * stored with it, `{ update, patch, options: { verify: false } }` once meant
+ * every later plain patch of that frame silently skipped its audit.
+ */
+const DRAW_ONLY_OPTIONS = ["verify", "checkFirst", "dryRun", "crossCheck"];
+
+function withoutDrawOnlyOptions(options: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...options };
+  for (const k of DRAW_ONLY_OPTIONS) delete out[k];
+  return out;
+}
+
+/**
+ * Merge option objects left to right. `policies` is a map of named rules, and
+ * sending one rule means "change this one", not "these are now all the
+ * rules" — a shallow merge dropped every stored rule the call did not repeat.
+ */
+function mergeOptionLayers(...layers: unknown[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const layer of layers) {
+    if (!layer || typeof layer !== "object" || Array.isArray(layer)) continue;
+    for (const [k, v] of Object.entries(layer as Record<string, unknown>)) {
+      const prev = out[k];
+      out[k] =
+        k === "policies" && isPlainObject(prev) && isPlainObject(v) ? { ...prev, ...v } : v;
+    }
+  }
+  return out;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
 
 interface BatchSpec {
   diagrams: unknown[];
@@ -467,6 +519,42 @@ async function handleDiagramBatch(
 
   // 1. Build every item dry: the findings and the size of each frame, with
   //    nothing on the canvas yet.
+  // Vet every entry's shape before any frame is read. Every patch reads its
+  // frame's model up front, so two entries naming the same frame would both
+  // start from the model as it was and the second draw would silently erase
+  // the first. And an `update` that is not a frame id must be refused here
+  // exactly as the single-diagram call refuses it — ignoring it drew a brand
+  // new frame beside the one the caller meant to change.
+  const targets = new Map<string, number>();
+  for (const [i, raw] of items.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        "Every entry in `diagrams` must be a diagram spec object.",
+        'Each entry carries its own `type` and `title`, e.g. { type: "state", title: "Booking lifecycle", states, transitions }.',
+      );
+    }
+    const entry = raw as Record<string, unknown>;
+    const update = entry.update;
+    if (update === undefined) continue;
+    if (typeof update !== "string" || !update.trim()) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        `"${titleOf(entry, i)}": \`update\` must be the id of the frame to redraw.`,
+        'It is the `frameId` a diagram tool returned, e.g. update: "140:5914".',
+      );
+    }
+    const first = targets.get(update);
+    if (first !== undefined) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        `Entries #${first + 1} and #${i + 1} both update frame "${update}" — the second would overwrite the first.`,
+        "Put every change to one frame in a single entry (one `patch` list can hold several changes).",
+      );
+    }
+    targets.set(update, i);
+  }
+
   const prepared: Array<{
     type: unknown;
     spec: Record<string, unknown>;
@@ -476,13 +564,6 @@ async function handleDiagramBatch(
     applied?: string[];
   }> = [];
   for (const raw of items) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      throw new OpError(
-        ErrorCode.INVALID_PARAMS,
-        "Every entry in `diagrams` must be a diagram spec object.",
-        'Each entry carries its own `type` and `title`, e.g. { type: "state", title: "Booking lifecycle", states, transitions }.',
-      );
-    }
     const item = { ...(raw as Record<string, unknown>) };
     const { type: rawType, update, patch, ...rest } = item;
     let type = rawType;
@@ -491,7 +572,9 @@ async function handleDiagramBatch(
     // change as a patch against the model that frame holds — the same two
     // things a single-diagram call can do. Without this, re-running a set is
     // the fastest way to end up with every diagram on the page twice.
-    let body: Record<string, unknown> = rest;
+    // Options, lowest to highest: what the frame stored (patch only), the
+    // batch's shared options, then the entry's own.
+    let merged = { ...rest, options: mergeOptionLayers(shared, readOptions(rest)) } as Record<string, unknown>;
     let applied: string[] | undefined;
     if (patch !== undefined) {
       if (update === undefined) {
@@ -501,12 +584,9 @@ async function handleDiagramBatch(
           'Each entry patches its own frame: { update: "140:5914", patch: [...] }.',
         );
       }
-      const stored = (await ctx.runValidated(
-        "get_diagram_spec",
-        { nodeId: update },
-        undefined,
-        channel,
-      )) as { kind?: string; spec?: unknown };
+      const stored = resultOf(
+        await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel),
+      ) as { kind?: string; spec?: unknown };
       const result = applyPatch(stored.spec, patch);
       const extra = Object.keys(rest).filter((k) => !PATCH_CALL_FIELDS.has(k));
       if (extra.length) {
@@ -516,12 +596,11 @@ async function handleDiagramBatch(
           "Either patch the stored model, or send a whole spec with `update` and no `patch`.",
         );
       }
-      body = result.spec;
+      merged = withCallOptions(result.spec, shared, rest.options) as Record<string, unknown>;
       applied = result.applied;
       if (type === undefined) type = stored.kind;
     }
 
-    const merged = { ...body, options: { ...shared, ...readOptions(body) } } as Record<string, unknown>;
     if (spec.parentId !== undefined && merged.parentId === undefined) merged.parentId = spec.parentId;
     const sized = (await runDiagramType(
       ctx,
@@ -651,6 +730,12 @@ async function drawWithChecks(
 ): Promise<unknown> {
   const options = readOptions(spec);
   const dryRun = options.dryRun === true;
+  // What reaches the draw — and so becomes the model the frame stores — keeps
+  // no draw-only option. They are read from `options` above and steer only
+  // this call; a dry run still needs its flag to know not to draw.
+  const model = isPlainObject(spec) && isPlainObject(spec.options)
+    ? { ...spec, options: withoutDrawOnlyOptions(spec.options) }
+    : spec;
 
   // `checkFirst` collapses the two-call dry-run ritual into one: the checker
   // and the layout run here (single-digit ms, no canvas write), and the draw
@@ -658,7 +743,7 @@ async function drawWithChecks(
   // write path — it returns before the create op is dispatched — so this is
   // about proof-reading, not about probing the bridge.
   if (!dryRun && options.checkFirst === true) {
-    const checked = (await run(withOptions(spec, { dryRun: true }))) as DiagramResult;
+    const checked = (await run(withOptions(model, { dryRun: true }))) as DiagramResult;
     if (checked.warnings?.length) {
       return {
         ...checked,
@@ -669,7 +754,7 @@ async function drawWithChecks(
     }
   }
 
-  const result = (await run(spec)) as DiagramResult;
+  const result = (await run(dryRun ? withOptions(model, { dryRun: true }) : model)) as DiagramResult;
   if (dryRun || !result.frameId) return result;
 
   // Fold the render-side check into the draw. `warnings` are SEMANTIC (the
@@ -803,7 +888,7 @@ export async function auditFrame(
   channel?: string,
 ): Promise<Record<string, unknown>> {
   try {
-    const raw = (await ctx.runValidated("layout_audit", { nodeId: frameId }, undefined, channel)) as
+    const raw = resultOf(await ctx.runValidated("layout_audit", { nodeId: frameId }, undefined, channel)) as
       | { nodeCount?: number; summary?: { issues?: unknown[]; styleHints?: unknown[] } }
       | undefined;
     const issues = (raw?.summary?.issues ?? []).map(String);
@@ -819,6 +904,21 @@ export async function auditFrame(
     // A failed verification must not sink a drawing that already landed.
     return { skipped: String(err instanceof Error ? err.message : err) };
   }
+}
+
+/**
+ * The value of a plugin op, whether or not it came wrapped with warnings.
+ * An op that calls ctx.warn answers `{ result, warnings }` instead of the bare
+ * value; these readers looked for `spec` / `summary` on the wrapper, so a
+ * single warning would have made a patch read no model and an audit read no
+ * issues — silently.
+ */
+function resultOf(raw: unknown): unknown {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const o = raw as Record<string, unknown>;
+    if ("result" in o && Array.isArray(o.warnings)) return o.result;
+  }
+  return raw;
 }
 
 // ---- figma_rules ----
@@ -884,7 +984,7 @@ function formatSection(
     return `_Could not load: ${msg}_`;
   }
   try {
-    return fmt(settled.value);
+    return fmt(resultOf(settled.value));
   } catch {
     return "_none_";
   }

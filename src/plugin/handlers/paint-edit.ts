@@ -1,5 +1,5 @@
 /// <reference types="@figma/plugin-typings" />
-import { HandlerContext, requireNode } from "../context.js";
+import { HandlerContext, requireNode, getNodeByIdSafe } from "../context.js";
 import { serializeNode } from "../serialize.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
@@ -64,40 +64,62 @@ export async function setSelectionColors(
     };
   }
 
-  let changed = 0;
+  const tally = { changed: 0, skippedBound: 0 };
   const stack: SceneNode[] = [...roots];
   while (stack.length > 0) {
     const n = stack.pop()!;
     if ("fills" in n) {
-      changed += recolorPaintList(n as GeometryMixin, "fills", from, toRgb);
+      recolorPaintList(n as GeometryMixin, "fills", from, toRgb, tally);
     }
     if (includeStrokes && "strokes" in n) {
-      changed += recolorPaintList(n as GeometryMixin, "strokes", from, toRgb);
+      recolorPaintList(n as GeometryMixin, "strokes", from, toRgb, tally);
     }
     if ("children" in n) stack.push(...(n as ChildrenMixin).children);
   }
 
-  return { changed };
+  if (tally.skippedBound > 0) {
+    ctx.warn(
+      `${tally.skippedBound} matching paint(s) are bound to a color variable and were left as they are. Change the variable's value to recolor everything using that token, or rebind those layers to a different variable.`,
+    );
+    return tally;
+  }
+  return { changed: tally.changed };
 }
 
-/** Recolor a node's fills/strokes array in place; returns count changed. */
+/**
+ * Recolor a node's fills/strokes array in place, adding to the tally.
+ *
+ * A paint bound to a color variable is skipped, not recolored. Figma renders a
+ * bound paint from the variable, so `{...paint, color}` kept
+ * boundVariables.color and changed nothing on screen while the op counted it
+ * as changed. Stripping the binding instead would make the colour change, but
+ * a bulk recolor over a subtree would then quietly detach every design token
+ * it touched — the kind of damage nobody notices until the theme changes. So
+ * the op stays honest the other way: it counts those paints as skipped and
+ * says how to change them on purpose.
+ */
 function recolorPaintList(
   node: GeometryMixin,
   field: "fills" | "strokes",
   from: string | undefined,
   toRgb: { r: number; g: number; b: number },
-): number {
+  tally: { changed: number; skippedBound: number },
+): void {
   const paints = node[field];
-  if (paints === figma.mixed || !Array.isArray(paints)) return 0;
+  if (paints === figma.mixed || !Array.isArray(paints)) return;
   let changed = 0;
   const next = paints.map((paint) => {
     if (paint.type !== "SOLID") return paint;
     if (!shouldRecolor(paint.color, from)) return paint;
+    if ((paint as SolidPaint).boundVariables?.color) {
+      tally.skippedBound++;
+      return paint;
+    }
     changed++;
     return { ...paint, color: toRgb };
   });
   if (changed > 0) node[field] = next as Paint[];
-  return changed;
+  tally.changed += changed;
 }
 
 /**
@@ -258,7 +280,7 @@ export async function setReactions(ctx: HandlerContext): Promise<unknown> {
     for (const action of reaction.actions) {
       if (action.type !== "NODE") continue;
       const destId = String(action.destinationId);
-      const dest = await figma.getNodeByIdAsync(destId);
+      const dest = await getNodeByIdSafe(destId);
       if (!dest) {
         throw err(
           ErrorCode.INVALID_PARAMS,

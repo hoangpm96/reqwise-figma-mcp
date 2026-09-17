@@ -27,6 +27,7 @@ import {
   hideLayer,
   indexChildren,
   unhide,
+  restoreAutoHidden,
 } from "./diagram-apply.js";
 import { reflowUserflow, type RouteGraph } from "../shared/userflow/route.js";
 import type { Placement } from "../shared/diagram/types.js";
@@ -88,14 +89,14 @@ export function userflowFrames(page: PageNode): FrameNode[] {
  */
 export async function reflowFrame(
   frame: FrameNode,
-  opts?: { grow?: boolean; onlyIfMoved?: boolean; force?: boolean },
+  opts?: { grow?: boolean; onlyIfMoved?: boolean; force?: boolean; deleted?: boolean },
 ): Promise<ReflowReport | null> {
   const graph = userflowGraphOf(frame);
   if (!graph) return null;
 
   const byName = indexChildren(frame);
 
-  const scan = scanBoxes(frame, graph.nodes, "flow:");
+  const scan = scanBoxes(frame, graph.nodes, "flow:", opts?.deleted === true);
   const { placed, goneBoxes, shapes: boxes } = scan;
 
   // Not one box found, though the graph names some: this frame is being
@@ -142,6 +143,10 @@ export async function reflowFrame(
   // answer. This is what stops the DRAW pass's own document changes from
   // immediately re-routing (and coarsening) a diagram that dagre just laid out.
   if (opts?.onlyIfMoved && !changed) {
+    // An undone delete brings its box back where it was, so nothing reads as
+    // moved — but the lines hidden when it went are still hidden. See
+    // restoreAutoHidden.
+    if (!goneBoxes.length) restoreAutoHidden(byName);
     return {
       frameId: frame.id,
       name: frame.name,

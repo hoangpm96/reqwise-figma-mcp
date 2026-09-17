@@ -18,7 +18,7 @@
  *    here to reposition.
  */
 import { readDiagramData, SITEMAP_MARKER } from "./diagram-mark.js";
-import { applyEdge, canvasChildren, growToFit, hideEdge, indexChildren, scanBoxes } from "./diagram-apply.js";
+import { applyEdge, canvasChildren, growToFit, hideEdge, indexChildren, scanBoxes, restoreAutoHidden } from "./diagram-apply.js";
 import { reflowSitemap } from "../shared/sitemap/layout.js";
 import type { PageKind, SitemapGraph } from "../shared/sitemap/types.js";
 import type { FlowClass, Placement } from "../shared/diagram/types.js";
@@ -56,13 +56,13 @@ export function sitemapFrames(page: PageNode): FrameNode[] {
 
 export async function reflowSitemapFrame(
   frame: FrameNode,
-  opts?: { grow?: boolean; onlyIfMoved?: boolean; force?: boolean },
+  opts?: { grow?: boolean; onlyIfMoved?: boolean; force?: boolean; deleted?: boolean },
 ): Promise<SitemapReflowReport | null> {
   const graph = sitemapGraphOf(frame);
   if (!graph) return null;
 
   const byName = indexChildren(frame);
-  const scan = scanBoxes(frame, graph.nodes, "page:");
+  const scan = scanBoxes(frame, graph.nodes, "page:", opts?.deleted === true);
   const { placed, goneBoxes } = scan;
 
   // Not one box found, though the graph names some: this frame is being
@@ -85,6 +85,10 @@ export async function reflowSitemapFrame(
   const { edges, dropped, moved } = reflowSitemap(graph, placed);
   const changed = moved.length > 0 || dropped.length > 0;
   if (opts?.onlyIfMoved && !changed) {
+    // An undone delete brings its box back where it was, so nothing reads as
+    // moved — but the lines hidden when it went are still hidden. See
+    // restoreAutoHidden.
+    if (!goneBoxes.length) restoreAutoHidden(byName);
     return {
       frameId: frame.id,
       name: frame.name,

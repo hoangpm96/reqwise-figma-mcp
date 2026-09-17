@@ -77,7 +77,12 @@ export function simplify(points: Pt[]): Pt[] {
     if (prev && next) {
       const collinearX = Math.abs(prev[0] - cur[0]) < 0.25 && Math.abs(cur[0] - next[0]) < 0.25;
       const collinearY = Math.abs(prev[1] - cur[1]) < 0.25 && Math.abs(cur[1] - next[1]) < 0.25;
-      if (collinearX || collinearY) continue;
+      // Only a point that lies BETWEEN its neighbours is redundant. One past
+      // them is a turnaround — the line runs out and doubles back — and
+      // dropping it would cut the path short at the neighbour instead.
+      const between = (i: 0 | 1): boolean =>
+        (cur[i] - prev[i]) * (next[i] - cur[i]) >= 0;
+      if ((collinearX && between(1)) || (collinearY && between(0))) continue;
     }
     kept.push(cur);
   }

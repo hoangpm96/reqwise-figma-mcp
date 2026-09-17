@@ -198,11 +198,18 @@ export function checkState(
   }
 
   // ---- concurrency ----
-  const forks = states.filter((s) => s.kind === "fork").length;
-  const joins = states.filter((s) => s.kind === "join").length;
-  if (forks && !joins) {
+  // Asked per fork, by walking forwards from it: counting forks and joins
+  // across the whole machine lets a join that belongs to some OTHER region
+  // vouch for a fork whose branches never meet again.
+  const joinIds = new Set(states.filter((s) => s.kind === "join").map((s) => s.id));
+  const unjoined = states.filter((s) => {
+    if (s.kind !== "fork") return false;
+    for (const id of reachableFrom([s.id], out)) if (joinIds.has(id)) return false;
+    return true;
+  });
+  if (unjoined.length) {
     warnings.push(
-      `${forks} fork(s) and no join. Concurrent regions have to come back together before the machine can move on — add the join, or the diagram says the entity is in two states forever.`,
+      `${unjoined.length} fork(s) and no join downstream (${list(unjoined.map((s) => `"${nameOf(s.id)}"`))}). Concurrent regions have to come back together before the machine can move on — add the join, or the diagram says the entity is in two states forever.`,
     );
   }
 

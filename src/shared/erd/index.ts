@@ -25,9 +25,14 @@ export function buildErd(spec: ErdSpec): ErdBuild {
   // the same entities/relations and is checked identically.
   let entities = spec.entities ?? [];
   let relations = spec.relations ?? [];
-  if (spec.text) {
-    if (entities.length) {
-      warnings.push("Both `text` and `entities` were given — the text won. Pass one or the other.");
+  if (typeof spec.text === "string" && spec.text.trim()) {
+    // `relations` counts too: the text brings its own, so a relations list
+    // passed alongside it was being thrown away without a word.
+    if (entities.length || relations.length) {
+      const given = [entities.length ? "`entities`" : "", relations.length ? "`relations`" : ""]
+        .filter(Boolean)
+        .join("/");
+      warnings.push(`Both \`text\` and ${given} were given — the text won. Pass one or the other.`);
     }
     const parsed = parseErdText(spec.text);
     entities = parsed.entities;

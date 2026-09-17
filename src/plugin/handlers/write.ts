@@ -1,5 +1,5 @@
 /// <reference types="@figma/plugin-typings" />
-import { HandlerContext, requireNode, findNode, isParentNode } from "../context.js";
+import { HandlerContext, requireNode, findNode, isParentNode, getNodeByIdSafe } from "../context.js";
 import { resolveParent, insertInto } from "../insert.js";
 import { toPaints, toEffects } from "../paints.js";
 import { loadNodeFonts, loadFontWithFallback, DEFAULT_FONT } from "../fonts.js";
@@ -89,6 +89,16 @@ export async function modify(ctx: HandlerContext): Promise<unknown> {
   // Auto-layout props.
   if ("layoutMode" in node) {
     applyLayoutProps(node as FrameNode, props);
+  } else {
+    // A rectangle/text/vector inside an auto-layout frame still takes
+    // layoutAlign/layoutGrow; the frame-only path above never reached them,
+    // so modify(rect, {layoutAlign:"STRETCH"}) returned ok and changed nothing.
+    if ("layoutAlign" in node && typeof props.layoutAlign === "string") {
+      (node as LayoutMixin).layoutAlign = props.layoutAlign as LayoutMixin["layoutAlign"];
+    }
+    if ("layoutGrow" in node && typeof props.layoutGrow === "number") {
+      (node as LayoutMixin).layoutGrow = props.layoutGrow;
+    }
   }
 
   // Geometry.
@@ -125,6 +135,14 @@ export async function modify(ctx: HandlerContext): Promise<unknown> {
   return { id: node.id, node: serializeNode(node, "compact") };
 }
 
+/** Text props Figma rejects unless the node's fonts are loaded. */
+const TEXT_LAYOUT_KEYS = [
+  "fontSize", "characters", "text", "textAlignHorizontal", "textAlignVertical",
+  "textAutoResize", "w", "h", "width", "height",
+  // Stretching/growing a text layer in auto-layout re-lays its lines.
+  "layoutAlign", "layoutGrow",
+];
+
 async function modifyText(
   node: TextNode,
   props: Record<string, unknown>,
@@ -149,7 +167,10 @@ async function modifyText(
     const res = await loadFontWithFallback({ family, style });
     node.fontName = res.resolvedFont;
     if (res.substituted && res.reason) ctx.warn(res.reason);
-  } else {
+  } else if (TEXT_LAYOUT_KEYS.some((k) => props[k] !== undefined)) {
+    // Only a change that re-lays the glyphs needs the node's fonts. Loading
+    // them for every modify made modify(text, {x}) fail outright on a file
+    // whose font isn't installed — the move never happened.
     await loadNodeFonts(node);
   }
   if (typeof props.fontSize === "number") node.fontSize = props.fontSize;
@@ -378,7 +399,7 @@ export async function setSelection(ctx: HandlerContext): Promise<unknown> {
       : [];
   const nodes: SceneNode[] = [];
   for (const id of ids) {
-    const n = await figma.getNodeByIdAsync(id);
+    const n = await getNodeByIdSafe(id);
     if (n && n.type !== "PAGE" && n.type !== "DOCUMENT") {
       nodes.push(n as SceneNode);
     }

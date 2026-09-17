@@ -57,7 +57,12 @@ export function pairCalls(messages: Msgish[], fragments: SeqFragmentSpec[]): Pai
     }
     if (kind !== "return") continue;
 
-    const answers = (c: PairedCall) => c.to === m.from && c.from === m.to;
+    // A call made in the OTHER branch of an alt never happened in the run this
+    // reply belongs to, so it cannot be what the reply answers — at any step.
+    // Sharing an outer `loop` with it used to be enough to pair them, which
+    // left the call from before the loop reported as unanswered.
+    const answers = (c: PairedCall) =>
+      c.to === m.from && c.from === m.to && !outOfRun(fragments, c.id, m.id);
     // 1. The call this reply shares a fragment with — the innermost one. A
     //    reply inside a branch answers the call made inside that branch, never
     //    an older one from before the fragment opened.
@@ -66,7 +71,10 @@ export function pairCalls(messages: Msgish[], fragments: SeqFragmentSpec[]): Pai
       // 2. Otherwise: is this the same answer given in another branch? Two
       //    `alt` branches, or a `break` body, are alternative timelines, so
       //    their replies belong to ONE call. Checked before the plain stack,
-      //    which would hand it an older call that is still open.
+      //    which would hand it an older call that is still open. The call
+      //    itself must be reachable from this branch too (`answers` says so):
+      //    a call made and answered INSIDE the if-branch is not what the
+      //    else-branch replies to.
       const alt = lastMatch(
         calls,
         (c) => answers(c) && c.replies.some((r) => exclusive(fragments, r, m.id)),
@@ -112,6 +120,28 @@ export function exclusive(fragments: SeqFragmentSpec[], a: string, b: string): b
       const aIn = f.messages.indexOf(a) >= 0;
       const bIn = f.messages.indexOf(b) >= 0;
       if (aIn !== bIn) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Is a call out of reach of a later reply — did the two happen in different
+ * runs? The other branch of an `alt`, yes. A `break` is one-directional,
+ * though: a call made BEFORE a break is still open inside its body (the body
+ * is often exactly the error reply to it), whereas a call made inside the body
+ * cannot be answered after it, because the body ends the enclosing fragment.
+ * `exclusive` is symmetric and would refuse the first case.
+ */
+function outOfRun(fragments: SeqFragmentSpec[], call: string, reply: string): boolean {
+  for (const f of fragments) {
+    if (f.kind === "alt") {
+      const els = f.else?.messages ?? [];
+      if (f.messages.indexOf(call) >= 0 && els.indexOf(reply) >= 0) return true;
+      if (els.indexOf(call) >= 0 && f.messages.indexOf(reply) >= 0) return true;
+    }
+    if (f.kind === "break" && f.messages.indexOf(call) >= 0 && f.messages.indexOf(reply) < 0) {
+      return true;
     }
   }
   return false;

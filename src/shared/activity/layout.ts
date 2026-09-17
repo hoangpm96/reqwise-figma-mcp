@@ -456,6 +456,12 @@ function boundsShift(
   return { dx, dy, maxX, maxY };
 }
 
+/** Beside the bar's first end, off its cross side: past the arrows that leave it. */
+function forkLabelBox(s: Sized, ax: Axis): Placement {
+  const [x, y] = ax.pt(ax.a0(s.at) - 4, ax.c1(s.at) + 10);
+  return { x, y, w: s.textW, h: s.textH + 8 };
+}
+
 function drawStep(s: Sized, move: (at: Placement) => Placement, ax: Axis): DrawStep {
   const at = move(s.at);
   const pal = PALETTE[s.cls] ?? PALETTE.plain;
@@ -481,9 +487,10 @@ function drawStep(s: Sized, move: (at: Placement) => Placement, ax: Axis): DrawS
       ...(s.titleLines.length
         ? {
             outside: {
-              at: move(
-                ax.box(ax.a0(s.at) - 4, ax.c1(s.at) + 10, s.textH + 8, s.textW),
-              ),
+              // The label is text, so its width is the text's width in BOTH
+              // rank directions. Building it with ax.box would swap w and h in
+              // LR and hand the plugin a 23-wide, 91-tall box for one line.
+              at: move(forkLabelBox(s, ax)),
               align: "LEFT" as const,
             },
           }

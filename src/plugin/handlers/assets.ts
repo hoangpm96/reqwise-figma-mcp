@@ -1,12 +1,12 @@
 /// <reference types="@figma/plugin-typings" />
-import { HandlerContext } from "../context.js";
+import { HandlerContext, getNodeByIdSafe } from "../context.js";
 import { resolveParent, insertInto } from "../insert.js";
 import { serializeNode } from "../serialize.js";
 import { hexToRgb } from "../color-util.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
-import { resolveGeometry, InsertAt, Inset } from "../layout-math.js";
-import { parentSize } from "./create.js";
+import { InsertAt, Inset } from "../layout-math.js";
+import { childOrigin, parentSize, resolveInParent } from "./create.js";
 
 import { decodeBase64 } from "../base64.js";
 import { fitArtwork } from "../fit-artwork.js";
@@ -63,8 +63,9 @@ export async function loadIcon(ctx: HandlerContext): Promise<unknown> {
   if (typeof p.color === "string") recolorPaints(node, p.color);
 
   const parent = await resolveParent(p.parentId);
+  const frame = parentFrame(parent);
   insertInto(parent, node, p.insertAt as InsertAt | undefined);
-  positionInParent(node, p, parent);
+  positionInParent(node, p, parent, frame);
 
   return { id: node.id, node: serializeNode(node, "compact") };
 }
@@ -106,8 +107,9 @@ export async function loadImage(ctx: HandlerContext): Promise<unknown> {
   rect.fills = [{ type: "IMAGE", scaleMode, imageHash: image.hash }];
 
   const parent = await resolveParent(p.parentId);
+  const frame = parentFrame(parent);
   insertInto(parent, rect, p.insertAt as InsertAt | undefined);
-  positionInParent(rect, p, parent);
+  positionInParent(rect, p, parent, frame);
 
   return {
     id: rect.id,
@@ -116,17 +118,30 @@ export async function loadImage(ctx: HandlerContext): Promise<unknown> {
   };
 }
 
+/**
+ * The parent's size and child origin, read BEFORE the new node goes in: a
+ * group grows to fit its children, so measured afterwards it includes the
+ * icon still sitting wherever it was created.
+ */
+function parentFrame(parent: BaseNode): {
+  size: { w: number; h: number } | null;
+  origin: { x: number; y: number };
+} {
+  return { size: parentSize(parent), origin: childOrigin(parent) };
+}
+
 function positionInParent(
   node: SceneNode,
   p: Record<string, unknown>,
   parent: BaseNode,
+  frame: ReturnType<typeof parentFrame>,
 ): void {
   const managed =
     "layoutMode" in parent && (parent as FrameNode).layoutMode !== "NONE";
   if (managed) return;
-  const pb = parentSize(parent);
+  const pb = frame.size;
   if (p.inset && pb) {
-    const box = resolveGeometry(
+    const box = resolveInParent(
       {
         w: node.width,
         h: node.height,
@@ -134,6 +149,7 @@ function positionInParent(
         align: p.align as "center-x" | "center-y" | "center" | undefined,
       },
       pb,
+      frame.origin,
     );
     node.x = box.x;
     node.y = box.y;
@@ -175,7 +191,7 @@ export async function setCurrentPage(ctx: HandlerContext): Promise<unknown> {
   await figma.loadAllPagesAsync?.();
   let page: PageNode | null = null;
   if (pageId) {
-    const node = await figma.getNodeByIdAsync(pageId);
+    const node = await getNodeByIdSafe(pageId);
     if (node?.type === "PAGE") page = node;
   } else if (pageName) {
     const matches = figma.root.children.filter((candidate) => candidate.name.toLowerCase() === pageName.toLowerCase());
@@ -220,6 +236,10 @@ export async function createOverlay(ctx: HandlerContext): Promise<unknown> {
   const p = ctx.params;
   const parent = await resolveParent(p.parentId);
   const pb = parentSize(parent);
+  // A group's children are in its containing frame's coordinates, so its own
+  // top-left is where an overlay covering it starts — not 0,0. Read before
+  // the insert, which grows the group around the rectangle.
+  const origin = childOrigin(parent);
   const rect = figma.createRectangle();
   rect.name = typeof p.name === "string" ? p.name : "Overlay";
   if (pb) rect.resize(Math.max(1, pb.w), Math.max(1, pb.h));
@@ -233,8 +253,8 @@ export async function createOverlay(ctx: HandlerContext): Promise<unknown> {
   const managed =
     "layoutMode" in parent && (parent as FrameNode).layoutMode !== "NONE";
   if (!managed) {
-    rect.x = 0;
-    rect.y = 0;
+    rect.x = origin.x;
+    rect.y = origin.y;
   }
   return { id: rect.id, node: serializeNode(rect, "compact") };
 }

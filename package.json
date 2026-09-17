@@ -10,9 +10,7 @@
     "dist",
     "plugin",
     ".claude/skills",
-    "assets",
     "README.md",
-    "CHANGELOG.md",
     "docs",
     "!**/*.map"
   ],

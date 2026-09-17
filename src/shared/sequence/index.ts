@@ -27,7 +27,7 @@ export function buildSequence(spec: SequenceSpec): SequenceBuild {
   let participants = spec.participants ?? [];
   let messages = spec.messages ?? [];
   let fragments = spec.fragments ?? [];
-  if (spec.text) {
+  if (typeof spec.text === "string" && spec.text.trim()) {
     if (participants.length || messages.length) {
       warnings.push(
         "Both `text` and `participants`/`messages` were given — the text won. Pass one or the other.",

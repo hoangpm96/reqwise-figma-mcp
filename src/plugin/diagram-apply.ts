@@ -27,6 +27,7 @@ import type { Placement } from "../shared/diagram/types.js";
 import { findFreeSpot } from "../shared/diagram/place.js";
 import type { Rect } from "../shared/diagram/place.js";
 import type { HandlerContext } from "./context.js";
+import { getNodeByIdSafe } from "./context.js";
 import type { DrawEdge } from "../shared/diagram/types.js";
 
 /** Frame padding the layout pass leaves around a diagram. */
@@ -285,6 +286,27 @@ export function unhide(node: SceneNode): void {
   setAutoHidden(node, false);
 }
 
+/**
+ * Every box is back and nothing moved: show again every layer WE hid.
+ *
+ * Undoing a box delete puts the box back exactly where it was, so a pass that
+ * only acts when something moved or went missing found nothing to do and
+ * returned — leaving the arrows it hid when the box went away hidden for good.
+ * With no box missing, nothing a hide was answering is still true, so all of
+ * them can come back. It writes only while a stamped layer is still hidden,
+ * so the pass our own write triggers finds none and settles. A layer the user
+ * hid by hand carries no stamp and stays hidden.
+ */
+export function restoreAutoHidden(byName: Map<string, SceneNode>): number {
+  let shown = 0;
+  byName.forEach((layer) => {
+    if (layer.visible) return;
+    unhide(layer);
+    if (layer.visible) shown++;
+  });
+  return shown;
+}
+
 function setAutoHidden(node: SceneNode, on: boolean): void {
   try {
     node.setPluginData(AUTO_HIDDEN, on ? "1" : "");
@@ -376,12 +398,63 @@ export function readDiagramSource(node: BaseNode): {
  * therefore left exactly as they are — only the size and the contents follow
  * the new drawing.
  */
+/**
+ * "This frame is being written right now", stored ON the frame.
+ *
+ * `paused` in diagram-live holds the live pass, but it cannot stop a second
+ * op: after a bridge timeout the next op starts while the plugin is still
+ * drawing, and a live batch already pulled from the queue keeps going. A
+ * redraw empties the frame while its old graph is still stored, so any pass
+ * that reached it then — flagged `deleted` or not — would read "no box left"
+ * and hide every line. The mark is what scanBoxes trusts over any flag. It
+ * carries a time so a draw that died with the plugin cannot pin it forever.
+ */
+const DRAWING_KEY = "reqwise.drawing";
+const DRAWING_STALE_MS = 5 * 60_000;
+const drawnBy = new WeakMap<HandlerContext, FrameNode[]>();
+
+function markDrawing(ctx: HandlerContext, frame: FrameNode): void {
+  try {
+    frame.setPluginData(DRAWING_KEY, String(Date.now()));
+  } catch {
+    return;
+  }
+  const list = drawnBy.get(ctx) ?? [];
+  list.push(frame);
+  drawnBy.set(ctx, list);
+}
+
+/** Clear the marks this op set. Called by whileDrawing, in `finally`. */
+export function endDrawing(ctx: HandlerContext): void {
+  for (const frame of drawnBy.get(ctx) ?? []) {
+    try {
+      if (!frame.removed) frame.setPluginData(DRAWING_KEY, "");
+    } catch {
+      // A frame deleted mid-draw has nothing left to clear.
+    }
+  }
+  drawnBy.delete(ctx);
+}
+
+export function isBeingDrawn(frame: BaseNode): boolean {
+  let at = 0;
+  try {
+    at = Number(frame.getPluginData(DRAWING_KEY)) || 0;
+  } catch {
+    return false;
+  }
+  return at > 0 && Date.now() - at < DRAWING_STALE_MS;
+}
+
 export async function openDiagramFrame(
   ctx: HandlerContext,
   frameSpec: Record<string, unknown>,
   intoFrameId?: string,
 ): Promise<FrameNode> {
-  if (intoFrameId) return await reopenFrame(intoFrameId, frameSpec);
+  if (intoFrameId) {
+    const reopened = await reopenFrame(intoFrameId, frameSpec, (f) => markDrawing(ctx, f));
+    return reopened;
+  }
 
   await keepClearOfExistingWork(ctx, frameSpec);
 
@@ -395,6 +468,7 @@ export async function openDiagramFrame(
   if (!frame || frame.type !== "FRAME") {
     throw err(ErrorCode.INTERNAL, "The diagram frame disappeared right after it was created.");
   }
+  markDrawing(ctx, frame);
   return frame;
 }
 
@@ -427,7 +501,7 @@ async function keepClearOfExistingWork(
   const parentId = typeof frameSpec.parentId === "string" ? frameSpec.parentId : "";
   let siblings: readonly SceneNode[];
   if (parentId) {
-    const parent = await figma.getNodeByIdAsync(parentId);
+    const parent = await getNodeByIdSafe(parentId);
     if (!parent || !("children" in parent)) return;
     siblings = (parent as ChildrenMixin).children;
   } else {
@@ -465,8 +539,9 @@ async function keepClearOfExistingWork(
 async function reopenFrame(
   frameId: string,
   frameSpec: Record<string, unknown>,
+  beforeEmptying: (frame: FrameNode) => void,
 ): Promise<FrameNode> {
-  const node = await figma.getNodeByIdAsync(frameId);
+  const node = await getNodeByIdSafe(frameId);
   if (!node) {
     throw err(
       ErrorCode.NODE_NOT_FOUND,
@@ -490,6 +565,7 @@ async function reopenFrame(
   }
 
   const frame = node as FrameNode;
+  beforeEmptying(frame);
   for (const child of [...frame.children]) child.remove();
 
   const w = Number(frameSpec.width ?? frameSpec.w);
@@ -555,6 +631,13 @@ export function scanBoxes<T extends { id: string }>(
   frame: FrameNode,
   nodes: readonly T[],
   prefix: string | ((node: T) => string),
+  /**
+   * There is evidence the boxes were DELETED — a DELETE change reached the live
+   * watcher, or somebody called reflow_diagram on purpose. Then "not one box
+   * found" means a person emptied the diagram, and its arrows have to go too;
+   * without this, deleting every box left every arrow on the canvas forever.
+   */
+  deleted = false,
 ): BoxScan {
   const placed = new Map<string, Placement>();
   const shapes = new Map<string, SceneNode>();
@@ -568,7 +651,7 @@ export function scanBoxes<T extends { id: string }>(
     shapes.set(n.id, node);
     placed.set(n.id, { x: node.x, y: node.y, w: node.width, h: node.height });
   }
-  const midWrite = nodes.length > 0 && placed.size === 0;
+  const midWrite = nodes.length > 0 && placed.size === 0 && (!deleted || isBeingDrawn(frame));
   return { placed, shapes, goneBoxes: midWrite ? [] : goneBoxes, midWrite };
 }
 
@@ -581,13 +664,14 @@ export function scanBoxes<T extends { id: string }>(
  */
 export function canvasChildren(page: BaseNode & ChildrenMixin): SceneNode[] {
   const out: SceneNode[] = [];
-  for (const child of page.children) {
-    if (child.type === "SECTION") {
-      for (const inner of child.children) out.push(inner as SceneNode);
-      continue;
+  const walk = (parent: BaseNode & ChildrenMixin) => {
+    for (const child of parent.children) {
+      // Sections nest (a section inside a section is one drag away).
+      if (child.type === "SECTION") walk(child);
+      else out.push(child as SceneNode);
     }
-    out.push(child);
-  }
+  };
+  walk(page);
   return out;
 }
 
@@ -602,10 +686,24 @@ export function pageArtboards(page: BaseNode & ChildrenMixin): Array<{ nodeId: s
 }
 
 export function pageModel(frame: FrameNode): Array<Record<string, unknown>> {
-  const parent = frame.parent;
-  if (!parent || !("children" in parent)) return [];
+  // The PAGE, not the frame's parent: a diagram inside a SECTION saw only the
+  // section's diagrams, and one on the page never saw those in a section.
+  let page: BaseNode | null = frame.parent;
+  while (page && page.type !== "PAGE") page = page.parent;
+  if (!page) return [];
   const out: Array<Record<string, unknown>> = [];
-  for (const child of (parent as ChildrenMixin).children) {
+  // Plus the frame's own siblings: a diagram drawn with parentId into a plain
+  // board frame is not canvas-level, and must still see itself and its
+  // neighbours. De-duplicated, since in a section those are the same nodes.
+  const seen = new Set<string>();
+  const candidates = [...canvasChildren(page as PageNode)];
+  const parent = frame.parent;
+  if (parent && parent.type !== "PAGE" && parent.type !== "SECTION" && "children" in parent) {
+    candidates.push(...(parent as ChildrenMixin).children);
+  }
+  for (const child of candidates) {
+    if (seen.has(child.id)) continue;
+    seen.add(child.id);
     const mark = readDiagramSource(child);
     if (!mark.kind || mark.source === undefined) continue;
     out.push({

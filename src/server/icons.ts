@@ -233,7 +233,14 @@ export async function loadIconSvg(name: string, opts: LoadIconOptions = {}): Pro
   const fetcher = opts.fetcher ?? defaultFetcher;
   const canonical = assertSafeIconName(resolveAlias(name));
 
-  const spec = LIBRARIES[library];
+  const spec = Object.hasOwn(LIBRARIES, library) ? LIBRARIES[library] : undefined;
+  if (!spec) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Unknown icon library "${String(library)}".`,
+      `Use one of: ${Object.keys(LIBRARIES).join(", ")}.`,
+    );
+  }
   const url = spec.url(canonical);
   const cacheFile = join(cacheDir(), `${library}__${hashName(canonical)}.svg`);
 

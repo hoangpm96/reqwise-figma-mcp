@@ -1,6 +1,6 @@
 /// <reference types="@figma/plugin-typings" />
 import { resolveInsertIndex, InsertAt } from "./layout-math.js";
-import { isParentNode } from "./context.js";
+import { getNodeByIdSafe, isParentNode } from "./context.js";
 
 export { isParentNode };
 import { err } from "./errors.js";
@@ -33,7 +33,7 @@ export async function resolveParent(
   parentId: unknown,
 ): Promise<ParentNode> {
   if (typeof parentId === "string" && parentId.length > 0) {
-    const p = await figma.getNodeByIdAsync(parentId);
+    const p = await getNodeByIdSafe(parentId);
     if (!p) {
       throw err(
         ErrorCode.NODE_NOT_FOUND,

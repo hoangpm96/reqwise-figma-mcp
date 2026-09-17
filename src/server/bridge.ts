@@ -166,6 +166,14 @@ export interface DispatchOptions {
    * that window without an explicit channel.
    */
   sessionId?: string;
+  /**
+   * Aborted by the caller once it has stopped waiting (figma_write gave up on
+   * its budget). An op still waiting in a queue is dropped and rejected; one
+   * already on the wire cannot be recalled from the plugin and is left alone.
+   * Without this, a queued op outlived the call that issued it and later ran
+   * on whichever window happened to connect.
+   */
+  signal?: AbortSignal;
 }
 
 export interface BridgeHandlers {
@@ -309,6 +317,19 @@ class PluginConnection {
     this.pending.delete(id);
     if (this.inFlight > 0) this.inFlight--;
     this.drainQueue();
+  }
+
+  /**
+   * Drop a request that is still waiting in this connection's queue. Returns
+   * false when it is not queued here — already on the wire or settled — so
+   * the caller knows it was not cancelled.
+   */
+  cancelQueued(id: string): boolean {
+    const at = this.queue.findIndex((item) => item.pending.id === id);
+    if (at < 0 || !this.pending.has(id)) return false;
+    this.queue.splice(at, 1);
+    this.pending.delete(id);
+    return true;
   }
 
   failAllPending(err: OpError): void {
@@ -698,6 +719,10 @@ export class Bridge {
     // unrouted queue — hand them to this connection now.
     if (this.unrouted.length > 0 && this.channels.size === 1) {
       for (const item of this.unrouted.splice(0)) {
+        // The wait-for-a-window deadline is over; the connection arms the
+        // real per-op timer when the op goes on the wire.
+        clearTimeout(item.pending.timer);
+        item.pending.timer = undefined;
         conn.enqueue(item.request, item.pending);
       }
     }
@@ -756,11 +781,54 @@ export class Bridge {
       };
       const request: BridgeRequest = { id, op, params, ...(opts.chunk ? { chunk: opts.chunk } : {}) };
 
+      const signal = opts.signal;
+      const onAbort = () => {
+        // Look everywhere it could be waiting: an unrouted op may have been
+        // handed to a connection that has not put it on the wire yet.
+        const cancelled =
+          this.removeUnrouted(id) || [...this.channels.values()].some((c) => c.cancelQueued(id));
+        if (!cancelled) return;
+        clearTimeout(pending.timer);
+        reject(
+          new OpError(
+            ErrorCode.PLUGIN_TIMEOUT,
+            `Operation "${op}" was cancelled before it reached Figma — the call that issued it stopped waiting.`,
+            "Nothing was sent to the plugin for this operation. Retry the call once a Figma window is connected and responsive.",
+          ),
+        );
+      };
+      if (signal) {
+        if (signal.aborted) {
+          reject(
+            new OpError(
+              ErrorCode.PLUGIN_TIMEOUT,
+              `Operation "${op}" was cancelled before it was dispatched.`,
+              "Nothing was sent to the plugin for this operation.",
+            ),
+          );
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+        const release = () => signal.removeEventListener("abort", onAbort);
+        const res0 = pending.resolve;
+        const rej0 = pending.reject;
+        pending.resolve = (r) => {
+          release();
+          res0(r);
+        };
+        pending.reject = (e) => {
+          release();
+          rej0(e);
+        };
+      }
+
+      // From here on every refusal goes through pending.reject, which also
+      // detaches the abort listener; the raw reject left it on the signal.
       // Explicit channel → exactly that window.
       if (opts.channel) {
         const conn = this.channels.get(opts.channel);
         if (!conn) {
-          reject(
+          pending.reject(
             new OpError(
               ErrorCode.CHANNEL_NOT_FOUND,
               `No Figma window is connected on channel "${opts.channel}".`,
@@ -783,11 +851,16 @@ export class Bridge {
         const conn = binding ? this.channels.get(binding.channel) : undefined;
         if (binding && conn) {
           if (!binding.notified) {
-            binding.notified = true;
+            // Marked only when an answer actually carries the notice back: an
+            // op that dies queued (QUEUE_FULL, timeout, disconnect) would
+            // otherwise spend the one-time notice on a reply nobody receives.
             const notice = `The user bound this session to channel "${binding.channel}" (${conn.info.fileName || "untitled"}) from the Figma plugin UI — operations now route to that window by default.`;
             const inner = pending.resolve;
-            pending.resolve = (res) =>
+            pending.resolve = (res) => {
+              if (binding.notified) return inner(res);
+              binding.notified = true;
               inner({ ...res, warnings: [...(res.warnings ?? []), notice] });
+            };
           }
           conn.enqueue(request, pending);
           return;
@@ -803,7 +876,7 @@ export class Bridge {
       if (this.channels.size === 0) {
         // Wait for the first window — same UX as the single-connection bridge.
         if (this.unrouted.length >= MAX_QUEUE) {
-          reject(
+          pending.reject(
             new OpError(
               ErrorCode.QUEUE_FULL,
               `Request queue is full (${this.unrouted.length}/${MAX_QUEUE}) — no plugin is connected to drain the queue.`,
@@ -812,12 +885,26 @@ export class Bridge {
           );
           return;
         }
+        // Waiting for a window is bounded too. Without a deadline the caller
+        // could time out and move on while this op sat here, only to run
+        // later against whichever file connected first.
+        pending.timer = setTimeout(() => {
+          if (!this.removeUnrouted(id)) return;
+          pending.reject(
+            new OpError(
+              ErrorCode.PLUGIN_TIMEOUT,
+              `Operation "${op}" waited ${timeoutMs}ms for a Figma window and none connected.`,
+              "Nothing was sent to Figma. Open the Reqwise plugin in the file you want, then retry.",
+            ),
+          );
+        }, timeoutMs);
+        pending.timer.unref?.();
         this.unrouted.push({ request, pending });
         return;
       }
 
       // Several windows and no channel — make the caller pick.
-      reject(
+      pending.reject(
         new OpError(
           ErrorCode.AMBIGUOUS_CHANNEL,
           `${this.channels.size} Figma windows are connected — specify which channel to target.`,
@@ -825,6 +912,14 @@ export class Bridge {
         ),
       );
     });
+  }
+
+  /** Take one request out of the unrouted queue; false when it is not there. */
+  private removeUnrouted(id: string): boolean {
+    const at = this.unrouted.findIndex((item) => item.pending.id === id);
+    if (at < 0) return false;
+    this.unrouted.splice(at, 1);
+    return true;
   }
 
   private describeChannels(): string {

@@ -199,3 +199,140 @@ describe("every op that rewrites a diagram is wrapped", () => {
     expect(liveIsPaused(), "the live pass stayed shut after the draw").toBe(false);
   });
 });
+
+describe("deleting every box of a diagram", () => {
+  /**
+   * `scanBoxes` reads "not one box found" as mid-write, which is right during
+   * a draw and wrong after a person selected every box and pressed delete:
+   * each pass bailed out and the arrows stayed on the canvas for good. A
+   * DELETE reaching the watcher is the evidence that tells the two apart.
+   */
+  const lines = (frame: any) => frame.children.filter((c: any) => c.name.indexOf("edge ") === 0);
+
+  it("hides every arrow once the DELETE arrives", async () => {
+    await HANDLERS.create_sitemap(ctx(drawData()));
+    const frame = page.children[0];
+    installDiagramLive();
+    expect(lines(frame).length).toBeGreaterThan(0);
+
+    const boxes = frame.children.filter((c: any) => c.name.indexOf("page:") === 0);
+    for (const b of boxes) b.remove();
+    for (const cb of pageListeners) cb({ nodeChanges: boxes.map((b: any) => ({ type: "DELETE", id: b.id })) });
+    await settle();
+
+    for (const l of lines(frame)) expect(l.visible, `${l.name} survived its boxes`).toBe(false);
+  });
+
+  it("an explicit reflow_diagram hides them too", async () => {
+    const res = (await HANDLERS.create_sitemap(ctx(drawData()))) as any;
+    const frame = page.children[0];
+    for (const b of frame.children.filter((c: any) => c.name.indexOf("page:") === 0)) b.remove();
+    const out = (await HANDLERS.reflow_diagram(ctx({ frameId: res.frameId }))) as any;
+    expect(out.frames[0].goneBoxes.length).toBe(3);
+    for (const l of lines(frame)) expect(l.visible).toBe(false);
+  });
+});
+
+describe("reflow_diagram pointed at a deeply nested layer", () => {
+  it("finds the diagram five levels up (an ERD column's text is that deep)", async () => {
+    await HANDLERS.create_sitemap(ctx(drawData()));
+    const frame = page.children[0];
+    let cur = frame;
+    for (const t of ["FRAME", "FRAME", "FRAME", "TEXT"]) {
+      const n = base(`90:${++seq}`, t);
+      cur.appendChild(n);
+      cur = n;
+    }
+    const out = (await HANDLERS.reflow_diagram(ctx({ nodeId: cur.id }))) as any;
+    expect(out.frames[0].frameId).toBe(frame.id);
+  });
+});
+
+describe("a DELETE-flagged pass that meets a frame being redrawn", () => {
+  /**
+   * `paused` cannot stop a second op (after a bridge timeout the next op starts
+   * while the plugin is still drawing). A redraw empties the frame while its old
+   * graph is stored, so a pass flagged `deleted` reaching it then would hide
+   * every line. The frame's own "being drawn" mark wins over the flag.
+   */
+  it("the frame carries the drawing mark for the length of a redraw, and not after", async () => {
+    const res = (await HANDLERS.create_sitemap(ctx(drawData()))) as any;
+    const frame = page.children[0];
+    let markDuring = "";
+    const realText = (globalThis as any).figma.createText;
+    (globalThis as any).figma.createText = vi.fn(() => {
+      if (!markDuring) markDuring = frame.getPluginData("reqwise.drawing");
+      return realText();
+    });
+    await HANDLERS.create_sitemap(ctx({ ...drawData(), intoFrameId: res.frameId }));
+    expect(markDuring, "no mark while the frame was being rewritten").not.toBe("");
+    expect(frame.getPluginData("reqwise.drawing")).toBe("");
+  });
+
+  it("an explicit reflow reaching a marked, emptied frame hides nothing", async () => {
+    const res = (await HANDLERS.create_sitemap(ctx(drawData()))) as any;
+    const frame = page.children[0];
+    const lines = () => frame.children.filter((c: any) => c.name.indexOf("edge ") === 0);
+    // The state a timed-out redraw leaves for the next op: marked, boxes not
+    // drawn yet, lines already in.
+    frame.setPluginData("reqwise.drawing", String(Date.now()));
+    for (const b of frame.children.filter((c: any) => c.name.indexOf("page:") === 0)) b.remove();
+    const out = (await HANDLERS.reflow_diagram(ctx({ frameId: res.frameId }))) as any;
+    for (const l of lines()) expect(l.visible, `${l.name} hidden mid-redraw`).toBe(true);
+    expect(out.frames[0].goneBoxes).toEqual([]);
+  });
+
+  it("a mark left by a draw that died long ago does not pin the frame forever", async () => {
+    const res = (await HANDLERS.create_sitemap(ctx(drawData()))) as any;
+    const frame = page.children[0];
+    frame.setPluginData("reqwise.drawing", String(Date.now() - 60 * 60_000));
+    for (const b of frame.children.filter((c: any) => c.name.indexOf("page:") === 0)) b.remove();
+    await HANDLERS.reflow_diagram(ctx({ frameId: res.frameId }));
+    for (const l of frame.children.filter((c: any) => c.name.indexOf("edge ") === 0)) expect(l.visible).toBe(false);
+  });
+});
+
+describe("a draw that starts while a live batch is running", () => {
+  /**
+   * `paused` used to be checked only at the head of the drain loop. A batch
+   * already taken off the queue kept re-routing frame after frame even though
+   * a draw had paused the watcher during one of its awaits. The rest of the
+   * batch now goes back on the queue and waits for resumeLive.
+   */
+  it("hands the rest of the batch back instead of routing it mid-draw", async () => {
+    await HANDLERS.create_sitemap(ctx(drawData()));
+    await HANDLERS.create_sitemap(ctx({ ...drawData(), x: 2000 }));
+    const [a, b] = page.children;
+    installDiagramLive();
+    const beforeB = pathOf(b, "edge root->a");
+
+    // The moment frame A's line is rewritten, a draw pauses the watcher.
+    const lineA = a.children.find((c: any) => c.name === "edge root->a");
+    let paths = lineA.vectorPaths;
+    let pausedOnce = false;
+    Object.defineProperty(lineA, "vectorPaths", {
+      configurable: true,
+      get: () => paths,
+      set: (v) => {
+        paths = v;
+        if (!pausedOnce) {
+          pausedOnce = true;
+          pauseLive();
+        }
+      },
+    });
+
+    boxOf(a, "a").x -= 200;
+    boxOf(b, "a").x -= 200;
+    for (const cb of pageListeners) cb({ nodeChanges: [moved(boxOf(a, "a")).nodeChanges[0], moved(boxOf(b, "a")).nodeChanges[0]] });
+    await settle();
+    await settle();
+    expect(pausedOnce, "frame A was never re-routed").toBe(true);
+    expect(pathOf(b, "edge root->a"), "frame B was routed while paused").toBe(beforeB);
+
+    resumeLive();
+    await settle();
+    await settle();
+    expect(pathOf(b, "edge root->a")).not.toBe(beforeB);
+  });
+});

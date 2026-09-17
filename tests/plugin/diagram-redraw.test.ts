@@ -240,3 +240,62 @@ describe("a frame nothing can read is reported, not hidden", () => {
     expect(res.diagrams.map((d: any) => d.nodeId)).not.toContain("88:1");
   });
 });
+
+describe("a diagram inside a SECTION", () => {
+  /**
+   * `artboards` already looked inside sections; `diagrams` did not, so a
+   * diagram dragged into one vanished from the page model — not even listed
+   * as unreadable — and every cross-check ran on part of the page.
+   */
+  const section = () => {
+    const s = base("5:1", "SECTION");
+    page.appendChild(s);
+    return s;
+  };
+
+  it("get_page_model lists it", async () => {
+    const res0 = (await run(draw("Draft it", { source: { title: "T" } }))) as any;
+    const frame = page.children[0];
+    page.children.splice(0, 1);
+    section().appendChild(frame);
+
+    const res = (await getPageModel(makeContext({} as any, () => {}))) as any;
+    expect(res.diagrams.map((d: any) => d.nodeId)).toContain(res0.frameId);
+  });
+
+  it("a draw inside a section still sees the diagrams on the page, and vice versa", async () => {
+    const onPage = (await run(draw("Draft it", { source: { title: "A" } }))) as any;
+    const s = section();
+    const inSection = (await run(draw("Other", { source: { title: "B" }, parentId: s.id }))) as any;
+    expect(page.children.find((c: any) => c.id === inSection.frameId)).toBeUndefined();
+    const ids = (inSection.pageModel ?? []).map((d: any) => d.nodeId);
+    expect(ids).toContain(onPage.frameId);
+    expect(ids).toContain(inSection.frameId);
+  });
+});
+
+describe("a diagram inside a plain board frame, or a section inside a section", () => {
+  it("the draw's page model still lists itself and its neighbour on the board", async () => {
+    const board = base("6:1", "FRAME");
+    page.appendChild(board);
+    const a = (await run(draw("Draft it", { source: { title: "A" }, parentId: board.id }))) as any;
+    const b = (await run(draw("Other", { source: { title: "B" }, parentId: board.id }))) as any;
+    const ids = (b.pageModel ?? []).map((d: any) => d.nodeId);
+    expect(ids).toContain(a.frameId);
+    expect(ids).toContain(b.frameId);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("get_page_model looks inside nested sections", async () => {
+    const res0 = (await run(draw("Draft it", { source: { title: "T" } }))) as any;
+    const frame = page.children.find((c: any) => c.id === res0.frameId);
+    page.children.splice(page.children.indexOf(frame), 1);
+    const outer = base("7:1", "SECTION");
+    const inner = base("7:2", "SECTION");
+    page.appendChild(outer);
+    outer.appendChild(inner);
+    inner.appendChild(frame);
+    const res = (await getPageModel(makeContext({} as any, () => {}))) as any;
+    expect(res.diagrams.map((d: any) => d.nodeId)).toContain(res0.frameId);
+  });
+});

@@ -1,8 +1,7 @@
 # Diagram skills for Reqwise Figma MCP
 
-Nine skills that turn the diagram tools into a working method: read the source, derive the
-model, ask the questions the source left open, draw once, and read what came back. Plus one
-itself out of screens the file already has.
+Six skills that turn the diagram tools into a working method: read the source, derive the
+model, ask the questions the source left open, draw once, and read what came back.
 
 The tools already refuse to invent content and already proof-read the model you hand them.
 What they cannot do is decide *which* diagram answers the question in front of you, interview
@@ -18,7 +17,7 @@ what these are for.
 | `/figma-erd` | What do we store, and how do the pieces refer to each other? |
 | `/figma-sitemap` | What pages exist, and how are they nested? |
 
-`reqwise-diagram-rules.md` holds what the nine diagram skills share — the connection gate, the four levels of
+`reqwise-diagram-rules.md` holds what the six diagram skills share — the connection gate, the four levels of
 "correct", the findings loop, frame placement, verification, redrawing. Each `SKILL.md`
 references it and carries only what is genuinely its own.
 
@@ -41,7 +40,7 @@ For every project rather than one, copy to `~/.claude/skills/` instead.
 **Anything else** — point your agent at the folder:
 
 ```
-Read the .claude/skills/ folder of the reqwise-figma-mcp package and install those nine skills
+Read the .claude/skills/ folder of the reqwise-figma-mcp package and install those six skills
 the way this tool expects them.
 ```
 

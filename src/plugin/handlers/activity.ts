@@ -35,6 +35,30 @@ export async function createActivity(ctx: HandlerContext): Promise<unknown> {
     );
   }
 
+  // Painting order = z-order: lanes are the background, arrows sit on them,
+  // steps cover the arrows that run into them, text and labels go on top.
+  //
+  // Built BEFORE the frame is opened. Redrawing in place (intoFrameId) empties
+  // the frame as it opens it, so a malformed piece of draw data that threw
+  // here used to leave the user's diagram wiped with nothing drawn back.
+  // Anything wrong with the data now fails while the canvas is untouched.
+  let children: Spec[];
+  try {
+    children = [
+      headerSpecs(d, font),
+      laneSpecs(d.lanes, font),
+      edgeSpecs(d.edges),
+      stepSpecs(d.steps, font),
+      labelSpecs(d.edges, font),
+    ].reduce<Spec[]>((all, part) => all.concat(part), []);
+  } catch (e) {
+    throw err(
+      ErrorCode.INVALID_PARAMS,
+      `create_activity got malformed draw data (${e instanceof Error ? e.message : String(e)}) — nothing was changed.`,
+      'Call it through the figma_diagram tool with type:"activity" — the server computes the layout.',
+    );
+  }
+
   await preloadDiagramFonts(ctx, font);
 
   const frame = await openDiagramFrame(
@@ -55,16 +79,6 @@ export async function createActivity(ctx: HandlerContext): Promise<unknown> {
     },
     d.intoFrameId,
   );
-
-  // Painting order = z-order: lanes are the background, arrows sit on them,
-  // steps cover the arrows that run into them, text and labels go on top.
-  const children: Spec[] = [
-    headerSpecs(d, font),
-    laneSpecs(d.lanes, font),
-    edgeSpecs(d.edges),
-    stepSpecs(d.steps, font),
-    labelSpecs(d.edges, font),
-  ].reduce<Spec[]>((all, part) => all.concat(part), []);
 
   let done = 0;
   for (const spec of children) {

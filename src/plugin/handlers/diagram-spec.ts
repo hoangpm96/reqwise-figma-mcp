@@ -6,14 +6,14 @@
  * because the frame remembers its ROUTING graph but not what it was asked to
  * draw. With it, "the finding says this handoff has no label" becomes a patch.
  */
-import { HandlerContext } from "../context.js";
+import { HandlerContext, getNodeByIdSafe } from "../context.js";
 import { readDiagramSource } from "../diagram-apply.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
 
 export async function getDiagramSpec(ctx: HandlerContext): Promise<unknown> {
   const id = String(ctx.params.nodeId ?? "");
-  const node = await figma.getNodeByIdAsync(id);
+  const node = await getNodeByIdSafe(id);
   if (!node) {
     throw err(
       ErrorCode.NODE_NOT_FOUND,

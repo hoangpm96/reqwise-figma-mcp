@@ -46,6 +46,35 @@ export async function createSequence(ctx: HandlerContext): Promise<unknown> {
     );
   }
 
+  // Order matters: the fragment BOXES are the background a block sits in, the
+  // lifelines hang behind everything, bars sit on them, arrows over those —
+  // and the fragment TABS go on top, because a lifeline drawn through the word
+  // "alt" makes the block look like a mistake.
+  //
+  // Built BEFORE the frame is opened. Redrawing in place (intoFrameId) empties
+  // the frame as it opens it, so a malformed piece of draw data that threw
+  // here used to leave the user's diagram wiped with nothing drawn back.
+  // Anything wrong with the data now fails while the canvas is untouched.
+  let children: Spec[];
+  try {
+    children = [
+      headerSpecs(d, font),
+      fragmentBoxSpecs(d.fragments),
+      lifelineSpecs(d.participants),
+      activationSpecs(d.activations),
+      messageSpecs(d.messages),
+      participantSpecs(d.participants, font),
+      fragmentLabelSpecs(d.fragments, font),
+      labelSpecs(d.messages, font),
+    ].reduce<Spec[]>((all, part) => all.concat(part), []);
+  } catch (e) {
+    throw err(
+      ErrorCode.INVALID_PARAMS,
+      `create_sequence got malformed draw data (${e instanceof Error ? e.message : String(e)}) — nothing was changed.`,
+      'Call it through the figma_diagram tool with type:"sequence" — the server computes the layout.',
+    );
+  }
+
   await preloadDiagramFonts(ctx, font);
 
   const frame = await openDiagramFrame(
@@ -66,21 +95,6 @@ export async function createSequence(ctx: HandlerContext): Promise<unknown> {
     },
     d.intoFrameId,
   );
-
-  // Order matters: the fragment BOXES are the background a block sits in, the
-  // lifelines hang behind everything, bars sit on them, arrows over those —
-  // and the fragment TABS go on top, because a lifeline drawn through the word
-  // "alt" makes the block look like a mistake.
-  const children: Spec[] = [
-    headerSpecs(d, font),
-    fragmentBoxSpecs(d.fragments),
-    lifelineSpecs(d.participants),
-    activationSpecs(d.activations),
-    messageSpecs(d.messages),
-    participantSpecs(d.participants, font),
-    fragmentLabelSpecs(d.fragments, font),
-    labelSpecs(d.messages, font),
-  ].reduce<Spec[]>((all, part) => all.concat(part), []);
 
   let done = 0;
   for (const spec of children) {

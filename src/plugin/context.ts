@@ -29,12 +29,64 @@ export function makeContext(
   };
 }
 
+// `documentAccess: "dynamic-page"` keeps only the current page in memory, and
+// a getNodeByIdAsync for a node on an UNLOADED page does not fail — it hangs
+// until Figma gives up ~10s in with "Unable to establish connection to Figma
+// after 10 seconds": a network message for a page-loading bug, which sends
+// you debugging the wrong layer entirely. 2500ms is comfortably past any
+// healthy lookup but well under that dead end.
+const LOOKUP_SETTLE_MS = 2500;
+
+// The cure is loadAllPagesAsync, paid once per plugin run — pages stay
+// loaded. Held as a promise so lookups that stall together share the one
+// load; a failed load is forgotten so the next stall can try again.
+let allPagesLoaded: Promise<unknown> | null = null;
+
+/**
+ * figma.getNodeByIdAsync that survives unloaded pages. A lookup still pending
+ * after LOOKUP_SETTLE_MS is assumed to reach into an unloaded page: every
+ * page is loaded once, then the lookup is retried. When the retry also fails,
+ * Figma's own error propagates — at that point it is honest.
+ */
+export async function getNodeByIdSafe(id: string): Promise<BaseNode | null> {
+  const lookup = figma.getNodeByIdAsync(id);
+  // The abandoned lookup keeps pending after the race is lost; swallow its
+  // late rejection so it never surfaces as an unhandled rejection.
+  lookup.catch(() => {});
+  const stalled = Symbol("lookup stalled");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let result: BaseNode | null | typeof stalled;
+  try {
+    result = await Promise.race([
+      lookup,
+      new Promise<typeof stalled>((resolve) => {
+        timer = setTimeout(() => resolve(stalled), LOOKUP_SETTLE_MS);
+      }),
+    ]);
+  } finally {
+    // Every handler lookup goes through here; a timer left behind per call
+    // keeps the plugin's event loop busy for nothing.
+    clearTimeout(timer);
+  }
+  if (result !== stalled) return result;
+  if (!allPagesLoaded) {
+    // `?.`: a runtime without loadAllPagesAsync (older Figma, test mocks)
+    // falls through to the retry — the only load it gets.
+    allPagesLoaded = Promise.resolve(figma.loadAllPagesAsync?.());
+    allPagesLoaded.catch(() => {
+      allPagesLoaded = null;
+    });
+  }
+  await allPagesLoaded;
+  return figma.getNodeByIdAsync(id);
+}
+
 /** Resolve a node id (async, dynamic-page safe) or throw NODE_NOT_FOUND. */
 export async function requireNode(id: unknown): Promise<SceneNode> {
   if (typeof id !== "string" || id.length === 0) {
     throw nodeNotFound(String(id));
   }
-  const node = await figma.getNodeByIdAsync(id);
+  const node = await getNodeByIdSafe(id);
   if (!node || node.type === "DOCUMENT" || node.type === "PAGE") {
     throw nodeNotFound(id);
   }
@@ -44,7 +96,7 @@ export async function requireNode(id: unknown): Promise<SceneNode> {
 /** Resolve a node id but allow PAGE/DOCUMENT for reads. */
 export async function findNode(id: unknown): Promise<BaseNode | null> {
   if (typeof id !== "string" || id.length === 0) return null;
-  return figma.getNodeByIdAsync(id);
+  return getNodeByIdSafe(id);
 }
 
 /** Does a node accept children? */

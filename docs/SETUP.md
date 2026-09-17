@@ -117,7 +117,7 @@ I'm using: Claude Code
 > - **Name your tool** (`Claude Code`, `Codex`, `Antigravity`, `Cursor`, `Claude Desktop`…). Each stores MCP servers in a **different** config file, and an AI can't reliably detect which app it's running inside — a wrong guess writes a config your editor never reads, and nothing appears.
 > - **"Globally" matters.** Registered the default way, the server only works in the folder where you ran the command — so it would work in the MCP folder and nowhere else. See [§7.2](#72-register-the-server-globally).
 
-The AI builds the project, registers the server, and verifies the connection. Then it hands you the two things it **cannot** do:
+The AI builds the project, registers the server, **installs the diagram skills** ([§7.3](#73-install-the-diagram-skills--and-tell-the-user-they-exist)), and verifies the connection. Then it hands you the two things it **cannot** do:
 
 **A. Restart your AI tool** — config changes only take effect on restart.
 
@@ -130,7 +130,7 @@ The AI builds the project, registers the server, and verifies the connection. Th
 
 The panel shows 🟡 **"Connecting…"** until your AI is running, then 🟢 **"Connected"**.
 
-Tell the AI **"done"** and it verifies. It should confirm it drew a test frame and removed it.
+Tell the AI **"done"** and it verifies. It should confirm it drew a test frame and removed it — **and tell you the skills are installed and to use them for diagrams**. If it doesn't mention skills at all, it skipped a step: see [§5 — Drawing diagrams](#drawing-diagrams-not-screens--use-the-skills).
 
 > Prefer doing it by hand? The exact commands per editor are in [§7.2](#72-register-the-server-globally).
 
@@ -163,21 +163,43 @@ You can run **several AI tools in parallel** on one Figma file. The first MCP pr
 
 Full walkthrough: [`MULTI-AGENT.md`](./MULTI-AGENT.md).
 
-### Drawing diagrams, not screens
+### Drawing diagrams, not screens — use the skills
 
-The same server also draws userflows, activity diagrams, sequence diagrams, state machines and ERDs — from a model your AI derives from your spec, with findings about the *model* rather than the picture ("nobody can start this use case", "this record can never leave that state").
+The same server also draws userflows, activity diagrams, sequence diagrams, state machines, ERDs and sitemaps — from a model your AI derives from your spec, with findings about the *model* rather than the picture ("nobody can start this use case", "this record can never leave that state").
 
-For that, the package ships nine skills in **`.claude/skills/`** — eight diagram kinds, plus
+That routing doesn't come from the server. It comes from **six skills** the package ships in **`.claude/skills/`** — one per diagram kind, plus `reqwise-diagram-rules.md`, the method they share (the connection gate, the four levels of "correct", the findings loop, verification):
+
+| Skill | The question it settles |
+|---|---|
+| `/figma-userflow` | What does the user see next? |
+| `/figma-activity` | Who does each step, and what gets handed over? |
+| `/figma-sequence` | What is sent between systems, in what order? |
+| `/figma-state` | What can this one record be, and what moves it? |
+| `/figma-erd` | What do we store, and how do the pieces refer to each other? |
+| `/figma-sitemap` | What pages exist, and how are they nested? |
+
+**Install them once, globally — not per project.** Skills are plain files, not part of the server. An MCP connection gives the model the tools but nothing that says *which* one answers the question in front of it, or which questions to ask before drawing. Without them you still get a picture — it's just hand-rolled, uninterviewed, and nobody reads the findings back.
+
+Easiest — ask the AI, from the unzipped folder:
 
 ```
-Read .claude/skills/README.md and install those skills for me, globally.
+Read .claude/skills/README.md and install those skills for me, globally (~/.claude/skills/).
 ```
 
+By hand (Claude Code / Claude Desktop) — copy the **whole** directory, layout intact, because each `SKILL.md` reaches `../reqwise-diagram-rules.md` by relative path:
 
-**Install them globally, not per project.** Skills are files, not part of the server: an MCP
-connection alone gives the model the tools but nothing that says which one answers the
-question in front of it. A project without them still draws — it just hand-rolls what a
-skill would have routed in one call.
+```bash
+mkdir -p ~/.claude/skills
+cp -R /path/to/reqwise-figma-mcp/.claude/skills/* ~/.claude/skills/
+```
+
+Per project instead of everywhere? Same command with `.claude/skills/` in your project. **Restart your AI tool afterwards** — `/figma-…` only appears on restart.
+
+> **Other editors** (Cursor, Codex, Antigravity) have no `.claude/skills` equivalent. Nothing is lost: point the agent at the file directly — *"read `<mcp folder>/.claude/skills/figma-userflow/SKILL.md` and follow it"* — and it works the same way.
+>
+> The skills expect the server registered as **`reqwise-figma`** (tools appear as `mcp__reqwise-figma__figma_diagram`). Registered under another name? Adjust the `allowed-tools` line in each `SKILL.md`.
+
+Then just call one: `/figma-userflow checkout, from docs/spec.md`.
 
 ## 6. When something goes wrong
 
@@ -201,6 +223,8 @@ The Figma connection isn't working. Please:
 | `Cannot find module …/dist/server/index.js` | build skipped, or wrong path | `npm run build`; re-register with **`scripts/reqwise-mcp.sh`** (full absolute path) |
 | MCP **"not connected" / 0 tools** in Cursor (works in another editor) | mixed spawn (`node dist/…` vs launcher) or stale leader on `:38470` | `npm run install:mcp` · restart all editors · see [`MULTI-AGENT.md`](./MULTI-AGENT.md) |
 | `mode: "follower"` but tools fail / election error on startup | follower cannot read leader token (`$TMPDIR` mismatch) | every editor must use **`reqwise-mcp.sh`**; kill stale server: `pkill -f reqwise-figma-mcp/dist/server` then restart MCP |
+| No `/figma-userflow`, AI hand-rolls diagrams | skills never installed, or installed without a restart | copy `.claude/skills/*` → `~/.claude/skills/`, restart — [§5](#drawing-diagrams-not-screens--use-the-skills) |
+| Skill runs but finds no tools | server registered under a name other than `reqwise-figma` | fix the `allowed-tools` line in each `SKILL.md`, or re-register under `reqwise-figma` |
 | Version mismatch | server rebuilt, plugin stale | rebuild **and re-import the manifest** |
 | Changed settings, still nothing | didn't restart | always restart after config changes |
 
@@ -212,7 +236,7 @@ A light that flickers or goes yellow between actions is normal — it reconnects
 
 # 7. Instructions for the AI
 
-**You are an AI asked to set this up.** Do §7.1–7.2 yourself, hand §7.3 to the user, verify in §7.4. **Setup is done only when `figma_status` returns `pluginConnected: true`.**
+**You are an AI asked to set this up.** Do §7.1–7.3 yourself, hand §7.4 to the user, verify in §7.5. **Setup is done only when `figma_status` returns `pluginConnected: true`** — and only after you've told the user about the skills (§7.3).
 
 Rules: run commands without asking permission each time · skip what's already done · **merge** MCP configs, never rewrite · don't claim success unverified · adapt shell syntax to their OS.
 
@@ -295,7 +319,29 @@ console.log("servers now:",Object.keys(j.mcpServers).join(", "));
 
 The printed list must still contain every server that was there before. Invalid JSON throws without writing — report it, don't hand-repair.
 
-## 7.3 Hand over, then wait
+## 7.3 Install the diagram skills — and tell the user they exist
+
+**Don't skip this and don't wait to be asked.** The server draws; the six skills in `.claude/skills/` decide *which* diagram answers the question, interview for what the spec never wrote down, and read the findings back. A user who never learns they exist ends up with a working MCP and hand-rolled diagrams, and blames the tool.
+
+**Claude Code / Claude Desktop** — copy the whole directory, global scope, layout intact (each `SKILL.md` reaches `../reqwise-diagram-rules.md` by relative path, so a flattened copy breaks):
+
+```bash
+mkdir -p "$HOME/.claude/skills"
+cp -R "$(pwd)/.claude/skills/"* "$HOME/.claude/skills/"
+ls "$HOME/.claude/skills"   # figma-activity figma-erd figma-sequence figma-sitemap figma-state figma-userflow reqwise-diagram-rules.md
+```
+
+Copying is additive — it never touches the user's other skills. Two exceptions worth naming before you overwrite: a same-named `figma-*` folder from an older version, and `README.md`, which lands at `~/.claude/skills/README.md` (drop it from the copy if one is already there).
+
+**Every other editor** — there is no `.claude/skills` equivalent. Don't invent one and don't copy files anywhere. Tell the user the skills live at `<folder>/.claude/skills/` and are used by pointing you at the file: *"read `…/.claude/skills/figma-userflow/SKILL.md` and follow it"*.
+
+They only register as `/figma-…` after the restart in hand-over **A**.
+
+**Then say this to the user — your own words, but don't drop the point:**
+
+> For diagrams, use the skills rather than asking me freehand: `/figma-userflow`, `/figma-activity`, `/figma-sequence`, `/figma-state`, `/figma-erd`, `/figma-sitemap`. They pick the right diagram kind, ask you what the spec left out, and report what's wrong with the *model* — freehand I'd just draw a picture. (UI screens are different: ask for those normally.)
+
+## 7.4 Hand over, then wait
 
 ```bash
 echo "MANIFEST: $(pwd)/plugin/manifest.json"
@@ -303,7 +349,7 @@ echo "MANIFEST: $(pwd)/plugin/manifest.json"
 
 Send them **A** and **B** from [§4](#4-install-it-once) with the real manifest path filled in, then **stop and wait for their reply.** Don't spin tools hoping something changes.
 
-## 7.4 Verify
+## 7.5 Verify
 
 On "done", call `figma_status`. Read `hints` (ordered, most actionable first) and act — don't retry blindly.
 
@@ -323,11 +369,11 @@ const f = await figma.create({ type:"FRAME", name:"Setup check", width:200, heig
 await figma.delete(f.id);
 ```
 
-**Now** report done, and tell them §5 repeats every session.
+**Now** report done, tell them §5 repeats every session, and repeat the skills line from §7.3 if you haven't yet — that's the one part of setup they can't discover on their own.
 
 Other failures: [§6](#6-when-something-goes-wrong). `mode: "follower"` = second IDE window, normal. Port 38470 busy → the server walks 38471–38479 by itself; `figma_status.port` shows the real one. Error codes: [`TOOLS.md`](./TOOLS.md#error-codes).
 
-## 7.5 Then: how to use it
+## 7.6 Then: how to use it
 
 1. `figma_docs({section:"api"})` — **read before your first write.** This is *not* the official Figma Plugin API. Sections: `rules`·`layout`·`api`·`tokens`·`icons`·`recipes`·`style`
 2. `figma_rules()` — existing styles/variables/components, so you reuse instead of hardcoding
@@ -335,6 +381,7 @@ Other failures: [§6](#6-when-something-goes-wrong). `mode: "follower"` = second
 4. **Draw:** `create()` takes ONE spec object with `parentId` *inside* it · FRAME/COMPONENT without an explicit fill is **transparent** · `state` persists across calls
 5. **Verify with data:** `figma_read({op:"layout_audit"})` for overflow/clipping/truncation. Screenshots are for the human's final look, not bug-hunting.
 6. **Multi-screen flow?** Ask first: which screens, what states, platform, light/dark.
+7. **Diagram, not a screen?** Use the matching skill (`/figma-userflow`, `/figma-erd`, …) instead of calling `figma_diagram` freehand — [§7.3](#73-install-the-diagram-skills--and-tell-the-user-they-exist).
 
 > `design.md` (human intent, never overwritten) ≠ `design-kit.md` (machine snapshot, regenerate freely) — [two-file workflow](./RECIPES.md#the-two-file-design-system-workflow).
 

@@ -148,7 +148,10 @@ export async function searchNodes(ctx: HandlerContext): Promise<unknown> {
   let scope: BaseNode & ChildrenMixin = figma.currentPage;
   if (typeof p.nodeId === "string") {
     const n = await requireNode(p.nodeId);
-    if ("children" in n) scope = n as BaseNode & ChildrenMixin;
+    // A leaf holds nothing to search; falling back to the whole page answered
+    // a question the caller did not ask.
+    if (!("children" in n)) return { count: 0, nodes: [] };
+    scope = n as BaseNode & ChildrenMixin;
   }
 
   const results: unknown[] = [];
@@ -224,6 +227,8 @@ export async function scanNodesByTypes(ctx: HandlerContext): Promise<unknown> {
   let root: BaseNode & ChildrenMixin;
   if (typeof p.nodeId === "string") {
     const n = await requireNode(p.nodeId);
+    // A leaf (TEXT, RECTANGLE) has no findAllWithCriteria — it threw INTERNAL.
+    if (!("children" in n)) return { count: 0, nodes: [] };
     root = n as BaseNode & ChildrenMixin;
   } else {
     root = figma.currentPage;

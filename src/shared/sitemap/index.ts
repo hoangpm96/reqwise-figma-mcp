@@ -25,7 +25,7 @@ export function buildSitemap(spec: SitemapSpec): SitemapBuild {
 
   // The compact form is an alternative INPUT, not a second model.
   let pages: PageSpec[] = spec.pages ?? [];
-  if (spec.text) {
+  if (typeof spec.text === "string" && spec.text.trim()) {
     if (pages.length) {
       warnings.push("Both `text` and `pages` were given — the text won. Pass one or the other.");
     }

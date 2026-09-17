@@ -27,7 +27,7 @@ export function buildActivity(spec: ActivitySpec): ActivityBuild {
   let nodes = spec.nodes ?? [];
   let edges = spec.edges ?? [];
   let rankdir = options.rankdir;
-  if (spec.text) {
+  if (typeof spec.text === "string" && spec.text.trim()) {
     if (nodes.length) {
       warnings.push("Both `text` and `nodes` were given — the text won. Pass one or the other.");
     }

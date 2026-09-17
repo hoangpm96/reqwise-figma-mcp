@@ -155,9 +155,15 @@ export interface RoutedActivity {
   edges: DrawEdge[];
   /** Edge ids whose step is gone from the canvas. */
   dropped: string[];
+  /**
+   * What the router could not do the way it was asked — today, a line that had
+   * to be drawn straight across because there was no gap to cross in and the
+   * detour around the outside was turned off.
+   */
+  warnings: string[];
 }
 
-type Shape = "straight" | "corridor" | "cross" | "gutter" | "sameRank" | "self" | "back";
+type Shape = "straight" | "direct" | "corridor" | "cross" | "gutter" | "sameRank" | "self" | "back";
 
 interface Wire extends EdgeInput {
   id: string;
@@ -232,7 +238,7 @@ export function routeActivity(input: RouteInput): RoutedActivity {
       labelAt: null,
     });
   });
-  if (!input.steps.length || !wires.length) return { edges: [], dropped };
+  if (!input.steps.length || !wires.length) return { edges: [], dropped, warnings: [] };
 
   const ranks = rankSteps(input.steps, ax);
   for (const w of wires) {
@@ -242,7 +248,8 @@ export function routeActivity(input: RouteInput): RoutedActivity {
 
   spreadDecisions(wires, byId, ax);
   assignPorts(wires, ax);
-  classify(wires, input.steps, ranks, ax, input.gutter !== false);
+  const warnings: string[] = [];
+  classify(wires, input.steps, ranks, ax, input.gutter !== false, warnings);
   assignCorridors(wires, ranks);
   assignGutterLanes(wires, ax);
   buildPaths(wires, ranks, laneExtent(input, ax), ax);
@@ -277,7 +284,7 @@ export function routeActivity(input: RouteInput): RoutedActivity {
     });
     if (drawn) out.push(drawn);
   }
-  return { edges: out, dropped };
+  return { edges: out, dropped, warnings };
 }
 
 // ----------------------------------------------------------------- ranks ----
@@ -459,7 +466,11 @@ function assignPorts(wires: Wire[], ax: Axis): void {
       });
     }
     for (const key of ["low", "high"] as const) {
-      const slots = f[key];
+      // Same rule as the end faces above: a wire leaving through a chosen
+      // connection point is not on this face, and counting it slid every
+      // sibling off the middle. A self-loop is the exception — it ignores
+      // ports and is always drawn off this face from its own slot.
+      const slots = f[key].filter((slot) => !chosen(slot) || slot.w.from === slot.w.to);
       if (!slots.length) continue;
       slots.sort((a, b) => a.sortAt - b.sortAt);
       const m = slots.length;
@@ -485,6 +496,7 @@ function classify(
   ranks: Ranks,
   ax: Axis,
   gutterAllowed: boolean,
+  warnings: string[],
 ): void {
   const clear = (cross: number, aFrom: number, aTo: number, skip: Wire): boolean => {
     const lo = Math.min(aFrom, aTo);
@@ -596,6 +608,18 @@ function classify(
     if (!gutterAllowed && last !== null) {
       w.shape = "corridor";
       w.corridorRank = last;
+      continue;
+    }
+    // No gap at all between the two ranks — the boxes overlap along the flow,
+    // usually because one was dragged. Falling through to the gutter here
+    // drew exactly the walk around the picture the caller turned off, so the
+    // line goes across directly instead, and the reader is told it may pass
+    // over a shape.
+    if (!gutterAllowed) {
+      w.shape = "direct";
+      warnings.push(
+        `${w.from} → ${w.to}: no gap between the two to route through, and the detour around the outside is off — drawn straight across, so it may pass over another shape. Move one of them apart along the flow.`,
+      );
       continue;
     }
     w.shape = "gutter";
@@ -725,13 +749,24 @@ function buildPaths(wires: Wire[], ranks: Ranks, lanes: { min: number; max: numb
     };
 
     if (w.shape === "self") {
+      const diamond = w.from_.kind === "decision";
+      // A diamond's side is two slants meeting at a tip, not a flat face: the
+      // loop's second end is kept close to the tip and brought in to meet the
+      // slant, or it stops in empty canvas beside the shape.
+      const spread = diamond ? Math.min(20, ax.aLen(s) / 4) : 20;
       const a1 = Math.min(w.portOut, w.portIn);
-      const a2 = Math.max(w.portOut, w.portIn) + (w.portOut === w.portIn ? 20 : 0);
+      const a2 = Math.max(w.portOut, w.portIn) + (w.portOut === w.portIn ? spread : 0);
+      const outline = (a: number): number => {
+        const halfA = ax.aLen(s) / 2;
+        if (!diamond || halfA <= 0) return ax.c1(s);
+        const off = Math.min(1, Math.abs(a - ax.aMid(s)) / halfA);
+        return ax.cMid(s) + (ax.cLen(s) / 2) * (1 - off);
+      };
       const cOut = ax.c1(s) + SELF_OUT;
-      push(a1, ax.c1(s));
+      push(a1, outline(a1));
       push(a1, cOut);
       push(a2, cOut);
-      push(a2, ax.c1(s));
+      push(a2, outline(a2));
       w.points = simplify(P);
       continue;
     }
@@ -754,6 +789,20 @@ function buildPaths(wires: Wire[], ranks: Ranks, lanes: { min: number; max: numb
     if (w.shape === "straight") {
       push(faceAlong(w.from_, w.portOut, ax, true), w.portOut);
       push(faceAlong(w.to_, w.portIn, ax, false), w.portIn);
+      w.points = simplify(P);
+      continue;
+    }
+
+    if (w.shape === "direct") {
+      // A single elbow halfway between the two faces, so it stays orthogonal
+      // when the ports are not level.
+      const a1 = faceAlong(w.from_, w.portOut, ax, true);
+      const a2 = faceAlong(w.to_, w.portIn, ax, false);
+      const mid = (a1 + a2) / 2;
+      push(a1, w.portOut);
+      push(mid, w.portOut);
+      push(mid, w.portIn);
+      push(a2, w.portIn);
       w.points = simplify(P);
       continue;
     }

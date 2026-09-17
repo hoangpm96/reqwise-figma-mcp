@@ -151,6 +151,7 @@ Read every warning. The ones specific to this kind:
 | Decision with fewer than two ways out | a question with one answer is not a question |
 | Fork that never joins | nobody waits for the parallel work |
 | Dead end that is not `end`/`external` | the process stops there and nobody said so |
+| End step with a way out / arrow INTO a start step | the terminal is not really one: a step was marked `end`/`start` by mistake, or the arrow belongs elsewhere |
 | Lane with no steps | the role does not belong on this diagram |
 
 Fix the model, re-dry-run, then draw.

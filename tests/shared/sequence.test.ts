@@ -493,3 +493,51 @@ describe("sequence branch pairing", () => {
     expect(warnings.filter((w) => w.indexOf("no call to answer") >= 0)).toEqual([]);
   });
 });
+
+describe("sequence nested fragments", () => {
+  // Six loops over the same self message: each one nests inside the one
+  // written before it, so each steps in another level.
+  const deep = (label: string, messages: SequenceSpec["messages"], on: string[]) =>
+    buildSequence({
+      title: "Deep nesting",
+      participants: [
+        { id: "a", name: "A" },
+        { id: "b", name: "B" },
+      ],
+      messages,
+      fragments: Array.from({ length: 6 }, (_, i) => ({
+        kind: "loop" as const,
+        label: `${label}${i}`,
+        messages: on,
+      })),
+    });
+
+  it("never collapses a deep stack, in the layout or the reflow", () => {
+    // Uncapped, the widths went 68, 52, 36, 20, 4, -12 — Figma throws on the
+    // last resize. Capped at the tab alone, the deeper boxes fell back onto the
+    // outermost box's edges. Now every level keeps its own edges and a width.
+    const built = deep("r", [{ id: "m1", from: "a", to: "a", label: "retry" }], ["m1"]);
+    const g = built.draw.graph!;
+    const reflowed = reflowSequence(g, new Map(g.participants.map((p) => [p.id, { ...p.at }])));
+    for (const fragments of [built.draw.fragments, reflowed.fragments]) {
+      expect(fragments).toHaveLength(6);
+      const byDepth = [...fragments].sort((p, q) => p.at.y - q.at.y);
+      for (let i = 0; i < byDepth.length; i++) {
+        expect(byDepth[i]!.at.w).toBeGreaterThanOrEqual(12);
+        if (i) expect(byDepth[i]!.at.x, `level ${i} shares its parent's left edge`).toBeGreaterThan(byDepth[i - 1]!.at.x);
+      }
+      // The outer levels, where there is room, still fit their tab.
+      expect(byDepth[0]!.at.w).toBeGreaterThanOrEqual(byDepth[0]!.tabW);
+    }
+    expect(reflowed.fragments).toEqual(built.draw.fragments);
+  });
+
+  it("still steps nested boxes in while there is room", () => {
+    const built = deep("x", [{ id: "m1", from: "a", to: "b", label: "call" }], ["m1"]);
+    const widths = built.draw.fragments.map((f) => f.at.w);
+    expect(widths[1]).toBeLessThan(widths[0]!);
+    expect(Math.min(...widths)).toBeGreaterThanOrEqual(
+      Math.max(...built.draw.fragments.map((f) => f.tabW)),
+    );
+  });
+});

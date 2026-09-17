@@ -88,10 +88,15 @@ function sidesFor(a: Placement, b: Placement, horizontal: boolean): [Side, Side]
 /**
  * Where along a face the line attaches: the row that implements the
  * relationship, when there is one and the face runs down the side of the box.
+ *
+ * The column is found the way the checker finds it — trimmed, any case. An
+ * exact match here let `fromField:"USER_ID"` pass the check against `user_id`
+ * and then quietly attach to the middle of the box.
  */
-function rowAt(entity: Anchored, field: string | undefined, side: Side): number {
+export function rowAt(entity: Anchored, field: string | undefined, side: Side): number {
   if (!field || side === "top" || side === "bottom") return 0.5;
-  const row = entity.rows.find((r) => r.name === field);
+  const want = field.trim().toLowerCase();
+  const row = entity.rows.find((r) => r.name.trim().toLowerCase() === want);
   if (!row) return 0.5;
   const centre = row.y + row.h / 2;
   return Math.min(0.95, Math.max(0.05, centre / entity.at.h));

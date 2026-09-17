@@ -10,18 +10,22 @@
  *   - standard globals (Math, JSON, Object, Array, Promise, Date, ...).
  * Banned: require, process, fetch, setTimeout/setInterval, eval, Function.
  *
- * The vm timeout (VM_TIMEOUT_MS) is a *whole-program* budget and must never
- * fire before an in-flight bridge op — the bridge owns per-op timeouts. We run
- * the code with a generous vm timeout only as a guard against pure-CPU
- * infinite loops in the user code itself; bridge waits are async and not
- * counted by vm's synchronous timeout.
+ * Why a worker: `vm`'s timeout only bounds SYNCHRONOUS execution — a
+ * `while(true){}` that starts AFTER an `await` resumes on the host event loop
+ * with no timeout able to fire, and used to freeze the whole server (every
+ * Figma channel, every session). Inside a worker the loop blocks only that
+ * thread; the parent's deadline still fires and `worker.terminate()` kills
+ * it. The invoke boundary was already pure JSON-RPC (method name + JSON args
+ * in, JSON envelope out), so moving the context across a thread changed the
+ * transport, not the trust boundary.
  *
  * figma.batch(ops) is special: it splits into BATCH_CHUNK_SIZE chunks streamed
  * sequentially, each chunk a separate bridge dispatch. Progress resets the
  * timeout; per-item try/catch on the plugin side yields exact per-index errors;
  * partial results are committed (no rollback).
  */
-import vm from "node:vm";
+import { Worker } from "node:worker_threads";
+import { setMaxListeners } from "node:events";
 import {
   BATCH_CHUNK_SIZE,
   OP_TIMEOUTS,
@@ -43,7 +47,13 @@ import { runUserflow } from "./userflow.js";
  * figma.* method so validation is never skipped. Accepts server ops too
  * (list_channels) — index.ts answers those from bridge state.
  */
-export type OpRunner = (op: AnyOperation, params: Record<string, unknown>) => Promise<BridgeResponse>;
+export type OpRunner = (
+  op: AnyOperation,
+  params: Record<string, unknown>,
+  /** Aborted when the figma_write that issued the op has given up waiting —
+   * the runner hands it to the bridge so a still-queued op is dropped. */
+  ctx?: { signal: AbortSignal },
+) => Promise<BridgeResponse>;
 
 export interface ExecutorDeps {
   runOp: OpRunner;
@@ -163,72 +173,73 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
  */
 const writeChains = new WeakMap<Session, Promise<unknown>>();
 
-export function executeWrite(code: string, session: Session, deps: ExecutorDeps): Promise<WriteResult> {
+export interface ExecuteWriteOpts {
+  /** Override the execution budget (tests use a short budget). */
+  timeoutMs?: number;
+}
+
+export function executeWrite(
+  code: string,
+  session: Session,
+  deps: ExecutorDeps,
+  opts?: ExecuteWriteOpts,
+): Promise<WriteResult> {
   const prev = writeChains.get(session) ?? Promise.resolve();
-  const next = prev.then(() => executeWriteInner(code, session, deps));
+  const next = prev.then(() => executeWriteInner(code, session, deps, opts));
   // Store a rejection-proof tail so one failed write never wedges the chain.
   writeChains.set(session, next.catch(() => undefined));
   return next;
 }
 
-async function executeWriteInner(code: string, session: Session, deps: ExecutorDeps): Promise<WriteResult> {
+async function executeWriteInner(
+  code: string,
+  session: Session,
+  deps: ExecutorDeps,
+  opts?: ExecuteWriteOpts,
+): Promise<WriteResult> {
+  const timeoutMs = opts?.timeoutMs ?? VM_TIMEOUT_MS;
   const logs: string[] = [];
   const warnings: string[] = [];
 
-  // Values crossing OUT of the context (console args, the result) are
-  // stringified INSIDE the context under a CPU budget — JSON.stringify runs
-  // caller-supplied toJSON/getters, which on the host would be unbounded (a
-  // `while(true){}` toJSON froze the server). Bound late: the context doesn't
-  // exist yet. The pre-context fallback is only reachable in tests.
-  let serToText: (v: unknown) => string = safeStringify;
-  let serResult: (v: unknown) => unknown = (v) => {
-    if (v === undefined) return undefined;
-    try {
-      return JSON.parse(JSON.stringify(v));
-    } catch {
-      return String(v);
-    }
-  };
-
-  const console_ = {
-    log: (...a: unknown[]) => logs.push(fmt(a, serToText)),
-    info: (...a: unknown[]) => logs.push(fmt(a, serToText)),
-    warn: (...a: unknown[]) => logs.push(`WARN: ${fmt(a, serToText)}`),
-    error: (...a: unknown[]) => logs.push(`ERROR: ${fmt(a, serToText)}`),
-    debug: (...a: unknown[]) => logs.push(fmt(a, serToText)),
-  };
-
   // Host-side writes to session.state made DURING this call (setupTokens'
-  // token map). The sandbox works on a context-realm copy of session.state
+  // token map). The worker's sandbox works on a JSON copy of session.state
   // that is synced back on exit; overlay keys re-apply on top of that copy so
   // host-side writes survive the sync.
   const stateOverlay: Record<string, unknown> = {};
-  const figmaProxy = buildFigmaProxy(session, deps, warnings, stateOverlay);
+  // Every op this call issues carries one abort signal. When the budget runs
+  // out the caller is told PLUGIN_TIMEOUT and moves on; an op still sitting in
+  // a bridge queue must not run afterwards on whatever window turns up.
+  const abort = new AbortController();
+  // One listener per op still waiting; a Promise.all over a dozen reads is
+  // normal, and the default cap of 10 printed MaxListenersExceededWarning.
+  setMaxListeners(0, abort.signal);
+  const scopedDeps: ExecutorDeps = {
+    ...deps,
+    runOp: (op, params) => deps.runOp(op, params, { signal: abort.signal }),
+  };
+  const figmaProxy = buildFigmaProxy(session, scopedDeps, warnings, stateOverlay);
 
   // ---- realm-boundary design (why this looks the way it does) ----
   //
   // node:vm gives a separate REALM, not a separate trust domain: any host
   // object reachable from sandbox code hands it the host realm's Function
   // through `value.constructor.constructor`, which then reads the real
-  // `process` — a full escape. Scrubbing the injected roots was not enough:
-  // values that cross the boundary AT RUNTIME leak the same way — the object
-  // a figma.* call resolves, the Error a failed op throws, the host Error a
-  // banned-global stub throws, even the Promise a call returns. So the rule:
+  // `process` — a full escape. So the rule, unchanged in the worker:
   //
-  //   NOTHING host-realm may become reachable from user code. Only
+  //   NOTHING worker-realm may become reachable from user code. Only
   //   primitives (JSON strings) cross the boundary; everything else is
-  //   rebuilt inside the context realm by the bootstrap below.
+  //   rebuilt inside the context realm by BOOTSTRAP_SRC.
   //
-  // - `__invoke` always resolves a JSON envelope string (never rejects, never
+  // - `__invoke` resolves a JSON envelope string (never rejects, never
   //   returns objects) and is removed from the globals by the bootstrap —
-  //   user code can never hold its host Promise.
+  //   user code can never hold its Promise. In the worker it is a postMessage
+  //   relay to `invoke` here, which does the real dispatch.
   // - `figma` is rebuilt inside the context as async wrappers that `await`
-  //   the bridge internally and re-throw a context-realm Error (code/hint).
+  //   the relay internally and re-throw a context-realm Error (code/hint).
   // - `state` is a JSON snapshot parsed inside the context; the wrapped IIFE
-  //   syncs it back through `__syncState` in `finally`.
-  // - banned globals are context stubs — a host-thrown Error would itself
-  //   leak the host realm.
-  // - `console` and `__syncState` are the only host values left reachable:
+  //   syncs it back through `__syncState` (a posted message) in `finally`.
+  // - banned globals are context stubs — a thrown Error must be context-realm.
+  // - `console` and `__syncState` are the only outside values left reachable:
   //   scrubbed by the bootstrap and returning only primitives.
   const invoke = async (method: string, argsJson: string): Promise<string> => {
     try {
@@ -272,14 +283,331 @@ async function executeWriteInner(code: string, session: Session, deps: ExecutorD
     /* unserializable prior state — this call starts from {} */
   }
 
-  // Explicit, minimal global surface. Anything not listed is undefined in the
-  // sandbox. The __-prefixed entries are bootstrap inputs consumed below;
-  // figma/state and the banned globals are installed inside the context.
-  const sandbox: Record<string, unknown> = {
+  session.writeCount++;
+
+  // The worker rebuilds the figma surface from DATA: method names become
+  // context-realm async wrappers around the relay; plain values (the `mixed`
+  // sentinel) cross as a JSON copy.
+  const figmaMethods: string[] = [];
+  const figmaData: Record<string, unknown> = {};
+  for (const name of Object.getOwnPropertyNames(figmaProxy)) {
+    const v = figmaProxy[name];
+    if (typeof v === "function") figmaMethods.push(name);
+    else figmaData[name] = v;
+  }
+  let figmaDataJson = "{}";
+  try {
+    figmaDataJson = JSON.stringify(figmaData);
+  } catch {
+    /* unserializable data props — the sandbox gets none */
+  }
+
+  const worker = new Worker(WRITE_WORKER_SOURCE, {
+    eval: true,
+    workerData: { code, stateJson, figmaMethods, figmaDataJson, timeoutMs },
+  });
+  // A wedged worker must not pin the process open — terminate() is the cleanup.
+  worker.unref();
+
+  interface DoneMsg {
+    t: "done";
+    ok: boolean;
+    result?: unknown;
+    error?: { code: ErrorCode; message: string; hint?: string };
+  }
+  type WorkerMsg =
+    | { t: "invoke"; seq: number; method: string; argsJson: string }
+    | { t: "state"; json: string }
+    | { t: "log"; line: string }
+    | DoneMsg;
+
+  const done = new Promise<DoneMsg | null>((resolve) => {
+    let finished = false;
+    const finish = (m: DoneMsg | null) => {
+      if (!finished) {
+        finished = true;
+        resolve(m);
+      }
+    };
+    worker.on("message", (m: WorkerMsg) => {
+      if (m.t === "invoke") {
+        void invoke(m.method, m.argsJson).then((env) => {
+          try {
+            worker.postMessage({ t: "r", seq: m.seq, env });
+          } catch {
+            /* worker already gone */
+          }
+        });
+      } else if (m.t === "state") {
+        syncState(m.json);
+      } else if (m.t === "log") {
+        logs.push(m.line);
+      } else if (m.t === "done") {
+        finish(m);
+      }
+    });
+    worker.on("error", (e) =>
+      finish({
+        t: "done",
+        ok: false,
+        error: { code: ErrorCode.SANDBOX_ERROR, message: `figma_write worker failed: ${e.message}` },
+      }),
+    );
+    worker.on("exit", (code) => {
+      if (code !== 0) {
+        finish({
+          t: "done",
+          ok: false,
+          error: { code: ErrorCode.SANDBOX_ERROR, message: `figma_write worker exited (code ${code}).` },
+        });
+      } else {
+        finish(null);
+      }
+    });
+  });
+
+  // The deadline covers spawn + the whole run. The worker's own vm timeout
+  // reports sync-phase loops first (the richer error); terminate() is what
+  // makes a post-await CPU loop survivable — it blocks only the worker thread,
+  // so this deadline still fires and kills it. Slack gives the in-worker
+  // timeout room to report before the parent steps in.
+  let msg: DoneMsg | null;
+  let terminated = false;
+  try {
+    msg = await withDeadline(done, timeoutMs + WORKER_SLACK_MS);
+  } catch {
+    terminated = true;
+    msg = null;
+    abort.abort();
+  }
+  try {
+    await worker.terminate();
+  } catch {
+    /* already gone */
+  }
+
+  if (msg === null) {
+    return {
+      ok: false,
+      logs,
+      warnings,
+      error: terminated
+        ? {
+            code: ErrorCode.PLUGIN_TIMEOUT,
+            message: `figma_write exceeded the ${timeoutMs}ms budget — the sandbox worker was terminated.`,
+            hint: "A synchronous loop after an await can block the sandbox — bound every loop, or split the work across calls.",
+          }
+        : {
+            code: ErrorCode.SANDBOX_ERROR,
+            message: "figma_write worker exited without a result.",
+            hint: "Retry the call; if it persists, the sandbox worker crashed on this code.",
+          },
+    };
+  }
+  if (!msg.ok) {
+    return {
+      ok: false,
+      logs,
+      warnings,
+      error: msg.error ?? { code: ErrorCode.SANDBOX_ERROR, message: "figma_write failed." },
+    };
+  }
+  return { ok: true, result: msg.result, logs, warnings };
+}
+
+/** Grace on top of VM_TIMEOUT_MS for worker spawn + the in-worker vm timeout. */
+const WORKER_SLACK_MS = 3000;
+
+/**
+ * The sandbox bootstrap, run inside the worker's vm context before user code.
+ * See the realm-boundary comment in executeWriteInner for why it is shaped
+ * this way; the only worker-specific part is that the figma surface arrives
+ * as data (`__figmaMethods`/`__figmaData`) instead of a host object.
+ */
+const BOOTSTRAP_SRC = `(() => {
+  // Capture context intrinsics BEFORE they are shadowed below.
+  const CtxObjectProto = Object.prototype;
+  const CtxFunctionProto = Function.prototype;
+  const __inv = __invoke;
+  const methods = __figmaMethods;
+  const dataJson = __figmaData;
+  const stateJson = __stateData;
+
+  // Outside values that must not stay reachable — an outside function's
+  // return value is an outside object, and .constructor.constructor on any
+  // outside value is the worker realm's Function (realm escape).
+  __invoke = undefined;
+  __figmaMethods = undefined;
+  __figmaData = undefined;
+  __stateData = undefined;
+
+  // Banned globals as context-realm stubs — a thrown Error must be
+  // context-realm or it leaks the worker realm.
+  const ban = (name) => () => {
+    const e = new Error('"' + name + '" is not available in figma_write.');
+    e.code = "SANDBOX_ERROR";
+    e.hint = "Sandbox bans require/process/fetch/timers/eval. Use figma.* ops and plain JS only.";
+    throw e;
+  };
+  require = ban("require");
+  process = ban("process");
+  fetch = ban("fetch");
+  setTimeout = ban("setTimeout");
+  setInterval = ban("setInterval");
+  setImmediate = ban("setImmediate");
+  eval = ban("eval");
+  Function = ban("Function");
+  globalThis = undefined;
+
+  // A poison constructor: '.constructor' reached on a scrubbed value lands
+  // here — a context-realm function, never the outside one. The scrub
+  // recursion poisons Poison itself, so Poison.constructor is Poison and the
+  // chain dead-ends.
+  const Poison = function Poison() { throw new TypeError("blocked"); };
+  const seen = new Set();
+  const scrub = (v) => {
+    if (v === null || (typeof v !== "object" && typeof v !== "function")) return;
+    if (seen.has(v)) return;
+    seen.add(v);
+    try { Object.setPrototypeOf(v, typeof v === "function" ? CtxFunctionProto : CtxObjectProto); } catch (_) {}
+    try {
+      Object.defineProperty(v, "constructor", {
+        value: Poison, writable: false, enumerable: false, configurable: false,
+      });
+    } catch (_) {}
+    for (const k of Object.getOwnPropertyNames(v)) {
+      let d; try { d = Object.getOwnPropertyDescriptor(v, k); } catch (_) { continue; }
+      if (!d) continue;
+      if (d.value && (typeof d.value === "object" || typeof d.value === "function")) scrub(d.value);
+      if (typeof d.get === "function") scrub(d.get);
+      if (typeof d.set === "function") scrub(d.set);
+    }
+  };
+  scrub(console);
+  scrub(__syncState);
+  scrub(__inv);
+
+  // state: a context-realm copy of the session object. The wrapped IIFE
+  // syncs it back to the parent in 'finally' via __syncState.
+  try { state = JSON.parse(stateJson || "{}"); } catch (_) { state = {}; }
+  if (state === null || typeof state !== "object" || Array.isArray(state)) state = {};
+
+  // figma: every method becomes a context-realm async wrapper around the
+  // relay. The Promise __inv returns is awaited INSIDE the wrapper and never
+  // reaches user code; only the resolved JSON string (a primitive — no
+  // prototype chain, nothing to escape through) crosses.
+  const callMethod = async (m, args) => {
+    const env = JSON.parse(await __inv(m, JSON.stringify(args)));
+    if (env && env.ok === true) return env.result;
+    const info = (env && env.error) || {};
+    const err = new Error(typeof info.message === "string" ? info.message : ("figma." + m + " failed"));
+    if (typeof info.code === "string") err.code = info.code;
+    if (typeof info.hint === "string") err.hint = info.hint;
+    throw err;
+  };
+  const rebuilt = {};
+  for (const m of methods) {
+    rebuilt[m] = ((mm) => (...args) => callMethod(mm, args))(m);
+  }
+  try {
+    const data = JSON.parse(dataJson || "{}");
+    for (const k of Object.keys(data)) rebuilt[k] = data[k];
+  } catch (_) {}
+  try {
+    Object.defineProperty(rebuilt, "constructor", {
+      value: Poison, writable: false, enumerable: false, configurable: false,
+    });
+    Object.defineProperty(state, "constructor", {
+      value: Poison, writable: false, enumerable: false, configurable: false,
+    });
+  } catch (_) {}
+  // Unknown-method trap, mirroring the host proxy's DX guard: an unknown name
+  // resolves to a wrapper so the host-side stub produces the mapped,
+  // actionable error. Non-call probes (then/toJSON/symbols) stay undefined so
+  // normal JS semantics hold.
+  figma = new Proxy(rebuilt, {
+    get(t, prop) {
+      if (typeof prop === "symbol") return Reflect.get(t, prop);
+      const v = t[prop];
+      if (v !== undefined) return v;
+      if (prop === "then" || prop === "toJSON" || prop === "constructor" || prop === "inspect") {
+        return undefined;
+      }
+      return (...args) => callMethod(String(prop), args);
+    },
+  });
+})();`;
+
+/**
+ * The worker program, evaluated via `new Worker(src, { eval: true })` — plain
+ * CJS JS, no imports, because eval workers cannot load the repo's ESM/TS.
+ * Embedding it keeps ONE source of truth for the sandbox rules (BOOTSTRAP_SRC
+ * is shared verbatim) and lets the same path run in tests, where no dist/
+ * bundle exists to point a Worker at.
+ */
+export const WRITE_WORKER_SOURCE = `(function () {
+  "use strict";
+  const { parentPort, workerData } = require("node:worker_threads");
+  const vm = require("node:vm");
+  const VM_TIMEOUT_MS = ${VM_TIMEOUT_MS};
+  const BOOTSTRAP_SRC = ${JSON.stringify(BOOTSTRAP_SRC)};
+  const { code, stateJson, figmaMethods, figmaDataJson } = workerData;
+  const TIMEOUT_MS =
+    typeof workerData.timeoutMs === "number" && workerData.timeoutMs > 0
+      ? workerData.timeoutMs
+      : VM_TIMEOUT_MS;
+
+  // ---- invoke relay: the one JSON-RPC channel to the parent ----
+  const pending = new Map();
+  let seq = 0;
+  parentPort.on("message", (m) => {
+    if (m && m.t === "r") {
+      const p = pending.get(m.seq);
+      if (p) {
+        pending.delete(m.seq);
+        p(m.env);
+      }
+    }
+  });
+  const invoke = (method, argsJson) =>
+    new Promise((res) => {
+      const id = ++seq;
+      pending.set(id, res);
+      parentPort.postMessage({ t: "invoke", seq: id, method, argsJson });
+    });
+  const syncState = (json) => parentPort.postMessage({ t: "state", json });
+
+  // console lines stream to the parent so partial output survives a wedge —
+  // on termination the caller still sees how far the code got.
+  const post = (m) => {
+    try {
+      parentPort.postMessage(m);
+    } catch (_) {}
+  };
+  let serToText = (v) => {
+    try {
+      return JSON.stringify(v);
+    } catch {
+      return String(v);
+    }
+  };
+  const fmtArgs = (a) => a.map((x) => (typeof x === "string" ? x : serToText(x))).join(" ");
+  const console_ = {
+    log: (...a) => post({ t: "log", line: fmtArgs(a) }),
+    info: (...a) => post({ t: "log", line: fmtArgs(a) }),
+    warn: (...a) => post({ t: "log", line: "WARN: " + fmtArgs(a) }),
+    error: (...a) => post({ t: "log", line: "ERROR: " + fmtArgs(a) }),
+    debug: (...a) => post({ t: "log", line: fmtArgs(a) }),
+  };
+
+  // Explicit, minimal global surface — the same list the in-process sandbox
+  // used; anything not listed is undefined inside the context.
+  const sandbox = {
     __invoke: invoke,
     __syncState: syncState,
     __stateData: stateJson,
-    __hostFigma: figmaProxy,
+    __figmaMethods: figmaMethods,
+    __figmaData: figmaDataJson,
     console: console_,
     figma: undefined,
     state: undefined,
@@ -290,158 +618,33 @@ async function executeWriteInner(code: string, session: Session, deps: ExecutorD
     setInterval: undefined,
     setImmediate: undefined,
     globalThis: undefined,
-    // `eval`/`Function` are intentionally NOT pre-shadowed: the bootstrap
-    // needs the real context Function.prototype before installing its stubs.
+    // eval/Function intentionally NOT pre-shadowed: the bootstrap needs the
+    // real context Function.prototype before installing its stubs.
   };
-
   const context = vm.createContext(sandbox, { name: "figma_write" });
+  new vm.Script(BOOTSTRAP_SRC, { filename: "figma_write.bootstrap.js" }).runInContext(context);
 
-  const bootstrap = new vm.Script(
-    `(() => {
-      // Capture context intrinsics BEFORE they are shadowed below.
-      const CtxObjectProto = Object.prototype;
-      const CtxFunctionProto = Function.prototype;
-      const __inv = __invoke;
-      const hostFigma = __hostFigma;
-      const stateJson = __stateData;
-
-      // Host values that must not stay reachable — a host function's return
-      // value is a host object, and .constructor.constructor on any host
-      // value is the HOST Function (realm escape). __syncState is the only
-      // bridge left in place: the wrapper calls it in finally, it takes and
-      // returns only primitives, and it is scrubbed below.
-      __invoke = undefined;
-      __hostFigma = undefined;
-      __stateData = undefined;
-
-      // Banned globals as context-realm stubs — a host-thrown Error would
-      // itself leak the host realm.
-      const ban = (name) => () => {
-        const e = new Error('"' + name + '" is not available in figma_write.');
-        e.code = "SANDBOX_ERROR";
-        e.hint = "Sandbox bans require/process/fetch/timers/eval. Use figma.* ops and plain JS only.";
-        throw e;
-      };
-      require = ban("require");
-      process = ban("process");
-      fetch = ban("fetch");
-      setTimeout = ban("setTimeout");
-      setInterval = ban("setInterval");
-      setImmediate = ban("setImmediate");
-      eval = ban("eval");
-      Function = ban("Function");
-      globalThis = undefined;
-
-      // A poison constructor: '.constructor' reached on a scrubbed value
-      // lands here — a context-realm function, never the host one. The scrub
-      // recursion poisons Poison itself, so Poison.constructor is Poison and
-      // the chain dead-ends.
-      const Poison = function Poison() { throw new TypeError("blocked"); };
-      const seen = new Set();
-      const scrub = (v) => {
-        if (v === null || (typeof v !== "object" && typeof v !== "function")) return;
-        if (seen.has(v)) return;
-        seen.add(v);
-        // Reparent onto the context realm's prototype so the host realm is
-        // unreachable through [[Prototype]].
-        try { Object.setPrototypeOf(v, typeof v === "function" ? CtxFunctionProto : CtxObjectProto); } catch (_) {}
-        // Own, non-configurable 'constructor' — can't be redefined away.
-        try {
-          Object.defineProperty(v, "constructor", {
-            value: Poison, writable: false, enumerable: false, configurable: false,
-          });
-        } catch (_) {}
-        // Recurse into EVERY object/function-valued own prop plus accessors —
-        // a host object nested a level deep is the same escape hatch.
-        for (const k of Object.getOwnPropertyNames(v)) {
-          let d; try { d = Object.getOwnPropertyDescriptor(v, k); } catch (_) { continue; }
-          if (!d) continue;
-          if (d.value && (typeof d.value === "object" || typeof d.value === "function")) scrub(d.value);
-          if (typeof d.get === "function") scrub(d.get);
-          if (typeof d.set === "function") scrub(d.set);
-        }
-      };
-      scrub(console);
-      scrub(__syncState);
-      scrub(__inv);
-
-      // state: a context-realm copy of the session object. The wrapped IIFE
-      // syncs it back to the host in 'finally' via __syncState.
-      try { state = JSON.parse(stateJson || "{}"); } catch (_) { state = {}; }
-      if (state === null || typeof state !== "object" || Array.isArray(state)) state = {};
-
-      // figma: every method becomes a context-realm async wrapper around the
-      // host bridge. The host Promise returned by __inv is awaited INSIDE the
-      // wrapper and never reaches user code; only the resolved JSON string
-      // (a primitive — no prototype chain, nothing to escape through) crosses.
-      const callMethod = async (m, args) => {
-        const env = JSON.parse(await __inv(m, JSON.stringify(args)));
-        if (env && env.ok === true) return env.result;
-        const info = (env && env.error) || {};
-        const err = new Error(typeof info.message === "string" ? info.message : ("figma." + m + " failed"));
-        if (typeof info.code === "string") err.code = info.code;
-        if (typeof info.hint === "string") err.hint = info.hint;
-        throw err;
-      };
-      const rebuilt = {};
-      for (const name of Object.getOwnPropertyNames(hostFigma)) {
-        const v = hostFigma[name];
-        if (typeof v === "function") {
-          rebuilt[name] = ((m) => (...args) => callMethod(m, args))(name);
-        } else {
-          // Data props (the "mixed" sentinel) cross as a JSON copy.
-          try { rebuilt[name] = JSON.parse(JSON.stringify(v)); } catch (_) {}
-        }
-      }
-      try {
-        Object.defineProperty(rebuilt, "constructor", {
-          value: Poison, writable: false, enumerable: false, configurable: false,
-        });
-        Object.defineProperty(state, "constructor", {
-          value: Poison, writable: false, enumerable: false, configurable: false,
-        });
-      } catch (_) {}
-      // Unknown-method trap, mirroring the host proxy's DX guard: an unknown
-      // name resolves to a wrapper so the host-side stub produces the mapped,
-      // actionable error. Non-call probes (then/toJSON/symbols) stay
-      // undefined so normal JS semantics hold.
-      figma = new Proxy(rebuilt, {
-        get(t, prop) {
-          if (typeof prop === "symbol") return Reflect.get(t, prop);
-          const v = t[prop];
-          if (v !== undefined) return v;
-          if (prop === "then" || prop === "toJSON" || prop === "constructor" || prop === "inspect") {
-            return undefined;
-          }
-          return (...args) => callMethod(String(prop), args);
-        },
-      });
-    })();`,
-    { filename: "figma_write.bootstrap.js" },
-  );
-  bootstrap.runInContext(context);
-
-  // Bound the stringify of context values leaving the sandbox: a hostile
-  // toJSON/getter would otherwise run unbounded on the host event loop during
-  // JSON.stringify. Rebuilt per call because it needs this context.
+  // Context-bounded stringify of values leaving the sandbox: a hostile
+  // toJSON/getter must not run unbounded on the worker loop either (bounded
+  // here, and the parent can still terminate the whole worker).
   const serScript = new vm.Script("JSON.stringify(__serArg)", { filename: "figma_write.serialize.js" });
-  const serInContext = (v: unknown): string | undefined => {
+  const serInContext = (v) => {
     sandbox.__serArg = v;
     try {
-      const s = serScript.runInContext(context, { timeout: VM_TIMEOUT_MS });
+      const s = serScript.runInContext(context, { timeout: TIMEOUT_MS });
       return typeof s === "string" ? s : undefined;
     } finally {
       sandbox.__serArg = undefined;
     }
   };
-  serToText = (v: unknown): string => {
+  serToText = (v) => {
     try {
       return serInContext(v) ?? "[unserializable value]";
     } catch {
       return "[unserializable value]";
     }
   };
-  serResult = (v: unknown): unknown => {
+  const serResult = (v) => {
     if (v === undefined) return undefined;
     try {
       const s = serInContext(v);
@@ -451,73 +654,59 @@ async function executeWriteInner(code: string, session: Session, deps: ExecutorD
     }
   };
 
-  // Wrap user code in an async IIFE so top-level await + returns work; the
-  // outer try/finally syncs the mutated `state` back to the session even when
-  // the code throws. Strict mode makes a bare call's `this` undefined.
+  // Async IIFE: top-level await + returns work; finally syncs state back even
+  // when the code throws. Strict mode makes a bare call's this undefined.
   const wrapped =
-    `(async function () {\n"use strict";\n` +
-    `try {\nreturn await (async function () {\n${code}\n})();\n` +
-    `} finally {\ntry { __syncState(JSON.stringify(state)); } catch (_) {}\n}\n` +
-    `}).call(undefined)`;
+    '(async function () {\\n"use strict";\\n' +
+    'try {\\nreturn await (async function () {\\n' + code + '\\n})();\\n' +
+    '} finally {\\ntry { __syncState(JSON.stringify(state)); } catch (_) {}\\n}\\n' +
+    '}).call(undefined)';
 
-  session.writeCount++;
-
-  let script: vm.Script;
+  let script;
   try {
     script = new vm.Script(wrapped, { filename: "figma_write.js" });
-  } catch (err) {
-    return {
+  } catch (e) {
+    post({
+      t: "done",
       ok: false,
-      logs,
-      warnings,
       error: {
-        code: ErrorCode.SANDBOX_ERROR,
-        message: `Syntax error in figma_write code: ${(err as Error).message}`,
+        code: "SANDBOX_ERROR",
+        message: "Syntax error in figma_write code: " + (e && e.message ? e.message : String(e)),
         hint: "Fix the JavaScript syntax. Modern ES (?., ??, spread, async/await) is supported.",
       },
-    };
+    });
+    return;
   }
 
-  try {
-    // vm.timeout only guards SYNCHRONOUS CPU loops. The code is an async IIFE,
-    // so runInContext returns a Promise immediately and the real wait happens at
-    // `await`. A body like `await new Promise(()=>{})` never resolves and never
-    // burns CPU, so vm.timeout can't fire — previously this hung ~150s until the
-    // MCP transport gave up, which dropped the plugin and wiped session state.
-    // Race the awaited result against an explicit async deadline so a hung write
-    // fails cleanly and in-budget instead of taking down the connection.
-    const runResult = script.runInContext(context, { timeout: VM_TIMEOUT_MS }) as Promise<unknown>;
-    const result = await withDeadline(runResult, VM_TIMEOUT_MS);
-    return { ok: true, result: serResult(result), logs, warnings };
-  } catch (err) {
-    if (err instanceof OpError) {
-      return { ok: false, logs, warnings, error: { code: err.code, message: err.message, ...(err.hint ? { hint: err.hint } : {}) } };
-    }
-    // Context-realm errors are not `instanceof Error` in the host realm —
-    // read .message as a prop so the text doesn't come out "Error: ...".
-    // They also carry code/hint as own props (banned-global stubs, figma.*
-    // failures) — primitives, safe to read across the boundary.
-    const ce = err as { code?: unknown; hint?: unknown; message?: unknown } | null;
-    const message = ce && typeof ce.message === "string" ? ce.message : String(err);
-    const ctxCode = ce && typeof ce.code === "string" ? (ce.code as ErrorCode) : undefined;
-    const ctxHint = ce && typeof ce.hint === "string" ? ce.hint : undefined;
-    const isTimeout = /Script execution timed out/i.test(message);
-    return {
-      ok: false,
-      logs,
-      warnings,
-      error: {
-        code: ctxCode ?? (isTimeout ? ErrorCode.PLUGIN_TIMEOUT : ErrorCode.SANDBOX_ERROR),
-        message: isTimeout && ctxCode === undefined ? `figma_write exceeded the ${VM_TIMEOUT_MS}ms budget.` : message,
-        hint:
-          ctxHint ??
-          (isTimeout
+  (async function () {
+    try {
+      const result = await script.runInContext(context, { timeout: TIMEOUT_MS });
+      post({ t: "done", ok: true, result: serResult(result) });
+    } catch (err) {
+      const ce = err || {};
+      const message = typeof ce.message === "string" ? ce.message : String(err);
+      const ctxCode = typeof ce.code === "string" ? ce.code : undefined;
+      const ctxHint = typeof ce.hint === "string" ? ce.hint : undefined;
+      const isTimeout = /Script execution timed out/i.test(message) || ctxCode === "ERR_SCRIPT_EXECUTION_TIMEOUT";
+      post({
+        t: "done",
+        ok: false,
+        error: {
+          // A vm timeout must surface as PLUGIN_TIMEOUT — Node tags the thrown
+          // error with code "ERR_SCRIPT_EXECUTION_TIMEOUT", which is a host
+          // detail, not a user ErrorCode.
+          code: isTimeout ? "PLUGIN_TIMEOUT" : ctxCode !== undefined ? ctxCode : "SANDBOX_ERROR",
+          message: isTimeout ? "figma_write exceeded the " + TIMEOUT_MS + "ms budget." : message,
+          hint: isTimeout
             ? "Split the work across multiple figma_write calls or use figma.batch() for many similar ops."
-            : "The error is from your code or a figma op — check the message and figma_docs(section=\"api\")."),
-      },
-    };
-  }
-}
+            : ctxHint !== undefined
+              ? ctxHint
+              : "The error is from your code or a figma op — check the message and figma_docs(section=\\"api\\").",
+        },
+      });
+    }
+  })();
+})();`;
 
 function buildFigmaProxy(
   session: Session,
@@ -780,17 +969,52 @@ function mergeTokenMap(
   return map;
 }
 
+const MAX_IMAGE_REDIRECTS = 3;
+
+/**
+ * Fetch with redirects handled by hand. assertSafeImageUrl only vets the URL
+ * it is given; letting fetch follow a 302 on its own would let any public
+ * https host bounce the request to 169.254.169.254 or an intranet name. So
+ * every Location is resolved against the hop that sent it and vetted again,
+ * and a chain longer than a few hops is refused rather than chased.
+ */
+export async function fetchImageFollowingSafeRedirects(
+  url: string,
+  fetchImpl: (u: string, init: RequestInit) => Promise<Response> = globalThis.fetch as never,
+): Promise<Response> {
+  let current = assertSafeImageUrl(url).href;
+  for (let hop = 0; ; hop++) {
+    const res = await fetchImpl(current, { redirect: "manual" });
+    if (res.status < 300 || res.status >= 400) return res;
+    const location = res.headers.get("location");
+    if (!location) return res;
+    // The redirect's own body is never read; release its socket.
+    await res.body?.cancel().catch(() => {});
+    if (hop >= MAX_IMAGE_REDIRECTS) {
+      throw new OpError(
+        ErrorCode.INVALID_PARAMS,
+        `Image URL redirected more than ${MAX_IMAGE_REDIRECTS} times.`,
+        "Pass the final image URL directly, or base64 bytes.",
+      );
+    }
+    current = assertSafeImageUrl(new URL(location, current).href).href;
+  }
+}
+
 /** Fetch an image URL and return its base64 body. An optional imageFetcher on
  * deps lets tests supply bytes without hitting the network. */
 async function fetchImageAsBase64(url: string, deps: ExecutorDeps): Promise<string> {
   const safe = assertSafeImageUrl(url);
   try {
     if (deps.imageFetcher) return await deps.imageFetcher(safe.href);
-    const res = await (globalThis.fetch as unknown as (u: string) => Promise<Response>)(safe.href);
+    const res = await fetchImageFollowingSafeRedirects(safe.href);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     return buf.toString("base64");
   } catch (e) {
+    // A blocked redirect hop is already a precise INVALID_PARAMS — keep its
+    // message instead of burying it under "Could not fetch".
+    if (e instanceof OpError) throw e;
     throw new OpError(
       ErrorCode.INVALID_PARAMS,
       `Could not fetch image from URL: ${(e as Error).message}`,
@@ -1169,20 +1393,6 @@ function flattenNode(node: Record<string, unknown>): Record<string, unknown> {
 
 function flattenNodes(nodes: unknown[]): Record<string, unknown>[] {
   return nodes.filter(isObj).map((n) => flattenNode(n as Record<string, unknown>));
-}
-
-function fmt(args: unknown[], ser: (v: unknown) => string): string {
-  return args
-    .map((a) => (typeof a === "string" ? a : ser(a)))
-    .join(" ");
-}
-
-function safeStringify(v: unknown): string {
-  try {
-    return JSON.stringify(v);
-  } catch {
-    return String(v);
-  }
 }
 
 export { isReadOp };

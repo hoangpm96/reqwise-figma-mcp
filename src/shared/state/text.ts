@@ -28,8 +28,13 @@ export interface ParsedState {
 const KINDS = ["initial", "final", "choice", "fork", "join", "state"] as const;
 const TRANS = /^(\[\*\]|[\w.-]+)\s*(~>|->)\s*(\[\*\]|[\w.-]+)\s*(?::\s*(.*))?$/;
 const CLAUSES = ["entry", "do", "exit", "detail"] as const;
-const INITIAL = "__start";
-const FINAL_ID = "__end";
+/**
+ * The ids `[*]` becomes. Exported because they are notation, not values the
+ * entity holds, and anything comparing a machine's states against a stored
+ * enum has to know to leave them out.
+ */
+export const INITIAL = "__start";
+export const FINAL_ID = "__end";
 
 export function parseStateText(src: string): ParsedState {
   const states: StateNodeSpec[] = [];

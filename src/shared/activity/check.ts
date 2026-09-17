@@ -74,8 +74,20 @@ export function checkActivity(
     // is the one question this diagram exists to answer. With no lanes at all
     // there is no such question — a plain activity diagram is a legitimate
     // drawing, and every step simply has no owner.
+    //
+    // A lane-less step carries NO `lane` rather than `lane: ""`. These nodes are
+    // the model the frame stores for a later patch, and the schema that patch
+    // is validated against wants a lane to be a real id — an empty string made
+    // every plain activity diagram impossible to patch. The layout reads a
+    // missing lane as "", so nothing downstream sees a difference.
     const lane = (n.lane ?? "").trim();
-    const node = laneless ? { ...n, lane: "" } : laneIds.has(lane) ? { ...n, lane } : { ...n, lane: UNASSIGNED_LANE };
+    let node: ActivityNodeSpec;
+    if (laneless) {
+      node = { ...n };
+      delete node.lane;
+    } else {
+      node = laneIds.has(lane) ? { ...n, lane } : { ...n, lane: UNASSIGNED_LANE };
+    }
     if (node.lane === UNASSIGNED_LANE) {
       homeless.push(lane ? `"${n.id}" (lane "${lane}")` : `"${n.id}" (no lane given)`);
     }
@@ -167,6 +179,25 @@ export function checkActivity(
   if (!ends.length && nodes.length) {
     warnings.push(
       `No kind:"end" step — every process needs a stated outcome, including the unhappy one (rejected, cancelled, timed out).`,
+    );
+  }
+
+  // The two terminals mean something only while they ARE terminal. An end
+  // with a way out is not where the process finishes, and a start that
+  // something loops back into is not what sets it off — the reader of either
+  // is told a wrong story about where the process begins and stops. The
+  // state checker says the same of a final state that leaks and of a
+  // transition into the initial dot.
+  const leaky = ends.filter((n) => out.get(n.id)!.length > 0);
+  if (leaky.length) {
+    warnings.push(
+      `End step with a way out: ${list(leaky.map((n) => `"${n.id}" (${firstLine(n.label)})`))}. An end is where the process finishes — if something follows it, it is an ordinary step (or the arrow belongs somewhere else).`,
+    );
+  }
+  const reentered = starts.filter((n) => inbound.get(n.id)!.length > 0);
+  if (reentered.length) {
+    warnings.push(
+      `Arrow INTO a start step: ${list(reentered.map((n) => `"${n.id}" (${firstLine(n.label)}) from ${list(inbound.get(n.id)!.map((e) => `"${e.from}"`))}`))}. The start is the trigger, not somewhere the process returns to — point the arrow at the first real step it goes back to.`,
     );
   }
 

@@ -1,5 +1,5 @@
 /// <reference types="@figma/plugin-typings" />
-import { HandlerContext } from "../context.js";
+import { HandlerContext, getNodeByIdSafe } from "../context.js";
 import { resolveParent, insertInto, isParentNode, type ParentNode } from "../insert.js";
 import { toPaints, toEffects } from "../paints.js";
 import { loadFontWithFallback, DEFAULT_FONT } from "../fonts.js";
@@ -178,7 +178,11 @@ async function buildNode(
   // cost a throttled background tab multiplies, and how a 300ms draw became a
   // 30s timeout when nobody was looking at the Figma window.
   const parent = known ?? (await resolveParent(p.parentId));
+  // Measured before the node is inserted: a group grows to fit whatever is
+  // put in it, so afterwards its size and origin include the new node sitting
+  // at its creation position.
   const parentBox = parentSize(parent);
+  const origin = childOrigin(parent);
 
   const geoReq: GeometryRequest = {
     x: numOr(p.x),
@@ -236,7 +240,7 @@ async function buildNode(
     }
   }
 
-  applyGeometry(node, geoReq, parentBox, parent, type);
+  applyGeometry(node, geoReq, parentBox, origin, parent, type);
   await applyVectorPath(node, p, type, ctx);
   applyVisuals(node, p, ctx, type);
   if (type === "ICON") {
@@ -260,9 +264,9 @@ async function buildNode(
   // auto-layout parent (e.g. STRETCH → fill the cross axis / full-width).
   // They apply to any node type, so they live outside applyAutoLayout (which
   // only runs for frames that are themselves auto-layouts). Without this,
-  // `create({ layoutAlign: "STRETCH" })` was silently dropped while
-  // `modify(id, { layoutAlign: "STRETCH" })` worked — the root cause of
-  // buttons/inputs rendering hug-width instead of full-width.
+  // `create({ layoutAlign: "STRETCH" })` was silently dropped — the root cause
+  // of buttons/inputs rendering hug-width instead of full-width. modify has
+  // the same non-frame branch.
   applyChildLayout(node, p);
 
   // Token bindings go last so they land on final paints/layout (autoLayout
@@ -337,7 +341,7 @@ async function createNode(
       return figma.createComponent();
     case "INSTANCE": {
       const compId = String(p.componentId ?? "");
-      const comp = await figma.getNodeByIdAsync(compId);
+      const comp = await getNodeByIdSafe(compId);
       if (!comp || comp.type !== "COMPONENT") {
         throw err(
           ErrorCode.NODE_NOT_FOUND,
@@ -365,6 +369,47 @@ async function createNode(
         "Use FRAME/TEXT/RECTANGLE/ELLIPSE/LINE/VECTOR/POLYGON/STAR/COMPONENT/INSTANCE/ICON.",
       );
   }
+}
+
+/**
+ * Where a parent's own top-left sits in the coordinate space its children's
+ * x/y are written in. A frame starts its children at 0,0, but a GROUP or
+ * BOOLEAN_OPERATION is not a coordinate space at all: its children are placed
+ * in the nearest frame's coordinates, so the group's own x/y is the origin.
+ * Treating it as 0,0 put `inset:{left:8}` inside a group at x=500 at x=8 —
+ * outside the group, on top of whatever sat at the frame's left edge.
+ */
+export function childOrigin(parent: BaseNode): { x: number; y: number } {
+  if (
+    (parent.type === "GROUP" || parent.type === "BOOLEAN_OPERATION") &&
+    "x" in parent
+  ) {
+    return { x: (parent as GroupNode).x, y: (parent as GroupNode).y };
+  }
+  return { x: 0, y: 0 };
+}
+
+/**
+ * resolveGeometry, then shifted into the parent's child coordinates on the
+ * axes that inset/align placed. A plain x/y is left raw on purpose: inside a
+ * group Figma already reads it in frame coordinates, and every read tool
+ * reports it that way, so an agent copying a position back gets it unchanged.
+ */
+export function resolveInParent(
+  req: GeometryRequest,
+  parentBox: { w: number; h: number },
+  origin: { x: number; y: number },
+): Box {
+  const box = resolveGeometry(req, parentBox);
+  const i = req.inset ?? {};
+  const a = req.align;
+  if (typeof i.left === "number" || typeof i.right === "number" || a === "center-x" || a === "center") {
+    box.x += origin.x;
+  }
+  if (typeof i.top === "number" || typeof i.bottom === "number" || a === "center-y" || a === "center") {
+    box.y += origin.y;
+  }
+  return box;
 }
 
 export function parentSize(parent: BaseNode): { w: number; h: number } | null {
@@ -480,13 +525,14 @@ function applyGeometry(
   node: SceneNode,
   geoReq: GeometryRequest,
   parentBox: { w: number; h: number } | null,
+  origin: { x: number; y: number },
   parent: BaseNode,
   type: NodeType,
 ): void {
   if (!("x" in node)) return;
   const layout = node as LayoutMixin;
   const box: Box = parentBox
-    ? resolveGeometry(geoReq, parentBox)
+    ? resolveInParent(geoReq, parentBox, origin)
     : {
         x: geoReq.x ?? 0,
         y: geoReq.y ?? 0,
@@ -834,8 +880,8 @@ function applyAutoLayout(
 
 /**
  * Apply the child-in-auto-layout properties (`layoutAlign`, `layoutGrow`) that
- * decide how a node stretches/grows inside an auto-layout parent. Mirrors the
- * same handling in the `modify` handler so create and modify stay in sync.
+ * decide how a node stretches/grows inside an auto-layout parent. modify has
+ * the same handling for non-frame nodes; keep the two in sync.
  * Guarded by `"layoutAlign" in node` so it is a no-op for nodes that can never
  * be auto-layout children.
  */

@@ -1,8 +1,10 @@
 # Reqwise Figma MCP
 
+![Reqwise Figma MCP — AI agents read and draw on the Figma canvas, safely: an open-source local MCP server plus Figma plugin for Claude Code, Cursor and Codex](docs/assets/hero.png)
+
 **An MCP server that lets AI agents read and draw on the Figma canvas — safely.** Open source (MIT).
 
-> **Need design systems, journey maps, personas, accessibility and responsive audits, or self-playing demos?**
+> **Need BPMN, UI templates, a 1-to-1 code ↔ Figma component map, design systems, journey maps, personas, accessibility and responsive audits, or self-playing demos?**
 > They are in **[Reqwise Figma MCP Pro →](https://ai4ba.com/figma-mcp)**. Compare the two editions [below](#free-vs-pro).
 
 Reqwise Figma MCP pairs a local MCP server with a companion Figma plugin. Point Claude Code, Cursor, Codex or any MCP-capable agent at it, and the agent can inspect a Figma file and draw into it by executing JavaScript against a `figma.*` proxy API — with the plugin layer catching the mistakes that usually turn "AI draws a screen" into "AI draws an overflowing, half-clipped mess." It also draws the BA diagrams a spec needs — userflow, activity, sequence, ERD, sitemap, state machine — and proof-reads the model behind each one.
@@ -10,6 +12,8 @@ Reqwise Figma MCP pairs a local MCP server with a companion Figma plugin. Point 
 It exists because the current generation of Figma MCPs make agents responsible for discipline they don't have: remembering never to overlay a semi-transparent frame, re-declaring token maps every call, manually computing x/y offsets, eyeballing screenshots to check for clipping. Reqwise moves that discipline into the server and plugin, and gives the agent a structured way to verify its own work.
 
 ## Free vs Pro
+
+![Free vs Pro at a glance — Free (MIT): bridge and multi-agent, read/draw canvas, layout_audit, tokens and styles, icons/images/prototypes, six BA diagrams and their Claude skills. Pro adds components and properties, design-system generation, use case, BPMN, journey and persona diagrams, UI section and block templates, a 1-to-1 code to Figma component map, accessibility and responsive audits, self-playing demos and video recording](docs/assets/free-vs-pro.png)
 
 <!-- features:begin -->
 | Feature | Free | Pro |
@@ -44,13 +48,19 @@ It exists because the current generation of Figma MCPs make agents responsible f
 | Arrows follow the boxes; edit a diagram in place | ✅ | ✅ |
 | Cross-check diagrams against each other | ✅ | ✅ |
 | Use case diagram | — | ✅ |
+| BPMN process diagram — pools, lanes, events, gateways, message flows | — | ✅ |
 | User journey map (several layouts and themes) | — | ✅ |
 | Persona set | — | ✅ |
 | **Design system** | | |
 | Generate a design system — 60 components, tokens, screen grids, doc pages | — | ✅ |
 | 10 visual styles, side-by-side preview, AI style recommendation | — | ✅ |
 | Learn a system from the canvas or from design.md | — | ✅ |
+| 1-to-1 map between your code components and Figma components — props ↔ variants, kept in sync both ways | — | ✅ |
 | The tool asks the user the right questions, with time estimates | — | ✅ |
+| **UI templates** | | |
+| Section and block templates — hero, nav, pricing, data table, form, empty state | — | ✅ |
+| Templates drawn with *your* components and tokens, not pasted stock art | — | ✅ |
+| Start a design system from a template — palette and visual style preconfigured | — | ✅ |
 | **Quality and presentation** | | |
 | Accessibility audit — contrast, touch targets, unnamed controls | — | ✅ |
 | Responsive audit — stretch a screen, compare mobile and desktop | — | ✅ |
@@ -83,6 +93,8 @@ It exists because the current generation of Figma MCPs make agents responsible f
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design rationale and the root-cause fixes behind these defaults.
 
 ## Quickstart
+
+![How Reqwise works — 1. install the MCP (npm install, npm run build, register in Cursor/Claude/Codex), 2. import the plugin in Figma Desktop from manifest.json, 3. open your file and keep the plugin window open, 4. call figma_status, then figma_read / figma_write / figma_diagram, then layout_audit](docs/assets/how-it-works.png)
 
 ```bash
 git clone https://github.com/hoangpm96/reqwise-figma-mcp.git
@@ -122,7 +134,7 @@ claude mcp add reqwise-figma -s user -- /absolute/path/to/reqwise-figma-mcp/scri
 | `figma_diagram` | Draw **six** diagram kinds from a model **you** derived from the spec, each with findings on the *content*, not the drawing. `type:"activity"` — a business process, with swimlanes or without: one band per owner, the handoffs between bands; reports an unlabelled handoff, a step nobody owns, a fork that never joins. `type:"sequence"` — an exchange over time: participants as columns, messages in the order you list them, activation bars derived from the calls and their replies, alt/loop blocks; reports a call nobody answers, a reply with no call, an alt with no else. `type:"state"` — the lifecycle of ONE entity: the values it can hold and every change that is allowed, written `event [guard] / action`; reports a state nothing can reach, a state nothing can leave, two transitions racing on one event. `type:"erd"` — a data model: tables, columns, keys, crow's-foot cardinality; reports what bites after a migration (no primary key, a foreign key to a column that does not exist, a many-to-many with no join table). `type:"userflow"` — the screens a user moves through, from a graph or a mermaid `flowchart`; reports a question with one way out, a dead end, an unreachable screen. `type:"sitemap"` — the pages a product is made of and what contains what, drawn as a tidy tree; reports an orphan page, a section with nothing under it, a depth nobody will navigate, and cross-checks against the userflows on the page. Write any of them in the compact `text` form at ~a third of the tokens, draw a whole set in one call (`diagrams: [...]`, placed for you), and **change** one with `update` + `patch` instead of re-authoring it. Every draw is cross-checked against the other diagrams on the page. Arrows stay attached on all of them: drag a box and every line touching it re-routes. |
 | `figma_docs` | On-demand documentation: `rules` \| `layout` \| `api` \| `tokens` \| `icons` \| `recipes` \| `style` \| `userflow` \| `activity` \| `erd` \| `sequence` \| `sitemap` \| `state`. Read `style` when there's no design system to reuse — it's the brand-neutral default scale/palette/elevation to fall back on instead of inventing values. |
 
-Full parameter reference for every operation and every `figma.*` method: [`docs/TOOLS.md`](./docs/TOOLS.md). Pro adds `figma_design_system` and `figma_record`, three more diagram kinds and the audits — see [Free vs Pro](#free-vs-pro).
+Full parameter reference for every operation and every `figma.*` method: [`docs/TOOLS.md`](./docs/TOOLS.md). Pro adds `figma_design_system` and `figma_record`, four more diagram kinds (use case, BPMN, journey map, persona set), the UI templates, the code ↔ Figma component map and the audits — see [Free vs Pro](#free-vs-pro).
 
 ## Diagram skills
 
@@ -206,7 +218,7 @@ Every operation — leader-direct or follower-forwarded — passes through one `
 
 ## Reqwise Figma MCP Pro
 
-Pro is the full edition, built by the same author on this same core: a design-system generator with ten visual styles, use case diagrams, journey maps and persona sets, component authoring, accessibility and responsive audits, self-playing demos and demo videos. **[ai4ba.com/figma-mcp](https://ai4ba.com/figma-mcp)**
+Pro is the full edition, built by the same author on this same core: a design-system generator with ten visual styles, use case and **BPMN** diagrams, journey maps and persona sets, component authoring, **UI section and block templates** that draw with your own components and tokens (and design-system templates that come with palette and visual style preconfigured), a **1-to-1 map between your code components and their Figma counterparts** (props ↔ variants, so generated UI matches the codebase instead of resembling it), accessibility and responsive audits, self-playing demos and demo videos. **[ai4ba.com/figma-mcp](https://ai4ba.com/figma-mcp)**
 
 ## License
 

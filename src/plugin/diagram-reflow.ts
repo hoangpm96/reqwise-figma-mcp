@@ -26,6 +26,7 @@ import {
   sitemapGraphOf,
   type SitemapReflowReport,
 } from "./sitemap-reflow.js";
+import { DIAGRAM_MARKERS } from "./diagram-mark.js";
 
 export type DiagramReport =
   | ReflowReport
@@ -40,6 +41,8 @@ export interface ReflowOpts {
   onlyIfMoved?: boolean;
   /** Re-route even the arrows somebody moved by hand. */
   force?: boolean;
+  /** Boxes were deleted (or the caller asked): an empty frame is not mid-write. See scanBoxes. */
+  deleted?: boolean;
 }
 
 /** Does this node carry a diagram we know how to re-route? */
@@ -84,8 +87,44 @@ export async function reflowAnyFrame(
   return null;
 }
 
-/** Every re-routable diagram on the page. */
+/**
+ * Every re-routable diagram on the page, at ANY depth.
+ *
+ * The per-kind lists only look at the page and its sections, so a diagram
+ * drawn with `parentId` into a plain frame (or dragged into one) was never in
+ * the DELETE sweep: deleting one of its boxes left its arrows dangling, and
+ * reflow_diagram with no frameId skipped it. One native search, narrowed to
+ * frames that carry one of our markers, is what keeps this cheap enough to run
+ * on every delete on a large page — the JSON of a graph is only parsed for
+ * the handful of frames that have one.
+ */
 export function diagramFrames(page: PageNode): FrameNode[] {
+  let marked: readonly SceneNode[] | null = null;
+  try {
+    if (typeof page.findAllWithCriteria === "function") {
+      marked = page.findAllWithCriteria({
+        types: ["FRAME"],
+        pluginData: { keys: [...DIAGRAM_MARKERS] },
+      });
+    }
+  } catch {
+    // An API surface without the criterion: fall back to the shallow lists,
+    // which still cover every diagram on the page or in a section.
+    marked = null;
+  }
+  if (marked) {
+    const out: FrameNode[] = [];
+    for (const node of marked) {
+      if (node.type === "FRAME" && isDiagramFrame(node) && !insideInstanceOrComponent(node)) {
+        out.push(node as FrameNode);
+      }
+    }
+    return out;
+  }
+  return shallowDiagramFrames(page);
+}
+
+function shallowDiagramFrames(page: PageNode): FrameNode[] {
   const out: FrameNode[] = [];
   const seen = new Set<string>();
   for (const frame of userflowFrames(page).concat(activityFrames(page), erdFrames(page), sequenceFrames(page), stateFrames(page), sitemapFrames(page))) {
@@ -97,16 +136,48 @@ export function diagramFrames(page: PageNode): FrameNode[] {
 }
 
 /**
- * Walk up from a changed node to the diagram frame that owns it. A box is a
- * direct child of the frame and a text inside a box is one level deeper, so
- * four hops is more than enough — and bounded, because this runs on every
- * batch of document changes.
+ * Walk up from a changed node to the diagram frame that owns it — all the way
+ * to the page, like owningMarkedFrame in handlers/diagram.ts. The old four-hop
+ * limit missed an ERD column's text (text → cell → row → entity → diagram is
+ * five), so editing it re-routed nothing. The nearest diagram still wins.
+ *
+ * This runs for every node of every change batch, so `memo` (one per batch)
+ * remembers the answer for each ancestor already walked: a paste of a thousand
+ * layers into one frame climbs that frame's ancestry once, not a thousand
+ * times, and a graph's JSON is parsed once per frame.
  */
-export function owningDiagram(node: BaseNode | null): FrameNode | null {
+/**
+ * A diagram inside a component is a picture of one, not a live diagram: the
+ * native search reaches into instances, and hiding or routing their layers
+ * would write overrides onto every copy.
+ */
+function insideInstanceOrComponent(node: BaseNode): boolean {
+  for (let cur = node.parent; cur && cur.type !== "PAGE"; cur = cur.parent) {
+    if (cur.type === "INSTANCE" || cur.type === "COMPONENT" || cur.type === "COMPONENT_SET") return true;
+  }
+  return false;
+}
+
+export function owningDiagram(
+  node: BaseNode | null,
+  memo?: Map<string, FrameNode | null>,
+): FrameNode | null {
+  const walked: string[] = [];
+  let found: FrameNode | null = null;
   let cur: BaseNode | null = node;
-  for (let hop = 0; cur && hop < 4; hop++) {
-    if (cur.type === "FRAME" && isDiagramFrame(cur)) return cur as FrameNode;
+  while (cur && cur.type !== "PAGE" && cur.type !== "DOCUMENT") {
+    const known = memo?.get(cur.id);
+    if (known !== undefined) {
+      found = known;
+      break;
+    }
+    walked.push(cur.id);
+    if (cur.type === "FRAME" && isDiagramFrame(cur)) {
+      found = insideInstanceOrComponent(cur) ? null : (cur as FrameNode);
+      break;
+    }
     cur = cur.parent;
   }
-  return null;
+  if (memo) for (const id of walked) memo.set(id, found);
+  return found;
 }

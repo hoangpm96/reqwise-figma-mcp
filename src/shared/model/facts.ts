@@ -15,6 +15,7 @@
  */
 import { refsIn } from "./policy.js";
 import { firstLine } from "../diagram/graph.js";
+import { FINAL_ID, INITIAL } from "../state/text.js";
 
 /** One diagram's stored model, as `get_page_model` hands it over. */
 export interface StoredDiagram {
@@ -140,7 +141,11 @@ export function collectFacts(diagrams: StoredDiagram[]): PageFacts {
     const declared = (spec.options as Record<string, unknown> | undefined)?.policies;
     if (declared && typeof declared === "object" && !Array.isArray(declared)) {
       const referenced = new Set<string>();
-      for (const n of refsIn(JSON.stringify(spec))) referenced.add(n);
+      // Each string on its own, never the JSON of the whole spec: serialised,
+      // a label that OPENS with the reference ("@hold-minutes phút") has a
+      // quote mark in front of the @, which is not a place a reference may
+      // begin, so the policy it uses was reported as declared-but-unused.
+      collectRefs(spec, referenced);
       for (const [name, value] of Object.entries(declared as Record<string, unknown>)) {
         if (typeof value !== "string" && typeof value !== "number") continue;
         out.policies.push({
@@ -204,8 +209,14 @@ export function collectFacts(diagrams: StoredDiagram[]): PageFacts {
         }
       }
     } else if (d.kind === "state") {
+      // `[*]` in the compact form becomes a pair of real nodes, and the end
+      // one is kind:"final" — which PSEUDO rightly lets through for a named
+      // final state. Those two are still only the notation's dots: the row
+      // never holds "__end", and comparing it against the enum reported a
+      // drift on every machine written with `-> [*]`.
       const states = arr(spec.states)
         .filter((s) => !PSEUDO.has(str(s.kind)))
+        .filter((s) => str(s.id) !== INITIAL && str(s.id) !== FINAL_ID)
         .map((s) => str(s.id))
         .filter(Boolean);
       // What this machine is ABOUT: said outright if the author said it,
@@ -238,6 +249,16 @@ export function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+
+function collectRefs(v: unknown, into: Set<string>): void {
+  if (typeof v === "string") {
+    for (const n of refsIn(v)) into.add(n);
+  } else if (Array.isArray(v)) {
+    for (const x of v) collectRefs(x, into);
+  } else if (v && typeof v === "object") {
+    for (const x of Object.values(v as Record<string, unknown>)) collectRefs(x, into);
+  }
+}
 
 function fold(s: string): string {
   return s.normalize("NFD").replace(/\p{M}/gu, "");

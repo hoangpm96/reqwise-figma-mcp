@@ -29,6 +29,7 @@ import { Coordinator } from "./leader.js";
 import { Follower, STATUS_RPC_TIMEOUT_MS } from "./follower.js";
 import { executeWrite, type WriteResult } from "./executor.js";
 import { isDirectRun } from "./is-main.js";
+import { installShutdown } from "./shutdown.js";
 import {
   handleDocs,
   handleDiagram,
@@ -362,7 +363,7 @@ export async function createServer(): Promise<ServerHandle> {
       if (op === "__write__") {
         const code = typeof params["code"] === "string" ? (params["code"] as string) : "";
         return executeWrite(code, sessions.get(sessionId), {
-          runOp: async (subOp, subParams): Promise<BridgeResponse> => {
+          runOp: async (subOp, subParams, ctx): Promise<BridgeResponse> => {
             const { op: v, params: p } = validateOperation(subOp, subParams);
             const b = liveBridge();
             if (!b) throw new OpError(ErrorCode.NOT_CONNECTED, "Bridge unavailable.", "Restart the leader.");
@@ -372,6 +373,7 @@ export async function createServer(): Promise<ServerHandle> {
             return b.dispatch(v, p, {
               ...(channel ? { channel } : {}),
               ...(sessionId ? { sessionId } : {}),
+              ...(ctx ? { signal: ctx.signal } : {}),
             });
           },
         });
@@ -463,7 +465,7 @@ export async function createServer(): Promise<ServerHandle> {
     return executeWrite(code, session, {
       // Executor's per-op runner IS validate+dispatch — no figma.* call skips
       // validation.
-      runOp: async (op, params): Promise<BridgeResponse> => {
+      runOp: async (op, params, ctx): Promise<BridgeResponse> => {
         const { op: validOp, params: validParams } = validateOperation(op, params);
         const bridge = liveBridge();
         if (!bridge) {
@@ -475,6 +477,7 @@ export async function createServer(): Promise<ServerHandle> {
         return bridge.dispatch(validOp, validParams, {
           ...(channel ? { channel } : {}),
           sessionId: sid,
+          ...(ctx ? { signal: ctx.signal } : {}),
         });
       },
     });
@@ -754,15 +757,7 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await handle.server.connect(transport);
 
-  const shutdown = async () => {
-    try {
-      await handle.close();
-    } finally {
-      process.exit(0);
-    }
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  installShutdown({ close: () => handle.close() });
 }
 
 // Only auto-run when executed directly (not when imported by tests). The

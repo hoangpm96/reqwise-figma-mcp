@@ -61,28 +61,6 @@ export function checkSequence(
     messages.push(m);
   }
 
-  // ---- calls and replies ----
-  // Who answers whom is shared with the layout (`pairCalls`), so a warning
-  // here and an activation bar there can never disagree.
-  const paired = pairCalls(messages, rawFragments);
-  if (paired.orphanReplies.length) {
-    warnings.push(
-      `Reply with no call to answer: ${list(paired.orphanReplies.map((r) => `"${r.id}" (${r.from} → ${r.to})`))}. Either the call is missing from the diagram, or this is not a reply — mark it kind:"async".`,
-    );
-  }
-  // Unanswered calls are only worth reporting when the diagram DOES show
-  // replies elsewhere: a diagram that never draws them is a style, not a bug.
-  const returns = messages.filter((m) => (m.kind ?? "sync") === "return").length;
-  // A person tapping a button is not waiting for a message back — only a
-  // system-to-system call reads as unanswered.
-  const actors = new Set(participants.filter((p) => p.kind === "actor").map((p) => p.id));
-  const unanswered = paired.unanswered.filter((c) => !actors.has(c.from));
-  if (returns > 0 && unanswered.length) {
-    warnings.push(
-      `Call with no reply: ${list(unanswered.map((c) => `"${c.id}" (${c.from} → ${c.to})`))}. This diagram draws replies elsewhere, so the reader will read the silence as "nothing comes back" — say what does, or mark the call kind:"async".`,
-    );
-  }
-
   // ---- fragments ----
   const order = new Map<string, number>();
   messages.forEach((m, i) => order.set(m.id, i));
@@ -114,6 +92,32 @@ export function checkSequence(
       );
     }
     fragments.push(f);
+  }
+
+  // ---- calls and replies ----
+  // Who answers whom is shared with the layout (`pairCalls`), so a warning
+  // here and an activation bar there can never disagree. That only holds if
+  // both see the SAME fragments: the layout gets the validated list, so this
+  // runs after the fragments are checked. Pairing on the raw list let a
+  // dropped `break` still split the timeline here, and the checker reported a
+  // "call with no reply" that the drawing showed answered.
+  const paired = pairCalls(messages, fragments);
+  if (paired.orphanReplies.length) {
+    warnings.push(
+      `Reply with no call to answer: ${list(paired.orphanReplies.map((r) => `"${r.id}" (${r.from} → ${r.to})`))}. Either the call is missing from the diagram, or this is not a reply — mark it kind:"async".`,
+    );
+  }
+  // Unanswered calls are only worth reporting when the diagram DOES show
+  // replies elsewhere: a diagram that never draws them is a style, not a bug.
+  const returns = messages.filter((m) => (m.kind ?? "sync") === "return").length;
+  // A person tapping a button is not waiting for a message back — only a
+  // system-to-system call reads as unanswered.
+  const actors = new Set(participants.filter((p) => p.kind === "actor").map((p) => p.id));
+  const unanswered = paired.unanswered.filter((c) => !actors.has(c.from));
+  if (returns > 0 && unanswered.length) {
+    warnings.push(
+      `Call with no reply: ${list(unanswered.map((c) => `"${c.id}" (${c.from} → ${c.to})`))}. This diagram draws replies elsewhere, so the reader will read the silence as "nothing comes back" — say what does, or mark the call kind:"async".`,
+    );
   }
 
   // ---- who is actually involved ----

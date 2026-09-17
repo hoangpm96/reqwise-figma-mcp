@@ -67,7 +67,18 @@ export function parseSitemapText(src: string): ParsedSitemap {
       continue;
     }
 
-    const arrow = ARROW.exec(l.text);
+    // `screen:` is read only where the grammar puts it — among the words,
+    // outside the quoted label and before the ` / ` detail. Scanning the raw
+    // line let prose like `/ See screen:admin docs` claim an artboard and cut
+    // a hole in the detail.
+    const { head, detail } = splitDetail(l.text);
+    const { value: label, rest: unscreened } = takeQuoted(head);
+
+    // The arrow check reads the same words, for the same reason: `p "Tap ->
+    // to continue"` is a page whose label has an arrow in it, and treating the
+    // whole line as an edge dropped the page and re-filed its children under
+    // whatever sat above it.
+    const arrow = ARROW.exec(unscreened);
     if (arrow) {
       warnings.push(
         `sitemap text, line ${l.no}: "${arrow[1]}" — skipped. A sitemap line has no arrow: its edges are CONTAINMENT (this page lives under that one), which is what the indentation says, and there is nothing here for an arrow to mean. If you meant "the user goes from here to there", that is navigation and belongs in figma_diagram type:"userflow".`,
@@ -78,18 +89,15 @@ export function parseSitemapText(src: string): ParsedSitemap {
     while (stack.length && l.indent <= stack[stack.length - 1]!.indent) stack.pop();
     const parent = stack.length ? stack[stack.length - 1]!.id : undefined;
 
-    let text = l.text;
-    const screenHit = SCREEN.exec(text);
+    let rest = unscreened;
+    const screenHit = SCREEN.exec(rest);
     const screens = (screenHit?.[1] ?? "")
       .split(SCREEN_SEP)
       .map((v) => v.trim())
       .filter(Boolean);
     if (screenHit) {
-      text = (text.slice(0, screenHit.index) + text.slice(screenHit.index + screenHit[0].length)).trim();
+      rest = (rest.slice(0, screenHit.index) + " " + rest.slice(screenHit.index + screenHit[0].length)).trim();
     }
-
-    const { head, detail } = splitDetail(text);
-    const { value: label, rest } = takeQuoted(head);
     const { cls, kind, rest: words } = takeWords(rest, KINDS);
     const id = words.shift();
     if (!id) {

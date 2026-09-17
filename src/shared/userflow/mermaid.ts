@@ -46,13 +46,22 @@ export function parseMermaid(source: string): ParsedMermaid {
     const line = stripComment(raw).trim();
     if (!line) continue;
 
-    const header = line.match(/^(?:flowchart|graph)\s+(TB|TD|LR|RL|BT)\b/i);
+    // The direction is optional in Mermaid: a bare `flowchart` used to be read
+    // as a NODE called "flowchart" — a phantom box, dead-end warnings and all.
+    const header = line.match(/^(?:flowchart|graph)(?:\s+(TB|TD|LR|RL|BT)\b|\s*;?\s*$)/i);
     if (header) {
       const dir = (header[1] ?? "TB").toUpperCase();
       rankdir = dir === "LR" || dir === "RL" ? "LR" : "TB";
+      if (dir === "RL" || dir === "BT") {
+        warnings.push(
+          `mermaid: direction ${dir} is drawn as ${rankdir} — a userflow reads left-to-right or top-to-bottom. Reverse the arrows if the order matters.`,
+        );
+      }
       continue;
     }
-    if (/^(classDef|style|linkStyle|click|%%|subgraph|end\b|direction)\b/i.test(line)) {
+    // A bare `end` closes a subgraph. `end\b` also swallowed `end["Done"]` and
+    // `end --> a` while `a --> end` still made the node — half a node, silently.
+    if (/^(classDef|style|linkStyle|click|%%|subgraph|direction)\b/i.test(line) || /^end\s*;?$/i.test(line)) {
       if (/^subgraph\b/i.test(line)) {
         warnings.push(
           `mermaid: subgraph "${line.slice(9).trim()}" ignored — draw each subgraph as its own userflow call.`,
@@ -97,6 +106,12 @@ export function parseMermaid(source: string): ParsedMermaid {
     const n = nodes.get(id);
     if (n) n.cls = cls;
     else warnings.push(`mermaid: class applied to unknown node "${id}".`);
+  }
+
+  if (nodes.has("end")) {
+    warnings.push(
+      'mermaid: a node called "end" is drawn here, but Mermaid itself rejects lowercase `end` as a node id (it closes a subgraph). Rename it (e.g. `done`) so the source still renders in Mermaid.',
+    );
   }
 
   return { nodes: [...nodes.values()], edges, ...(rankdir ? { rankdir } : {}), warnings };

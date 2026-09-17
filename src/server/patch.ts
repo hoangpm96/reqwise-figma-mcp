@@ -259,6 +259,11 @@ function describe(m: unknown): string {
  * silently overwritten.
  */
 function assign(target: Record<string, unknown>, fields: Record<string, unknown>): void {
+  // Keys in one `set` read as simultaneous, so every index means the list as
+  // it was when the call was made. Removing as we went shifted the rest:
+  // {"attributes.1": null, "attributes.2": null} removed b and d, not b and c.
+  // Removals are collected and applied last, highest index first.
+  const removals = new Map<unknown[], Set<number>>();
   for (const [key, value] of Object.entries(fields)) {
     const path = key.split(".");
     const last = path.pop()!;
@@ -302,8 +307,27 @@ function assign(target: Record<string, unknown>, fields: Record<string, unknown>
     // `null` means REMOVE. JSON cannot carry `undefined`, so without this
     // there is no way to make a state stop being `final` or a message stop
     // being a `return` — the field could only ever be changed, never dropped.
-    if (value === null) delete (cur as Record<string, unknown>)[last];
+    if (Array.isArray(cur)) {
+      // A list leaf is an existing index, like the steps above: `delete` left
+      // a hole that serialised as null, and a far index padded with holes.
+      const i = /^\d+$/.test(last) ? Number(last) : -1;
+      if (i < 0 || i >= cur.length) {
+        throw new OpError(
+          ErrorCode.INVALID_PARAMS,
+          `Cannot set \`${key}\`: there is no index ${last} in that list.`,
+          "A list index has to already exist — use `add` to append a member, then set fields on it.",
+        );
+      }
+      if (value === null) {
+        const at = removals.get(cur) ?? new Set<number>();
+        at.add(i);
+        removals.set(cur, at);
+      } else cur[i] = value;
+    } else if (value === null) delete (cur as Record<string, unknown>)[last];
     else (cur as Record<string, unknown>)[last] = value;
+  }
+  for (const [list, at] of removals) {
+    for (const i of [...at].sort((a, b) => b - a)) list.splice(i, 1);
   }
 }
 

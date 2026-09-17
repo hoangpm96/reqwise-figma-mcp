@@ -129,6 +129,8 @@ Both are ignored on a decision diamond, which attaches at its tip.
 - a \`fork\` whose branches never reach a \`join\` — nobody waits for the parallel
   work;
 - a dead end that is not \`end\`/\`external\`, and a step nothing leads into;
+- an \`end\` with an arrow leaving it, or a \`start\` with an arrow coming in —
+  neither is really where the process stops or begins;
 - a lane with no steps.
 
 Use \`options.dryRun\` to iterate on the process before anything is drawn.

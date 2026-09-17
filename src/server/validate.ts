@@ -295,7 +295,9 @@ const OP_SCHEMAS: Partial<Record<Operation, z.ZodTypeAny>> = {
     .object({ pageId: nodeId.optional(), name: z.string().trim().min(1).optional() })
     .passthrough()
     .refine((p) => p.pageId || p.name, { message: "set_current_page requires pageId or name." }),
-  load_icon: z.object({ name: z.string().trim().min(1) }).passthrough(),
+  // The plugin draws the svg; `name` only labels the layer. figma.loadIcon()
+  // fetches the svg server-side and always sends both.
+  load_icon: z.object({ svg: z.string().min(1), name: z.string().optional() }).passthrough(),
   load_image: z.object({}).passthrough(),
   batch: z
     .object({ ops: z.array(z.object({ op: z.string(), params: z.record(z.unknown()) })).min(1) })
@@ -549,6 +551,16 @@ export const userflowSpecSchema = z
       "userflow needs nodes[] (with edges[]) or a mermaid source — the graph comes from YOUR analysis of the spec, not from the tool.",
   });
 
+/**
+ * Does a diagram spec carry compact `text` to parse? The builders take `text`
+ * only when it has something besides whitespace, so an empty or blank `text`
+ * beside valid arrays draws the arrays — the spec refines must agree, or they
+ * veto a spec the builder would draw correctly.
+ */
+function hasText(text: unknown): boolean {
+  return typeof text === "string" && text.trim().length > 0;
+}
+
 /** Parse a userflow spec or throw the standard INVALID_PARAMS OpError. */
 export function validateUserflowSpec(spec: unknown): Record<string, unknown> {
   const parsed = userflowSpecSchema.safeParse(spec ?? {});
@@ -564,11 +576,26 @@ export function validateUserflowSpec(spec: unknown): Record<string, unknown> {
   return parsed.data as Record<string, unknown>;
 }
 
+/**
+ * An id the plugin names a drawn layer with (`step:<id>`, `state:<id>`,
+ * `entity:<id>`, `party:<id>` …) and reads back with `[^\s]+`. An id with a
+ * space in it is cut at the space on the way back, so "Order Line" and
+ * "Order Header" both come back as "Order" and one box is taken for the
+ * other. The references to such an id (`from`, `to`, `lane`) are held to the
+ * same rule, so a mismatch is reported where it is written.
+ */
+const layerId = (what: string) =>
+  z
+    .string()
+    .trim()
+    .min(1)
+    .regex(/^\S+$/, `${what} must not contain whitespace — it is the handle the drawn layer is named with`);
+
 // ---- the user-facing activity spec (what an agent writes) ----
 
 const laneSpec = z
   .object({
-    id: z.string().trim().min(1),
+    id: layerId("lane id"),
     label: z.string().trim().min(1),
     detail: z.string().optional(),
   })
@@ -576,13 +603,13 @@ const laneSpec = z
 
 const activityNode = z
   .object({
-    id: z.string().trim().min(1),
+    id: layerId("step id"),
     label: z.string(),
     detail: z.string().optional(),
     // Required as soon as the diagram has lanes — an unowned step is the
     // drawing this tool exists to prevent. Omitted on EVERY step, it is a
     // plain activity diagram with no swimlanes, which is a real thing to want.
-    lane: z.string().trim().min(1).optional(),
+    lane: layerId("step `lane`").optional(),
     kind: z
       .enum(["action", "decision", "start", "end", "fork", "join", "event", "external"])
       .optional(),
@@ -592,8 +619,8 @@ const activityNode = z
 
 const activityEdge = z
   .object({
-    from: z.string().trim().min(1),
-    to: z.string().trim().min(1),
+    from: layerId("edge `from`"),
+    to: layerId("edge `to`"),
     label: z.string().optional(),
     kind: z.enum(["forward", "return"]).optional(),
     fromAt: portAt,
@@ -631,7 +658,7 @@ export const activitySpecSchema = z
       .optional(),
   })
   .passthrough()
-  .refine((sp) => typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.nodes) && sp.nodes.length > 0, {
+  .refine((sp) => hasText(sp.text) || (Array.isArray(sp.nodes) && sp.nodes.length > 0), {
     message: "Pass either `text` (the compact line form, e.g. `sys: pay ? 'Paid?'`) or lanes / nodes / edges. `text` is roughly a third of the tokens; figma_docs({ section, level: 'cheat' }) has the grammar.",
   });
 
@@ -654,7 +681,7 @@ export function validateActivitySpec(spec: unknown): Record<string, unknown> {
 
 const stateNode = z
   .object({
-    id: z.string().trim().min(1),
+    id: layerId("state id"),
     label: z.string().optional(),
     kind: z.enum(["state", "initial", "final", "choice", "fork", "join"]).optional(),
     entry: z.string().optional(),
@@ -667,8 +694,8 @@ const stateNode = z
 
 const transition = z
   .object({
-    from: z.string().trim().min(1),
-    to: z.string().trim().min(1),
+    from: layerId("transition `from`"),
+    to: layerId("transition `to`"),
     event: z.string().optional(),
     guard: z.string().optional(),
     action: z.string().optional(),
@@ -708,7 +735,7 @@ export const stateSpecSchema = z
       .optional(),
   })
   .passthrough()
-  .refine((sp) => typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.states) && sp.states.length > 0, {
+  .refine((sp) => hasText(sp.text) || (Array.isArray(sp.states) && sp.states.length > 0), {
     message: "Pass either `text` (the compact line form, e.g. `held -> paying: Confirm [guard] / action`) or states / transitions. `text` is roughly a third of the tokens; figma_docs({ section, level: 'cheat' }) has the grammar.",
   });
 
@@ -742,7 +769,7 @@ const erdAttribute = z
 
 const erdEntity = z
   .object({
-    id: z.string().trim().min(1),
+    id: layerId("entity id"),
     name: z.string().trim().min(1),
     detail: z.string().optional(),
     attributes: z.array(erdAttribute),
@@ -753,8 +780,8 @@ const erdEntity = z
 
 const erdRelation = z
   .object({
-    from: z.string().trim().min(1),
-    to: z.string().trim().min(1),
+    from: layerId("relation `from`"),
+    to: layerId("relation `to`"),
     fromCard: cardinality,
     toCard: cardinality,
     label: z.string().optional(),
@@ -792,7 +819,7 @@ export const erdSpecSchema = z
       .optional(),
   })
   .passthrough()
-  .refine((sp) => typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.entities) && sp.entities.length > 0, {
+  .refine((sp) => hasText(sp.text) || (Array.isArray(sp.entities) && sp.entities.length > 0), {
     message: "Pass either `text` (the compact line form, e.g. `users.id 1-* bookings.user_id 'books'`) or entities / relations. `text` is roughly a third of the tokens; figma_docs({ section, level: 'cheat' }) has the grammar.",
   });
 
@@ -815,7 +842,7 @@ export function validateErdSpec(spec: unknown): Record<string, unknown> {
 
 const seqParticipant = z
   .object({
-    id: z.string().trim().min(1),
+    id: layerId("participant id"),
     name: z.string().trim().min(1),
     detail: z.string().optional(),
     kind: z.enum(["actor", "system", "external", "queue", "db"]).optional(),
@@ -825,9 +852,9 @@ const seqParticipant = z
 
 const seqMessage = z
   .object({
-    id: z.string().trim().min(1),
-    from: z.string().trim().min(1),
-    to: z.string().trim().min(1),
+    id: layerId("message id"),
+    from: layerId("message `from`"),
+    to: layerId("message `to`"),
     label: z.string(),
     kind: z.enum(["sync", "async", "return"]).optional(),
     note: z.string().optional(),
@@ -873,7 +900,7 @@ export const sequenceSpecSchema = z
       .optional(),
   })
   .passthrough()
-  .refine((sp) => typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.messages) && sp.messages.length > 0, {
+  .refine((sp) => hasText(sp.text) || (Array.isArray(sp.messages) && sp.messages.length > 0), {
     message: "Pass either `text` (the compact line form, e.g. `u ->> api: POST /pay`) or participants / messages / fragments. `text` is roughly a third of the tokens; figma_docs({ section, level: 'cheat' }) has the grammar.",
   });
 
@@ -954,7 +981,7 @@ export const sitemapSpecSchema = z
   .passthrough()
   .refine(
     (sp) =>
-      typeof sp.text === "string" ? sp.text.trim().length > 0 : Array.isArray(sp.pages) && sp.pages.length > 0,
+      hasText(sp.text) || (Array.isArray(sp.pages) && sp.pages.length > 0),
     {
       message:
         "Pass either `text` (the compact line form — one line per page, INDENTED under the page that contains it) or `pages`. `text` is roughly a third of the tokens; figma_docs({ section: \"sitemap\", level: \"cheat\" }) has the grammar.",

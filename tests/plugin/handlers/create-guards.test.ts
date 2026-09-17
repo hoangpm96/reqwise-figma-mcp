@@ -149,6 +149,26 @@ describe("keepClearOnCanvas", () => {
     expect(nb.x).toBe(415);
   });
 
+  it("a row whose FIRST member lands clear still moves together once a later member collides", async () => {
+    // Two obstacles of different heights under the 2nd and 3rd screens. The
+    // 1st screen is clear, so it used to be the only member allowed to set
+    // the row's offset; the 2nd and 3rd each found their own spot and the row
+    // came out as a staircase (y 920 vs 720).
+    page.children.push(
+      { id: "9:1", type: "FRAME", name: "Tall", x: 500, y: 0, width: 400, height: 800 },
+      { id: "9:2", type: "FRAME", name: "Short", x: 1200, y: 0, width: 400, height: 600 },
+    );
+    const make = (x: number) =>
+      create(ctx({ type: "FRAME", width: 400, height: 500, x, y: 0, placeGroup: "run-2" })) as Promise<{ id: string }>;
+    await make(0);
+    const b = await make(500);
+    const c = await make(1200);
+    const nb = page.children.find((n: any) => n.id === b.id);
+    const nc = page.children.find((n: any) => n.id === c.id);
+    expect(nb.y).toBeGreaterThanOrEqual(800);
+    expect(nc.y).toBe(nb.y);
+  });
+
   it("does NOT move a nested node (positioned by its parent, not the page)", async () => {
     const parent = fakeFrame("11:1");
     parent.layoutMode = "VERTICAL";

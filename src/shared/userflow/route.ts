@@ -292,8 +292,11 @@ export function route(
   // ---- gutter lanes: the shortest hop takes the inner lane ----
   const gutterBase = new Map<number, number>();
   for (const side of [1, -1] as const) {
+    // A same-rank `return` is `back` but is drawn across the face between the
+    // two boxes, not in a gutter; counted here it took the inner lane (its
+    // hop is the shortest there is) and pushed every real gutter line out.
     const lane = edges
-      .filter((e) => e.back && e.side === side)
+      .filter((e) => e.back && e.side === side && !sameRank(byId.get(e.from)!, byId.get(e.to)!))
       .sort(
         (a, b) =>
           Math.abs(ax.aMid(byId.get(a.from)!) - ax.aMid(byId.get(a.to)!)) -
@@ -310,6 +313,12 @@ export function route(
   // How far a label sticks out ACROSS the flow: its width in TB, its height in
   // LR. Used for gutter clearance and for parking a self-loop's label.
   const crossHalf = (e: RouteEdge): number => (ax.vertical ? e.lw : e.lh) / 2;
+
+  // Only the edges actually drawn in a gutter have a gutter label. A `return`
+  // between two boxes on the same rank is `back` too, but it is routed across
+  // the face between them and never gets a side — so it must not be stacked
+  // against the gutter labels, which it is nowhere near.
+  const inGutter: RouteEdge[] = [];
 
   const grooveUse = new Map<string, number>();
   const stagger = (key: string): number => {
@@ -328,12 +337,12 @@ export function route(
 
     if (e.from === e.to) {
       const a1 = Math.min(e.portOut, e.portIn);
-      const a2 = Math.max(e.portOut, e.portIn) + (e.portOut === e.portIn ? 20 : 0);
+      const a2 = Math.max(e.portOut, e.portIn) + (e.portOut === e.portIn ? loopSpread(s, ax) : 0);
       const cOut = ax.c1(s) + 36;
-      push(a1, ax.c1(s));
+      push(a1, highOutline(s, a1, ax));
       push(a1, cOut);
       push(a2, cOut);
-      push(a2, ax.c1(s));
+      push(a2, highOutline(s, a2, ax));
       e.points = P;
       e.labelAt = ax.pt((a1 + a2) / 2, cOut + 8 + crossHalf(e));
     } else if (sameRank(s, t)) {
@@ -352,6 +361,7 @@ export function route(
       e.points = P;
       e.labelAt = e.labelLines.length ? ax.pt((a0 + a1) / 2, (c1 + c2) / 2) : null;
     } else if (e.back) {
+      inGutter.push(e);
       const base = gutterBase.get(e.side) ?? 28;
       const gc =
         e.side > 0
@@ -402,7 +412,28 @@ export function route(
     e.points = simplify(e.points);
   }
 
-  stackGutterLabels(edges, ax);
+  stackGutterLabels(inGutter, ax);
+}
+
+/**
+ * Where the high cross face of a node is at along-position `a`. A box's face
+ * is flat; a diamond's is its two slanted edges meeting at the side tip, so an
+ * end offset from the tip has to come in to meet the slant — left on the
+ * bounding box's line it stops in empty canvas beside the shape.
+ */
+function highOutline(n: RouteNode, a: number, ax: Axis): number {
+  if (n.kind !== "decision") return ax.c1(n);
+  const halfA = ax.aLen(n) / 2;
+  if (halfA <= 0) return ax.c1(n);
+  const off = Math.min(1, Math.abs(a - ax.aMid(n)) / halfA);
+  return ax.cMid(n) + (ax.cLen(n) / 2) * (1 - off);
+}
+
+/** How far apart a self-loop's two ends sit when they share one port. */
+function loopSpread(n: RouteNode, ax: Axis): number {
+  // A diamond narrows to nothing at its along tips; stay on the part of the
+  // slant that is still clearly beside the side tip.
+  return n.kind === "decision" ? Math.min(20, ax.aLen(n) / 4) : 20;
 }
 
 /**
@@ -459,11 +490,11 @@ function nearestOnPath(p: Pt, points: Pt[]): Pt {
   return best;
 }
 
-/** Gutter labels landing on each other: push the outer lanes further down. */
+/** Gutter labels landing on each other: push the outer lanes further along. */
 function stackGutterLabels(edges: RouteEdge[], ax: Axis): void {
   for (const side of [1, -1] as const) {
     const list = edges
-      .filter((e) => e.back && e.side === side && e.labelAt)
+      .filter((e) => e.side === side && e.labelAt)
       .sort((a, b) => a.lane - b.lane);
     for (let i = 0; i < list.length; i++) {
       for (let j = 0; j < i; j++) {
@@ -472,7 +503,11 @@ function stackGutterLabels(edges: RouteEdge[], ax: Axis): void {
         const overlapX = Math.abs(a.labelAt![0] - b.labelAt![0]) < (a.lw + b.lw) / 2 + 6;
         const overlapY = Math.abs(a.labelAt![1] - b.labelAt![1]) < (a.lh + b.lh) / 2 + 6;
         if (overlapX && overlapY) {
-          const shift = (a.lh + b.lh) / 2 + 8;
+          // The push is ALONG the flow, so it has to clear the labels' extent
+          // along the flow: their heights when the flow runs down, their
+          // widths when it runs across. Heights in LR moved a wide label a
+          // few pixels and left it overlapping.
+          const shift = (ax.vertical ? (a.lh + b.lh) / 2 : (a.lw + b.lw) / 2) + 8;
           a.labelAt = ax.pt(
             ax.ofA({ x: b.labelAt![0], y: b.labelAt![1] }) + shift,
             ax.ofC({ x: a.labelAt![0], y: a.labelAt![1] }),

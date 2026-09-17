@@ -55,12 +55,15 @@ interface OpenBlock {
   current: string[];
   elseLabel?: string;
   inElse: boolean;
+  /** Line order of the opening keyword: the tie-break for blocks over the same messages. */
+  opened: number;
 }
 
 export function parseSequenceText(src: string): ParsedSequence {
   const participants: SeqParticipantSpec[] = [];
   const messages: SeqMessageSpec[] = [];
   const fragments: SeqFragmentSpec[] = [];
+  const openedAt = new Map<SeqFragmentSpec, number>();
   const warnings: string[] = [];
   const known = new Set<string>();
   const stack: OpenBlock[] = [];
@@ -104,6 +107,7 @@ export function parseSequenceText(src: string): ParsedSequence {
         first: [],
         current: [],
         inElse: false,
+        opened: l.no,
       });
       continue;
     }
@@ -129,17 +133,24 @@ export function parseSequenceText(src: string): ParsedSequence {
         warnings.push(`sequence text, line ${l.no}: \`end\` with no open block.`);
         continue;
       }
-      fragments.push({
+      const frag: SeqFragmentSpec = {
         kind: b.kind,
         label: b.label,
         messages: b.first,
         ...(b.inElse ? { else: { label: b.elseLabel ?? "", messages: b.current } } : {}),
-      });
+      };
+      openedAt.set(frag, b.opened);
+      fragments.push(frag);
       continue;
     }
 
     // ---- a note on the message above ----
-    if (head === "note" || head.startsWith("note")) {
+    // Exactly `note` / `note:` — a participant called `notifier` or
+    // `notes-api` starts with "note" too, and its message used to vanish.
+    // And only when the line is not a message: a participant called exactly
+    // `note` (`note ->> api: b`) is a sender, and its arrows were being read as
+    // a note on the message above.
+    if ((head === "note" || head.startsWith("note:")) && !ARROW.test(l.text)) {
       const text = l.text.slice(l.text.indexOf(":") + 1).trim();
       const last = messages[messages.length - 1];
       if (!last || l.text.indexOf(":") < 0) {
@@ -202,7 +213,12 @@ export function parseSequenceText(src: string): ParsedSequence {
     const ids = [...f.messages, ...(f.else?.messages ?? [])];
     return (order.get(ids[ids.length - 1] ?? "") ?? 0) - startOf(f);
   };
-  fragments.sort((a, b) => startOf(a) - startOf(b) || spanOf(b) - spanOf(a));
+  // Same start and same span (`loop` whose whole body is an `opt`): only the
+  // line each was opened on says which is outside. Without this tie-break the
+  // stable sort kept close order, and the inner block was drawn around the outer.
+  fragments.sort(
+    (a, b) => startOf(a) - startOf(b) || spanOf(b) - spanOf(a) || (openedAt.get(a) ?? 0) - (openedAt.get(b) ?? 0),
+  );
 
   return { participants, messages, fragments, warnings };
 }

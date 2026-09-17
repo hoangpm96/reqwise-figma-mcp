@@ -688,7 +688,14 @@ function screenRootFor(node: BaseNode): SceneNode | null {
   let candidate: SceneNode | null = node.type !== "DOCUMENT" && node.type !== "PAGE" ? node as SceneNode : null;
   while (cur?.parent) {
     if (cur.parent.type === "PAGE") return cur.type === "DOCUMENT" || cur.type === "PAGE" ? candidate : cur as SceneNode;
-    if (cur.parent.type === "SECTION" && cur.parent.parent?.type === "PAGE") return cur as SceneNode;
+    if (cur.parent.type === "SECTION" && cur.parent.parent?.type === "PAGE") {
+      // Mirror collectScreenRoots: a section holding frames has those frames
+      // as its screens, but a section with none IS the screen. Returning the
+      // child there matched no registered screen id, so every instance drawn
+      // straight into such a section counted 0 toward it.
+      const section = cur.parent as SectionNode;
+      return section.children.some((child) => child.type === "FRAME") ? cur as SceneNode : section;
+    }
     if (cur.type !== "DOCUMENT" && cur.type !== "PAGE") candidate = cur as SceneNode;
     cur = cur.parent;
   }

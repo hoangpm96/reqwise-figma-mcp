@@ -438,3 +438,24 @@ describe("review follow-ups", () => {
     expect(p.warnings.join(" ")).toContain("class statement");
   });
 });
+
+describe("mermaid headers and the `end` keyword", () => {
+  it("a bare `flowchart` header is a header, not a node", () => {
+    const p = parseMermaid(`flowchart\n  a["A"] --> b["B"]`);
+    expect(p.nodes.map((n) => n.id)).toEqual(["a", "b"]);
+  });
+
+  it("RL / BT are drawn LR / TB, and say so", () => {
+    const rl = parseMermaid(`graph RL\n  a --> b`);
+    expect(rl.rankdir).toBe("LR");
+    expect(rl.warnings.join(" ")).toMatch(/RL is drawn as LR/);
+    expect(parseMermaid(`graph LR\n  a --> b`).warnings).toEqual([]);
+  });
+
+  it("`end` as a node is kept consistently and warned about; a bare `end` is still skipped", () => {
+    const p = parseMermaid(`flowchart TD\n  subgraph S\n  a --> b\n  end\n  end["Done"] --> a`);
+    expect(p.nodes.map((n) => n.id).sort()).toEqual(["a", "b", "end"]);
+    expect(p.edges.some((e) => e.from === "end" && e.to === "a")).toBe(true);
+    expect(p.warnings.join(" ")).toMatch(/lowercase `end`/);
+  });
+});

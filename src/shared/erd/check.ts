@@ -90,7 +90,10 @@ export function checkErd(
 
     if (r.fromField && !fromAttr) badField.push(`"${r.from}.${r.fromField}"`);
     if (r.toField && !toAttr) badField.push(`"${r.to}.${r.toField}"`);
-    if (!r.fromField && !r.toField) noField.push(`${r.from} → ${r.to}`);
+    // Either end missing is enough: the line then attaches mid-box at that
+    // end, and the text parser already reports a relationship with one column
+    // named — the JSON form should not be quieter than the text one.
+    if (!r.fromField || !r.toField) noField.push(`${r.from} → ${r.to}`);
 
     if (fromAttr?.type && toAttr?.type && normalizeType(fromAttr.type) !== normalizeType(toAttr.type)) {
       typeClash.push(

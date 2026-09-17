@@ -107,14 +107,22 @@ export function checkSitemap(rawPages: PageSpec[], maxDepth = DEFAULT_MAX_DEPTH)
 
   // ---- what the tree actually reaches ----
   const depth = new Map<string, number>();
+  /**
+   * Levels a user actually navigates: `depth` minus every modal on the way
+   * down. Kept apart from `depth` because the layout draws a row per tree
+   * level, and a modal's children still need a row below the modal.
+   */
+  const clicks = new Map<string, number>();
   const order: string[] = [];
-  const walk = (id: string, level: number): void => {
+  const walk = (id: string, level: number, click: number): void => {
     if (depth.has(id)) return;
     depth.set(id, level);
+    clicks.set(id, click);
     order.push(id);
-    for (const kid of children.get(id) ?? []) walk(kid, level + 1);
+    const through = byId.get(id)?.kind === "modal" ? click : click + 1;
+    for (const kid of children.get(id) ?? []) walk(kid, level + 1, through);
   };
-  for (const id of roots) walk(id, 1);
+  for (const id of roots) walk(id, 1, 1);
 
   const unreachable = declared.filter((p) => !depth.has(p.id));
   if (danglers.length) {
@@ -164,10 +172,12 @@ export function checkSitemap(rawPages: PageSpec[], maxDepth = DEFAULT_MAX_DEPTH)
 
   // ---- how deep ----
   // A `modal` is not a level: a dialog opens on top of the page you are on, so
-  // counting it would report a depth the user never navigates.
-  const deep = pages.filter((p) => (depth.get(p.id) ?? 1) > maxDepth && p.kind !== "modal");
+  // counting it would report a depth the user never navigates. That holds for
+  // what is UNDER a modal too — skipping only the modal itself still counted
+  // it for every page below, and a page four clicks deep read as five.
+  const deep = pages.filter((p) => (clicks.get(p.id) ?? 1) > maxDepth && p.kind !== "modal");
   if (deep.length) {
-    const worst = Math.max(...pages.map((p) => (p.kind === "modal" ? 0 : (depth.get(p.id) ?? 1))));
+    const worst = Math.max(...pages.map((p) => (p.kind === "modal" ? 0 : (clicks.get(p.id) ?? 1))));
     warnings.push(
       `${deep.length} page(s) are ${maxDepth + 1}+ levels deep (deepest ${worst}): ${list(deep.slice(0, 6).map((p) => `"${nameOf(p.id)}"`))}. That is ${worst - 1} clicks from the front door — either the middle levels are doing no work and can be collapsed, or ${deep.length > 1 ? "those pages" : "that page"} needs reaching another way (search, a shortcut in the nav). Raise options.maxDepth if this IA is deliberately deep.`,
     );
@@ -218,6 +228,9 @@ export function checkSitemap(rawPages: PageSpec[], maxDepth = DEFAULT_MAX_DEPTH)
     for (const art of artboardsOf(p)) {
       const key = art.toLowerCase();
       const bucket = claimedBy.get(key);
+      // One page listing the same artboard twice (`screen:01,01`) is a
+      // repeated word, not a second owner — it read as a clash with itself.
+      if (bucket?.includes(p.id)) continue;
       if (bucket) bucket.push(p.id);
       else claimedBy.set(key, [p.id]);
     }

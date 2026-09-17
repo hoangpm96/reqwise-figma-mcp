@@ -9,7 +9,7 @@
  * nothing in time, because the row a message sits on IS its order.
  */
 import { readDiagramData, SEQUENCE_MARKER } from "./diagram-mark.js";
-import { applyEdge, canvasChildren, growToFit, hideEdge, hideLayer, indexChildren, scanBoxes, unhide } from "./diagram-apply.js";
+import { applyEdge, canvasChildren, growToFit, hideEdge, hideLayer, indexChildren, scanBoxes, unhide, restoreAutoHidden } from "./diagram-apply.js";
 import { setPolyline } from "./vector-path.js";
 import { reflowSequence } from "../shared/sequence/layout.js";
 import type { FlowClass, Placement } from "../shared/diagram/types.js";
@@ -43,13 +43,13 @@ export function sequenceFrames(page: PageNode): FrameNode[] {
 
 export async function reflowSequenceFrame(
   frame: FrameNode,
-  opts?: { grow?: boolean; onlyIfMoved?: boolean; force?: boolean },
+  opts?: { grow?: boolean; onlyIfMoved?: boolean; force?: boolean; deleted?: boolean },
 ): Promise<SequenceReflowReport | null> {
   const graph = sequenceGraphOf(frame);
   if (!graph) return null;
 
   const byName = indexChildren(frame);
-  const scan = scanBoxes(frame, graph.participants, "party:");
+  const scan = scanBoxes(frame, graph.participants, "party:", opts?.deleted === true);
   const { placed, goneBoxes } = scan;
 
   // Not one box found, though the graph names some: this frame is being
@@ -75,6 +75,10 @@ export async function reflowSequenceFrame(
   );
   const changed = moved.length > 0 || dropped.length > 0;
   if (opts?.onlyIfMoved && !changed) {
+    // An undone delete brings its box back where it was, so nothing reads as
+    // moved — but the lines hidden when it went are still hidden. See
+    // restoreAutoHidden.
+    if (!goneBoxes.length) restoreAutoHidden(byName);
     return {
       frameId: frame.id,
       name: frame.name,

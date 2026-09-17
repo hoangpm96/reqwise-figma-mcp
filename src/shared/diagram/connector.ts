@@ -78,11 +78,139 @@ export function connectPorts(
   const a = f.to(p0);
   const b = f.to(p1);
   const dir = f.to(d1);
-  const local = join(a, b, dir[0]! > 0.5 ? "+x" : dir[0]! < -0.5 ? "-x" : dir[1]! > 0.5 ? "+y" : "-y");
+  const d: Dir = dir[0]! > 0.5 ? "+x" : dir[0]! < -0.5 ? "-x" : dir[1]! > 0.5 ? "+y" : "-y";
+  const boxes = [localBox(from.box, f), localBox(to.box, f)];
+  const shaped = join(a, b, d);
+  // The shapes in join() are chosen from the two POINTS alone, and a point
+  // says nothing about how big the box behind it is: a U-turn that steps
+  // aside by a fixed amount runs straight through a tall target. Keep the
+  // shape when it is clear — it is the shortest, and every drawn diagram
+  // already relies on it — and look for one that goes round otherwise.
+  const local = clearOf(simplify(shaped), boxes) ? shaped : (goAround(a, b, d, boxes) ?? shaped);
   return simplify(local.map(f.from));
 }
 
 type Dir = "+x" | "-x" | "+y" | "-y";
+
+/** A box as extents in the local frame (corners rotated, then re-ordered). */
+interface Extent {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+function localBox(box: Placement, f: { to: (p: Pt) => Pt }): Extent {
+  const p = f.to([box.x, box.y]);
+  const q = f.to([box.x + box.w, box.y + box.h]);
+  return {
+    x0: Math.min(p[0], q[0]),
+    y0: Math.min(p[1], q[1]),
+    x1: Math.max(p[0], q[0]),
+    y1: Math.max(p[1], q[1]),
+  };
+}
+
+/**
+ * Does no segment pass through the INSIDE of either box? Running along a face
+ * is fine (the ports sit on faces, so the first and last segments start and
+ * end on one), which is why the box is shrunk by half a pixel first.
+ */
+function clearOf(path: Pt[], boxes: Extent[]): boolean {
+  for (let i = 1; i < path.length; i++) {
+    const p = path[i - 1]!;
+    const q = path[i]!;
+    const x0 = Math.min(p[0], q[0]);
+    const x1 = Math.max(p[0], q[0]);
+    const y0 = Math.min(p[1], q[1]);
+    const y1 = Math.max(p[1], q[1]);
+    for (const b of boxes) {
+      if (x0 < b.x1 - 0.5 && x1 > b.x0 + 0.5 && y0 < b.y1 - 0.5 && y1 > b.y0 + 0.5) return false;
+    }
+  }
+  return true;
+}
+
+/** Does the line double straight back on itself anywhere? That reads as a spike, not a route. */
+function turnsBack(path: Pt[]): boolean {
+  for (let i = 2; i < path.length; i++) {
+    const u: Pt = [path[i - 1]![0] - path[i - 2]![0], path[i - 1]![1] - path[i - 2]![1]];
+    const v: Pt = [path[i]![0] - path[i - 1]![0], path[i]![1] - path[i - 1]![1]];
+    if (u[0] * v[0] + u[1] * v[1] < 0) return true;
+  }
+  return false;
+}
+
+/**
+ * The fallback when the point-only shape cuts through a box: try the
+ * orthogonal paths with up to four turns whose legs run along lines that clear
+ * both boxes, and keep the shortest one that touches neither (a turn costs a
+ * little length, so a path does not zig-zag to save a pixel). The stubs shrink
+ * to half the gap when the two boxes sit closer than a stub — otherwise the
+ * very first segment would already be inside the other box, and nothing after
+ * it could fix that.
+ */
+function goAround(a: Pt, b: Pt, dir: Dir, boxes: Extent[]): Pt[] | null {
+  const into: Pt = dir === "+x" ? [1, 0] : dir === "-x" ? [-1, 0] : dir === "+y" ? [0, 1] : [0, -1];
+  const stubOut = stubLength(a, [1, 0], boxes);
+  const stubIn = stubLength(b, [-into[0], -into[1]], boxes);
+  const s: Pt = [a[0] + stubOut, a[1]];
+  const e: Pt = [b[0] - into[0] * stubIn, b[1] - into[1] * stubIn];
+
+  // Lines a leg may run along: the two stub ends, and just outside every box
+  // face, at the stub's distance.
+  const xs = new Set<number>([s[0], e[0]]);
+  const ys = new Set<number>([s[1], e[1]]);
+  for (const box of boxes) {
+    xs.add(box.x0 - STUB);
+    xs.add(box.x1 + STUB);
+    ys.add(box.y0 - STUB);
+    ys.add(box.y1 + STUB);
+  }
+
+  const middles: Pt[][] = [[[e[0], s[1]]], [[s[0], e[1]]]];
+  for (const x of xs) middles.push([[x, s[1]], [x, e[1]]]);
+  for (const y of ys) middles.push([[s[0], y], [e[0], y]]);
+  for (const x of xs) {
+    for (const y of ys) {
+      middles.push([[s[0], y], [x, y], [x, e[1]]]);
+      middles.push([[x, s[1]], [x, y], [e[0], y]]);
+    }
+  }
+
+  let best: { path: Pt[]; cost: number } | null = null;
+  for (const mid of middles) {
+    const path = simplify([a, s, ...mid, e, b]);
+    if (turnsBack(path) || !clearOf(path, boxes)) continue;
+    let cost = 0;
+    for (let i = 1; i < path.length; i++) {
+      cost += Math.abs(path[i]![0] - path[i - 1]![0]) + Math.abs(path[i]![1] - path[i - 1]![1]);
+    }
+    cost += (path.length - 2) * 8;
+    if (!best || cost < best.cost) best = { path, cost };
+  }
+  return best ? best.path : null;
+}
+
+/** STUB, or half the room in front of the port when a box is closer than that. */
+function stubLength(p: Pt, d: Pt, boxes: Extent[]): number {
+  let len = STUB;
+  for (const box of boxes) {
+    // Distance to the first face of this box straight ahead, if the ray hits it.
+    if (d[0] !== 0) {
+      if (!(p[1] > box.y0 + 0.5 && p[1] < box.y1 - 0.5)) continue;
+      const face = d[0] > 0 ? box.x0 : box.x1;
+      const gap = (face - p[0]) * d[0];
+      if (gap > 0.5 && gap < len * 2) len = Math.min(len, gap / 2);
+    } else {
+      if (!(p[0] > box.x0 + 0.5 && p[0] < box.x1 - 0.5)) continue;
+      const face = d[1] > 0 ? box.y0 : box.y1;
+      const gap = (face - p[1]) * d[1];
+      if (gap > 0.5 && gap < len * 2) len = Math.min(len, gap / 2);
+    }
+  }
+  return len;
+}
 
 /**
  * Join two points in a frame where the line MUST leave `a` heading +x and
@@ -199,8 +327,13 @@ export function routeThroughPorts(
 ): Pt[] | null {
   if (!wish.fromPort && !wish.toPort) return null;
   if (points.length < 2) return null;
-  const from = wish.fromPort ?? nearestPort(boxes.from, points[0]!, 6);
-  const to = wish.toPort ?? nearestPort(boxes.to, points[points.length - 1]!, 6);
+  // The end nobody set is read back off the route. No distance limit: the
+  // routers do not always end a line exactly on the perimeter (a start point
+  // can sit inside the box it leaves), and refusing to read that end threw
+  // away the port somebody DID set on the other one. The nearest face is the
+  // face the router meant.
+  const from = wish.fromPort ?? nearestPort(boxes.from, points[0]!, Infinity);
+  const to = wish.toPort ?? nearestPort(boxes.to, points[points.length - 1]!, Infinity);
   if (!from || !to) return null;
   return connectPorts({ box: boxes.from, port: from }, { box: boxes.to, port: to });
 }

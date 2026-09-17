@@ -10,7 +10,7 @@
 import dagre from "@dagrejs/dagre";
 import { clearLabelOverlaps, r2, type Pt } from "../diagram/geometry.js";
 import { portPoint, type Port } from "../diagram/connector.js";
-import { emitWires, many, placeLabels, route, type Anchored, type Wire } from "./route.js";
+import { emitWires, many, placeLabels, route, rowAt, type Anchored, type Wire } from "./route.js";
 import { headerHeight, lineHeight, textWidth, wrapText } from "../diagram/metrics.js";
 import { DEFAULT_FONT, INK, MUTED, PALETTE } from "../diagram/palette.js";
 import type { DrawEdge, FlowClass, Placement } from "../diagram/types.js";
@@ -92,8 +92,15 @@ export function layoutErd(
       ...(r.toField ? { toField: r.toField } : {}),
       identifying: r.identifying === true,
       ...measureLabel(r.label),
-      ...(r.fromSide ? { fromPort: { side: r.fromSide, at: 0.5 } } : {}),
-      ...(r.toSide ? { toPort: { side: r.toSide, at: 0.5 } } : {}),
+      // A pinned side still attaches at the column that implements the
+      // relationship. The port is stored in the graph as it is, so a 0.5 here
+      // was not a first-draw glitch: every re-route kept the line mid-box.
+      ...(r.fromSide
+        ? { fromPort: { side: r.fromSide, at: rowAt(toAnchored(byId.get(r.from)!), r.fromField, r.fromSide) } }
+        : {}),
+      ...(r.toSide
+        ? { toPort: { side: r.toSide, at: rowAt(toAnchored(byId.get(r.to)!), r.toField, r.toSide) } }
+        : {}),
       points: [],
       labelAt: null,
     }));

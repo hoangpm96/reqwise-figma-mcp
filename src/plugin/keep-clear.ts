@@ -87,9 +87,13 @@ export function keepClearOnCanvas(node: SceneNode, p: Record<string, unknown>, c
 
   const spot = findFreeSpot(occupied, want, PLACE_GUTTER);
   self.y = spot.y;
-  // Only the first mover sets the group's offset; members already placed at
-  // their own spot cannot follow a later one.
-  if (group && group.dy === 0 && group.ids.size === 1) group.dy = spot.y - want.y;
+  // The first member that has to move sets the group's offset, whichever
+  // member that is. This used to require being the group's first member
+  // (ids.size === 1, and ids is filled above), so when the first screen of a
+  // row happened to land clear, no later one could ever set it: each collider
+  // found its own spot and the row came out as a staircase. A member that sat
+  // clear before this point stays where it is — nothing covered it.
+  if (group && group.dy === 0) group.dy = spot.y - want.y;
   ctx.warn(
     `New ${node.type} "${node.name || "(unnamed)"}" overlapped existing "${hit.name}" at (${Math.round(want.x)},${Math.round(want.y)}), so it was moved to (${Math.round(spot.x)},${Math.round(spot.y)}) instead — clear of existing work. Pick a free x/y, or pass allowOverlap:true to lay it on top on purpose.`,
   );

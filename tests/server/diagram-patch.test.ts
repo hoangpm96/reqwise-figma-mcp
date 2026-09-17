@@ -402,3 +402,56 @@ describe("reaching into lists, and taking a field away", () => {
     expect((spec.options as any).policies).toEqual({ b: 2 });
   });
 });
+
+describe("a lane-less activity diagram", () => {
+  it("can be patched after it is drawn", async () => {
+    // With no lanes[] the check used to store every step with `lane: ""`, and
+    // the activity schema (a lane id is at least one character) then refused
+    // the model the frame itself had saved — so the one thing a stored model
+    // is for, a patch, failed on "nodes.0.lane" for every plain diagram.
+    const drawn = ctxWith(undefined);
+    await handleDiagram(drawn.ctx, "activity", {
+      title: "Plain",
+      nodes: [{ id: "a", label: "A" }, { id: "b", label: "B" }],
+      edges: [{ from: "a", to: "b" }],
+    });
+    const source = drawn.calls.find((c) => c[0] === "create_activity")![1].source;
+    expect(source.nodes[0]).not.toHaveProperty("lane");
+
+    const { ctx, calls } = ctxWith({ nodeId: "140:5914", kind: "activity", spec: source });
+    const res = (await handleDiagram(ctx, undefined, {
+      update: "140:5914",
+      patch: [{ collection: "nodes", id: "a", set: { label: "Start here" } }],
+    })) as Record<string, any>;
+    expect(calls.map((c) => c[0])).toContain("create_activity");
+    const draw = calls.find((c) => c[0] === "create_activity")![1];
+    expect(draw.source.nodes[0].label).toBe("Start here");
+    expect(res.patched).toEqual(["set label on nodes a"]);
+  });
+});
+
+describe("plugin answers that come wrapped with warnings", () => {
+  // An op that calls ctx.warn answers { result, warnings } instead of the bare
+  // value. The patch path read `stored.spec` and the audit `raw.summary` off
+  // the wrapper, so one warning made a patch find no model and an audit no
+  // issues.
+  it("a patch still reads the stored model, and the audit its issues", async () => {
+    const calls: string[] = [];
+    const ctx = {
+      runValidated: vi.fn(async (op: string) => {
+        calls.push(op);
+        if (op === "get_diagram_spec") return { result: { kind: "sequence", spec: MODEL }, warnings: ["w"] };
+        if (op === "layout_audit") {
+          return { result: { nodeCount: 9, summary: { issues: ["clipped text"], styleHints: [] } }, warnings: ["w"] };
+        }
+        return { frameId: "140:5914" };
+      }),
+    } as unknown as ToolContext;
+    const res = (await handleDiagram(ctx, undefined, {
+      update: "140:5914",
+      patch: [{ collection: "messages", id: "m2", set: { label: "201 created" } }],
+    })) as Record<string, any>;
+    expect(res.patched).toEqual(["set label on messages m2"]);
+    expect(JSON.stringify(res.audit)).toContain("clipped text");
+  });
+});

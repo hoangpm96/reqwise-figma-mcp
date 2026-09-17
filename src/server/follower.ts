@@ -186,12 +186,27 @@ export class Follower {
                 const json = JSON.parse(data) as {
                   ok?: boolean;
                   result?: unknown;
-                  error?: { code: ErrorCode; message: string; hint?: string };
+                  error?: unknown;
                 };
+                // Only a real error envelope is passed on. The leader's 404
+                // body is `{ error: "not found" }` — read as an envelope it
+                // became an OpError with no code and an empty message.
+                const err = json.error as { code?: unknown; message?: unknown; hint?: unknown } | undefined;
                 if (json.ok === true) {
                   resolve(json.result);
-                } else if (json.error) {
-                  reject(new OpError(json.error.code, json.error.message, json.error.hint));
+                } else if (
+                  err &&
+                  typeof err === "object" &&
+                  typeof err.code === "string" &&
+                  typeof err.message === "string"
+                ) {
+                  reject(
+                    new OpError(
+                      err.code as ErrorCode,
+                      err.message,
+                      typeof err.hint === "string" ? err.hint : undefined,
+                    ),
+                  );
                 } else {
                   reject(new OpError(ErrorCode.INTERNAL, "Malformed /rpc response from leader.", "Leader/follower version mismatch — restart both."));
                 }

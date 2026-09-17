@@ -52,6 +52,14 @@ const SELF_OUT = 46;
 const FRAG_TOP = 30;
 const FRAG_BOTTOM = 16;
 const FRAG_SIDE = 34;
+/** How far a nested fragment box steps in from each side per level. */
+const NEST_INSET = 8;
+/** The least a nested box steps in per level once its tab no longer fits. */
+const NEST_MIN_STEP = 2;
+/** No box, however deep, gets narrower than this. */
+const NEST_MIN_W = 12;
+/** Narrowest a nested box is stepped in to, whatever its tab says. */
+const FRAG_MIN_W = 48;
 
 const LIFELINE = "#aeb6c2";
 const FRAG_STROKE = "#94a3b8";
@@ -469,6 +477,18 @@ function placeFragments(
   for (const m of msgs) byMsg.set(m.id, m);
   const out: Box[] = [];
 
+  // Which fragment sits inside which, by the messages they hold. Two fragments
+  // over the SAME messages (a `loop` whose whole body is an `opt`) are nested
+  // too: the one written first is the outer one, as the text parser emits them.
+  const sets = fragments.map(
+    (f) => new Set(f.messages.concat(f.else?.messages ?? []).filter((id) => byMsg.has(id))),
+  );
+  const inside = (j: number, i: number): boolean => {
+    if (i === j || !sets[j]!.size) return false;
+    for (const id of sets[j]!) if (!sets[i]!.has(id)) return false;
+    return sets[j]!.size < sets[i]!.size || j > i;
+  };
+
   fragments.forEach((f, i) => {
     const all = f.messages.concat(f.else?.messages ?? []);
     const held = all.map((id) => byMsg.get(id)).filter((m): m is Msg => !!m);
@@ -488,6 +508,21 @@ function placeFragments(
 
     const first = held[0]!;
     const last = held[held.length - 1]!;
+    // placeRows already reserved one band above the first message for EVERY
+    // fragment opening there, and one below the last for every fragment
+    // closing there. Each box takes the band its nesting gives it: fragments
+    // nested inside this one and sharing its first (last) message sit closer
+    // in, so this one steps out past them. Without it two boxes over the same
+    // messages were drawn on top of each other, identical to the pixel.
+    let opensInside = 0;
+    let closesInside = 0;
+    for (let j = 0; j < fragments.length; j++) {
+      if (!inside(j, i)) continue;
+      const g = fragments[j]!;
+      const ids = g.messages.concat(g.else?.messages ?? []).filter((id) => byMsg.has(id));
+      if (ids[0] === first.id) opensInside++;
+      if (ids[ids.length - 1] === last.id) closesInside++;
+    }
     const elseFirst = f.else?.messages.map((id) => byMsg.get(id)).find((m): m is Msg => !!m);
     const label = `${f.kind} · ${f.label}`;
     out.push({
@@ -495,8 +530,13 @@ function placeFragments(
       kind: f.kind,
       label: f.label,
       parties: Array.from(parties),
-      top: first.y - fragTop(first) + 6,
-      bottom: last.y + (last.self ? SELF_ROW : ROW) - 10 + (last.nh ? last.nh + 6 : 0),
+      top: first.y - (1 + opensInside) * fragTop(first) + 6,
+      bottom:
+        last.y +
+        (last.self ? SELF_ROW : ROW) -
+        10 +
+        (last.nh ? last.nh + 6 : 0) +
+        closesInside * FRAG_BOTTOM,
       left: Math.min(...xs) - FRAG_SIDE,
       right: Math.max(...xs) + FRAG_SIDE,
       tabW: textWidth(label, 10) + 16,
@@ -506,7 +546,47 @@ function placeFragments(
         : {}),
     });
   });
+  const depth = nestDepth(out);
+  out.forEach((b, i) => {
+    const inset = nestInset(depth[i]!, b.right - b.left, b.tabW);
+    b.left += inset;
+    b.right -= inset;
+  });
   return out;
+}
+
+/**
+ * How far a box at this nesting depth steps in from each side.
+ *
+ * Eight pixels a level, but never so far that the box gets narrower than its
+ * own tab (or a sane minimum). Uncapped, six loops nested around one self
+ * message came out 68, 52, 36, 20, 4 and -12 wide: from the third level the
+ * word "loop" stuck out past its box, and the last resize made Figma throw.
+ * Past the cap the deeper boxes keep the same width — they still read as
+ * nested by their top and bottom, which step out per level regardless. The
+ * layout and the reflow both go through here, so a drag never changes a width
+ * the first draw did not have.
+ */
+function nestInset(depth: number, width: number, tabW: number): number {
+  const floor = Math.max(tabW, FRAG_MIN_W);
+  const roomy = Math.min(depth * NEST_INSET, (width - floor) / 2);
+  // Past the cap every level still steps in a little, so two nested boxes
+  // never share a left/right edge (a narrow box used to fall back to the
+  // outermost x). Bounded so even a deep stack keeps a visible width.
+  const stepped = Math.max(roomy, depth * NEST_MIN_STEP);
+  return Math.max(0, Math.min(stepped, (width - NEST_MIN_W) / 2));
+}
+
+/**
+ * How many other boxes enclose each one, read off the boxes' own top and
+ * bottom. Geometry rather than the message lists, because the reflow only has
+ * the stored boxes — and a box nested in another then steps in from both
+ * sides, so its border never runs along its parent's on a shared lifeline.
+ */
+function nestDepth(boxes: Array<{ top: number; bottom: number }>): number[] {
+  return boxes.map(
+    (b) => boxes.filter((o) => o !== b && o.top < b.top && o.bottom > b.bottom).length,
+  );
 }
 
 // ------------------------------------------------------------------ emit ----
@@ -709,12 +789,16 @@ export function reflowSequence(
       },
     }));
 
-  const fragments: DrawFragment[] = graph.fragments.map((f) => {
+  const depth = nestDepth(graph.fragments);
+  const fragments: DrawFragment[] = graph.fragments.map((f, i) => {
     const xs = f.parties
       .map((id) => byId.get(id)?.cx)
       .filter((x): x is number => typeof x === "number");
-    const left = xs.length ? Math.min(...xs) - FRAG_SIDE : 0;
-    const right = xs.length ? Math.max(...xs) + FRAG_SIDE : 0;
+    const outerLeft = xs.length ? Math.min(...xs) - FRAG_SIDE : 0;
+    const outerRight = xs.length ? Math.max(...xs) + FRAG_SIDE : 0;
+    const inset = xs.length ? nestInset(depth[i]!, outerRight - outerLeft, f.tabW) : 0;
+    const left = outerLeft + inset;
+    const right = outerRight - inset;
     return {
       id: f.id,
       kind: f.kind,

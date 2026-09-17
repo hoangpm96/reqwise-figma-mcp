@@ -90,12 +90,16 @@ export function parseErdText(src: string): ParsedErd {
 
     // Indented under an entity → one of its columns.
     if (l.indent > 0 && current) {
-      const m = ATTR.exec(l.text) ?? KEY_ONLY.exec(l.text);
+      // KEY_ONLY first: ATTR's free-text type also matches `pk`, so `id pk!`
+      // read as a column of TYPE pk — no key badge, and a false "no primary
+      // key" finding.
+      const keyOnly = KEY_ONLY.exec(l.text);
+      const m = keyOnly ?? ATTR.exec(l.text);
       if (!m) {
         unknownLine(warnings, "erd", l);
         continue;
       }
-      const isKeyOnly = !ATTR.exec(l.text);
+      const isKeyOnly = keyOnly !== null;
       const attr: ErdAttributeSpec = isKeyOnly
         ? {
             name: m[1]!,

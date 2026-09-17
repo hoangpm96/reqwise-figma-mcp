@@ -17,8 +17,8 @@
  * on every draw stays page-local for exactly that reason; this is the call an
  * agent makes ONCE, at the start of a session, to find out what already exists.
  */
-import { HandlerContext } from "../context.js";
-import { pageArtboards, readDiagramSource } from "../diagram-apply.js";
+import { HandlerContext, getNodeByIdSafe } from "../context.js";
+import { canvasChildren, pageArtboards, readDiagramSource } from "../diagram-apply.js";
 import { isDiagramFrameName } from "../diagram-mark.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
@@ -44,7 +44,7 @@ export async function getPageModel(ctx: HandlerContext): Promise<unknown> {
 
   let page: BaseNode | null = figma.currentPage;
   if (pageId) {
-    page = await figma.getNodeByIdAsync(pageId);
+    page = await getNodeByIdSafe(pageId);
     if (!page || page.type !== "PAGE") {
       throw err(
         ErrorCode.NODE_NOT_FOUND,
@@ -73,7 +73,10 @@ function collect(
   into: Array<Record<string, unknown>>,
   withPage: boolean,
 ): void {
-  for (const child of page.children) {
+  // canvasChildren, like `artboards` below it: a diagram dragged into a
+  // SECTION was left out entirely — not even listed as unreadable — so the
+  // cross-check ran on a partial page and reported nothing.
+  for (const child of canvasChildren(page)) {
     const mark = readDiagramSource(child);
 
     // A frame drawn by an older build carries no `kind`, so nothing here can

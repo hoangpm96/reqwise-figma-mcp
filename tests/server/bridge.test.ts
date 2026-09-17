@@ -656,3 +656,84 @@ describe("bridge hardening", () => {
     expect(bridge.channelCount).toBe(0);
   });
 });
+
+describe("queued ops do not outlive their caller", () => {
+  it("an unrouted op gives up after its timeout instead of running on a later window", async () => {
+    const { bridge, port } = await newBridge();
+    const early = bridge.dispatch("create", { type: "FRAME" }, { timeoutMs: 80 });
+    await expect(early).rejects.toMatchObject({ code: "PLUGIN_TIMEOUT" });
+    expect(bridge.queueLength).toBe(0);
+
+    // The window that connects afterwards must not receive the dead op.
+    const received: BridgeRequest[] = [];
+    const p = new FakePlugin();
+    p.onRequest = (req) => received.push(req);
+    await p.connect(port);
+    await delay(50);
+    expect(received).toHaveLength(0);
+  });
+
+  it("aborting the caller's signal drops an op still waiting in the unrouted queue", async () => {
+    const { bridge, port } = await newBridge();
+    const abort = new AbortController();
+    const early = bridge.dispatch("create", { type: "FRAME" }, { timeoutMs: 10_000, signal: abort.signal });
+    await delay(20);
+    abort.abort();
+    await expect(early).rejects.toMatchObject({ code: "PLUGIN_TIMEOUT" });
+
+    const received: BridgeRequest[] = [];
+    const p = new FakePlugin();
+    p.onRequest = (req) => received.push(req);
+    await p.connect(port);
+    await delay(50);
+    expect(received).toHaveLength(0);
+  });
+
+  it("aborting drops an op queued behind an in-flight one, but leaves the in-flight op alone", async () => {
+    const { bridge, port } = await newBridge();
+    const received: BridgeRequest[] = [];
+    const p = new FakePlugin();
+    p.onRequest = (req) => received.push(req);
+    await p.connect(port);
+
+    const abort = new AbortController();
+    const first = bridge.dispatch("get_selection", {}, { timeoutMs: 5000, signal: abort.signal });
+    const second = bridge.dispatch("create", { type: "FRAME" }, { timeoutMs: 5000, signal: abort.signal });
+    await delay(30);
+    abort.abort();
+    await expect(second).rejects.toMatchObject({ code: "PLUGIN_TIMEOUT" });
+
+    p.respond(received[0]!.id, { ok: true, result: { still: "answered" } });
+    expect(((await first).result as { still: string }).still).toBe("answered");
+    await delay(30);
+    expect(received.map((r) => r.op)).toEqual(["get_selection"]);
+  });
+});
+
+describe("the one-time pairing notice", () => {
+  it("is not spent on an op that never answered", async () => {
+    const { bridge, port } = await newBridge();
+    bridge.setSessionsProvider(() => [{ id: "s-agent1", writeCount: 0, lastUsedMs: 0 }]);
+    const pA = new FakePlugin();
+    const pB = new FakePlugin();
+    let calls = 0;
+    pA.onRequest = (req) => pA.respond(req.id, { ok: true, result: { from: "A" } });
+    pB.onRequest = (req) => {
+      // The first op stalls into a timeout; later ones answer.
+      if (++calls > 1) pB.respond(req.id, { ok: true, result: { from: "B" } });
+    };
+    await pA.connect(port, { channel: "chan-a" });
+    await pB.connect(port, { channel: "chan-b" });
+    pB.ws!.send(JSON.stringify({ type: "bind", sessionId: "s-agent1" }));
+    await delay(30);
+
+    await expect(
+      bridge.dispatch("get_selection", {}, { sessionId: "s-agent1", timeoutMs: 60 }),
+    ).rejects.toMatchObject({ code: "PLUGIN_TIMEOUT" });
+
+    const next = await bridge.dispatch("get_selection", {}, { sessionId: "s-agent1", timeoutMs: 1000 });
+    expect(next.warnings?.join(" ")).toMatch(/bound this session to channel "chan-b"/);
+    const after = await bridge.dispatch("get_selection", {}, { sessionId: "s-agent1", timeoutMs: 1000 });
+    expect(after.warnings ?? []).toHaveLength(0);
+  });
+});

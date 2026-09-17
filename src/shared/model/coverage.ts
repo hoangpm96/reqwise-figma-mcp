@@ -85,12 +85,18 @@ export function checkCoverage(
     // artboard it is can be missing one.
     if (!p.wanted.length) continue;
     const hits = artboards.filter((a) => p.wanted.some((id) => nameMatchesScreenId(a.name, id)));
-    if (!hits.length) {
+    // Its states still belong to it, designed or not — an empty-state frame
+    // drawn before the page itself is not an orphan.
+    for (const a of hits) claimed.add(a.nodeId);
+    // The FIRST artboard is the page itself; the rest are states of it. A page
+    // whose only design is its empty state has not been designed, and counting
+    // any hit as "designed" reported it done with nothing left to do.
+    const self = p.wanted[0]!;
+    if (!artboards.some((a) => nameMatchesScreenId(a.name, self))) {
       undesigned.push({ page: p.name, frame: p.frame, nodeId: p.nodeId, wanted: p.wanted });
       continue;
     }
     designed++;
-    for (const a of hits) claimed.add(a.nodeId);
   }
 
   const orphans = artboards

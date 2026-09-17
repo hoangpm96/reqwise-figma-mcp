@@ -51,6 +51,12 @@ let running = false;
  * re-route, one moment later.
  */
 let paused = 0;
+/**
+ * Frames queued by a DELETE sweep. That is the evidence scanBoxes needs to
+ * read "no box left" as "a person deleted them all" rather than "mid-write" —
+ * and a draw never gets here mid-write, because it holds `paused`.
+ */
+const deletedIn = new Set<string>();
 
 export function installDiagramLive(): void {
   attach(figma.currentPage);
@@ -97,24 +103,34 @@ export function liveIsPaused(): boolean {
 
 function onNodeChange(event: NodeChangeEvent): void {
   const frames = new Map<string, FrameNode>();
+  const owners = new Map<string, FrameNode | null>();
   let sweptForDeletes = false;
   for (const change of event.nodeChanges) {
     if (change.type === "PROPERTY_CHANGE" && !touchesGeometry(change.properties)) continue;
-    if (change.type === "CREATE") continue;
+    // A CREATE inside a diagram is how an undone delete comes back: the box
+    // returns where it was, so nothing reads as moved, and its arrows stayed
+    // hidden for good because this used to skip every CREATE. Queuing the
+    // owning frame lets the pass bring back the lines WE hid (only those —
+    // see unhide). Our own draws create nodes too; those arrive while the
+    // pass is paused and the frame carries its drawing mark, and a finished
+    // draw has nothing hidden and nothing moved, so its pass does nothing.
     const node = change.type === "DELETE" ? null : (change.node as BaseNode);
     // A change to the flow FRAME itself (moving the whole diagram, renaming
     // it) cannot move an arrow relative to its boxes — only its descendants
     // can. Deletes are followed up from the frame side instead, because the
     // deleted node's parent is already gone.
     const frame =
-      node && node.type === "FRAME" && isDiagramFrame(node) ? null : owningDiagram(node);
+      node && node.type === "FRAME" && isDiagramFrame(node) ? null : owningDiagram(node, owners);
     if (frame) frames.set(frame.id, frame);
     // A deleted node arrives with no parent to walk up from, so every
-    // userflow on the page is re-checked; each one hides the arrows whose
-    // box has gone.
+    // diagram on the page — at any depth, including one inside a plain
+    // frame — is re-checked; each one hides the arrows whose box has gone.
     if (change.type === "DELETE" && !sweptForDeletes) {
       sweptForDeletes = true;
-      for (const f of diagramFrames(figma.currentPage)) frames.set(f.id, f);
+      for (const f of diagramFrames(figma.currentPage)) {
+        frames.set(f.id, f);
+        deletedIn.add(f.id);
+      }
     }
   }
   if (!frames.size) return;
@@ -137,11 +153,19 @@ async function drain(): Promise<void> {
     while (queue.size && !paused) {
       const batch = Array.from(queue.values());
       queue.clear();
-      for (const frame of batch) {
+      for (let i = 0; i < batch.length; i++) {
+        const frame = batch[i]!;
+        // A draw can start while this loop awaits a re-route. Hand the rest
+        // back (their DELETE flags stay in deletedIn) and let resumeLive drain.
+        if (paused) {
+          for (const rest of batch.slice(i)) if (!queue.has(rest.id)) queue.set(rest.id, rest);
+          break;
+        }
         try {
+          const deleted = deletedIn.delete(frame.id);
           if (frame.removed) continue;
           if (!liveRouteOn(frame)) continue;
-          await reflowAnyFrame(frame, { onlyIfMoved: true });
+          await reflowAnyFrame(frame, { onlyIfMoved: true, deleted });
         } catch {
           // A live re-route must never take the plugin (and with it the bridge)
           // down. The op path reports failures properly.

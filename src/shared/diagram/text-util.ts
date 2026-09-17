@@ -78,9 +78,36 @@ export function detailBar(label: string): string {
     : label;
 }
 
-/** `... / a trailing note` → the `detail` field, and the head of the line. */
+/**
+ * `... / a trailing note` → the `detail` field, and the head of the line.
+ *
+ * A ` / ` inside the quoted label is part of the label: `"Đăng nhập / Đăng ký"`
+ * is one page name, and splitting there cut the label in half and pushed
+ * everything after it (`screen:login`, a kind, a class) into the detail.
+ * Quotes are tracked the way `takeQuoted` reads them, `\"` escapes included.
+ */
 export function splitDetail(text: string): { head: string; detail?: string } {
-  const i = text.indexOf(" / ");
+  let i = -1;
+  let quoted = false;
+  for (let k = 0; k < text.length; k++) {
+    const c = text[k]!;
+    if (quoted && c === "\\") {
+      k++;
+      continue;
+    }
+    if (c === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (!quoted && c === " " && text.startsWith(" / ", k)) {
+      i = k;
+      break;
+    }
+  }
+  // An unclosed quote cannot hide a separator — it is a stray `"` (an inch
+  // mark, a typo), and reading the rest of the line as label would lose the
+  // detail it always had.
+  if (i < 0 && quoted) i = text.indexOf(" / ");
   if (i < 0) return { head: text.trim() };
   return { head: text.slice(0, i).trim(), detail: text.slice(i + 3).trim() || undefined };
 }

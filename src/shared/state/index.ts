@@ -25,7 +25,7 @@ export function buildState(spec: StateSpec): StateBuild {
   // The compact form is an alternative INPUT, not a second model.
   let states = spec.states ?? [];
   let transitions = spec.transitions ?? [];
-  if (spec.text) {
+  if (typeof spec.text === "string" && spec.text.trim()) {
     if (states.length) {
       warnings.push("Both `text` and `states` were given — the text won. Pass one or the other.");
     }
