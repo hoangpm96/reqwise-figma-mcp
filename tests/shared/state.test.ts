@@ -281,3 +281,11 @@ describe("the state proof-reader", () => {
     expect(res.warnings.join(" ")).toContain('"ghost"');
   });
 });
+
+describe("findings about [*]", () => {
+  it("name it as written, not by the tool's internal id", () => {
+    const b = buildState({ title: "T", text: "[*] -> held\nheld -> paid: Pay\npaid -> [*]" } as never);
+    const all = b.warnings.join(" ");
+    expect(all).not.toMatch(/__end|__start/);
+  });
+});

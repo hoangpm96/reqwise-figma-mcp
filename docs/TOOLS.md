@@ -790,6 +790,16 @@ Two things follow, and they are the point. A label cannot drift from the value, 
 
 Two diagrams quoting one rule differently is then reported as a `policy-drift` finding, because neither of them holds the number.
 
+`options.policies` sent **beside** a patch (or on a `diagrams` batch) is merged into the rules the frame already holds — sending one rule changes that rule and keeps the rest, so `policies: {}` changes nothing. To take rules away, use `null`, the same spelling a patch's `set` uses:
+
+```json
+{ "update": "140:5914",
+  "patch": [{ "collection": "transitions", "id": "t3", "set": { "label": "hold expired" } }],
+  "options": { "policies": { "hold-minutes": null } } }
+```
+
+removes `hold-minutes`; `"policies": null` removes every stored rule.
+
 ### Do the diagrams agree? — `options.crossCheck`
 
 Every other checker here reads **one** model and asks whether it is a legal diagram of its kind. None can see the diagram next to it — so the mistake nobody catches is the one where two views of the same business are each well-formed and say different things. On by default; the page's models come back with the draw, so it costs no round trip. Findings arrive as `consistency`:

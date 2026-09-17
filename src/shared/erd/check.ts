@@ -80,6 +80,7 @@ export function checkErd(
   // ---- per relationship ----
   const badField: string[] = [];
   const noField: string[] = [];
+  const halfField: string[] = [];
   const typeClash: string[] = [];
   const manyToMany: string[] = [];
   for (const r of relations) {
@@ -91,9 +92,18 @@ export function checkErd(
     if (r.fromField && !fromAttr) badField.push(`"${r.from}.${r.fromField}"`);
     if (r.toField && !toAttr) badField.push(`"${r.to}.${r.toField}"`);
     // Either end missing is enough: the line then attaches mid-box at that
-    // end, and the text parser already reports a relationship with one column
-    // named — the JSON form should not be quieter than the text one.
-    if (!r.fromField || !r.toField) noField.push(`${r.from} → ${r.to}`);
+    // end. This is the ONE place it is reported, for the JSON and the text
+    // form alike — the text parser used to say it too, so a text relation
+    // came back with the same finding twice, and neither copy said which end
+    // was missing when the other end WAS named.
+    if (!r.fromField && !r.toField) noField.push(`${r.from} → ${r.to}`);
+    else if (!r.fromField || !r.toField) {
+      const named = r.fromField ? `${r.from}.${r.fromField}` : `${r.to}.${r.toField}`;
+      const bare = r.fromField ? r.to : r.from;
+      halfField.push(
+        `Relationship ${r.from} → ${r.to} names ${named} but no column on "${bare}" — that end of the line attaches mid-box, so the reader cannot see which key of "${bare}" implements it. Give ${r.fromField ? "toField" : "fromField"}.`,
+      );
+    }
 
     if (fromAttr?.type && toAttr?.type && normalizeType(fromAttr.type) !== normalizeType(toAttr.type)) {
       typeClash.push(
@@ -112,9 +122,10 @@ export function checkErd(
   }
   if (noField.length) {
     warnings.push(
-      `No column named on ${list(noField)} — the line is drawn box-to-box, so the reader cannot see WHICH key implements it. Give fromField/toField.`,
+      `No column named on ${list(noField)} — the line is drawn box-to-box, so the reader cannot see WHICH key implements it. Give fromField/toField (in the text form, \`a.id 1-* b.a_id\`).`,
     );
   }
+  for (const w of halfField) warnings.push(w);
   if (typeClash.length) {
     warnings.push(
       `Foreign key and the key it references have different types: ${list(typeClash)}. One of the two is wrong, and the database will not let you add the constraint.`,

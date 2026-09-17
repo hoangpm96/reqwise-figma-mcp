@@ -197,6 +197,8 @@ async function buildNode(
       "inset/align requested but parent has no measurable size; used raw coordinates.",
     );
   }
+  const rotated = needsParent(geoReq) ? rotatedGroupNote(parent) : null;
+  if (rotated) ctx.warn(rotated);
 
   // Resolve token bindings and text style BEFORE creating the node so a bad
   // token/style name fails fast instead of leaving an orphan half-styled node.
@@ -282,6 +284,9 @@ async function buildNode(
   if (typeof p.rotation === "number" && "rotation" in node) {
     (node as LayoutMixin).rotation = p.rotation;
   }
+  // modify() honoured `visible`, create() never read it: a layer meant to start
+  // hidden (a variant's optional icon, an error state) came out visible.
+  if (typeof p.visible === "boolean") node.visible = p.visible;
 
   warnIfClipped(node, parent, ctx);
   warnAboutUserflow(node, parent, ctx);
@@ -380,13 +385,60 @@ async function createNode(
  * outside the group, on top of whatever sat at the frame's left edge.
  */
 export function childOrigin(parent: BaseNode): { x: number; y: number } {
-  if (
-    (parent.type === "GROUP" || parent.type === "BOOLEAN_OPERATION") &&
-    "x" in parent
-  ) {
-    return { x: (parent as GroupNode).x, y: (parent as GroupNode).y };
+  const box = groupBox(parent);
+  return box ? { x: box.x, y: box.y } : { x: 0, y: 0 };
+}
+
+/**
+ * A group's box in the coordinate space its children are written in (the
+ * containing frame's), as it LOOKS: axis-aligned around whatever rotation it
+ * carries.
+ *
+ * `x`/`y` and `width`/`height` do not describe that box once the group is
+ * rotated. x/y is where the rotated local origin landed and width/height are
+ * the unrotated size, so a group turned 90° about its corner reported its
+ * left edge where its right edge now is, and `inset:{left:8}` placed the new
+ * layer a whole group-height off to the side. The relativeTransform is
+ * already expressed in the containing frame's coordinates (a group is not a
+ * coordinate space), so its four corners give the true visual box without
+ * touching absolute coordinates — which a rotated containing frame would
+ * skew again.
+ *
+ * The new layer itself is NOT rotated to match: inset/align mean "from this
+ * edge of what you see", and an axis-aligned box is the only reading of that
+ * a caller can predict. `rotatedGroupNote` says so.
+ */
+function groupBox(parent: BaseNode): { x: number; y: number; w: number; h: number } | null {
+  if ((parent.type !== "GROUP" && parent.type !== "BOOLEAN_OPERATION") || !("x" in parent)) {
+    return null;
   }
-  return { x: 0, y: 0 };
+  const g = parent as GroupNode;
+  const t = g.relativeTransform;
+  if (!isRotated(g) || !Array.isArray(t) || t.length < 2) {
+    return { x: g.x, y: g.y, w: g.width, h: g.height };
+  }
+  const [[a, c, tx], [b, d, ty]] = t;
+  const xs = [0, g.width * a, g.height * c, g.width * a + g.height * c].map((v) => v + tx);
+  const ys = [0, g.width * b, g.height * d, g.width * b + g.height * d].map((v) => v + ty);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y };
+}
+
+function isRotated(node: BaseNode): boolean {
+  const r = (node as Partial<LayoutMixin>).rotation;
+  return typeof r === "number" && Math.abs(r % 360) > 1e-6;
+}
+
+/**
+ * The warning for inset/align into a rotated group, or null. Placing is still
+ * done (against the group's visual, axis-aligned box — see groupBox), but the
+ * caller should know the new layer is upright inside a tilted group.
+ */
+export function rotatedGroupNote(parent: BaseNode): string | null {
+  if (!groupBox(parent) || !isRotated(parent)) return null;
+  const r = Math.round((parent as LayoutMixin).rotation);
+  return `"${(parent as SceneNode).name}" is rotated ${r}°, so inset/align were measured from its on-screen (axis-aligned) bounds and the new layer is NOT rotated with it. Rotate the new layer yourself, or place it with x/y.`;
 }
 
 /**
@@ -413,6 +465,10 @@ export function resolveInParent(
 }
 
 export function parentSize(parent: BaseNode): { w: number; h: number } | null {
+  // A rotated group's width/height is its unrotated size; what inset/align
+  // measure against is the box it covers — same source as childOrigin.
+  const box = groupBox(parent);
+  if (box) return { w: box.w, h: box.h };
   if ("width" in parent && "height" in parent) {
     return {
       w: (parent as LayoutMixin).width,

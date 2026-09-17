@@ -541,3 +541,29 @@ describe("sequence nested fragments", () => {
     );
   });
 });
+
+describe("a fragment around a self-message", () => {
+  it("is wide enough for the hop and its label, and nested boxes still contain each other", () => {
+    const built = buildSequence({
+      title: "T",
+      participants: [{ id: "u", name: "User" }, { id: "api", name: "API" }, { id: "n", name: "Notifier" }],
+      text: undefined,
+      messages: [
+        { id: "m1", from: "u", to: "api", label: "POST /pay" },
+        { id: "m2", from: "api", to: "api", label: "refresh token now" },
+      ],
+      fragments: [
+        { kind: "loop", label: "retry", messages: ["m2"] },
+        { kind: "opt", label: "token expired", messages: ["m2"] },
+      ],
+    } as never);
+    const msg = built.draw.messages.find((m) => m.id === "m2")!;
+    const labelEnd = msg.label.x + msg.label.w;
+    const [outer, inner] = [...built.draw.fragments].sort((a, b) => a.at.y - b.at.y);
+    expect(inner!.at.x + inner!.at.w).toBeGreaterThan(labelEnd);
+    expect(outer!.at.x + outer!.at.w).toBeGreaterThan(inner!.at.x + inner!.at.w);
+    const g = built.draw.graph!;
+    const reflowed = reflowSequence(g, new Map(g.participants.map((p) => [p.id, { ...p.at }])));
+    expect(reflowed.fragments).toEqual(built.draw.fragments);
+  });
+});

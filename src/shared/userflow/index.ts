@@ -37,6 +37,18 @@ export function buildUserflow(spec: UserflowSpec): UserflowBuild {
     edges = parsed.edges;
     if (!options.rankdir && parsed.rankdir) rankdir = parsed.rankdir;
     for (const w of parsed.warnings) warnings.push(w);
+    // Only worth saying when the header is what decides the direction: with
+    // options.rankdir set, the drawing never followed the header, and saying
+    // "RL is drawn as LR" to someone who asked for TB was wrong. It stays a
+    // warning (so checkFirst holds the draw) because the frame WILL come out
+    // mirrored from the source the author wrote; passing options.rankdir is
+    // the explicit choice that clears it. Nothing in the model changes — the
+    // arrows keep their direction, only the page is laid out the other way.
+    if (!options.rankdir && parsed.mirrored) {
+      warnings.push(
+        `mermaid: direction ${parsed.mirrored} is drawn as ${parsed.rankdir} — a userflow reads left-to-right or top-to-bottom. The arrows keep their direction; only the layout is mirrored. Pass options.rankdir ("LR" or "TB") to choose explicitly.`,
+      );
+    }
   }
 
   const checked = checkGraph(nodes, edges);

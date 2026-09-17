@@ -13,6 +13,7 @@
  */
 import { adjacency, list, reachableFrom } from "../diagram/graph.js";
 import type { StateKind, StateNodeSpec, TransitionSpec } from "./types.js";
+import { FINAL_ID, INITIAL } from "./text.js";
 
 export interface StateCheck {
   warnings: string[];
@@ -42,6 +43,10 @@ export function checkState(
 
   const kindOf = (id: string): StateKind => byId.get(id)?.kind ?? "state";
   const nameOf = (id: string): string => {
+    // The synthetic ids behind `[*]` are the tool's, not the author's: a
+    // finding that said "paid → __end" named something nobody wrote.
+    if (id === INITIAL) return "[*] (start)";
+    if (id === FINAL_ID) return "[*] (end)";
     const s = byId.get(id);
     const label = (s?.label ?? "").trim();
     return label ? label : id;

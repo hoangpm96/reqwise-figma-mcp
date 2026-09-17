@@ -299,3 +299,53 @@ describe("a diagram inside a plain board frame, or a section inside a section", 
     expect(res.diagrams.map((d: any) => d.nodeId)).toContain(res0.frameId);
   });
 });
+
+describe("a diagram nested deeper than a board's direct child", () => {
+  /**
+   * The page model only walked the canvas (plus the drawn frame's siblings),
+   * so frame > frame > diagram was invisible to every cross-check, while the
+   * re-route sweep already found it with one native search. Both now use it.
+   */
+  function withNativeSearch() {
+    page.findAllWithCriteria = function (criteria: { types?: string[]; pluginData?: { keys?: string[] } }) {
+      const out: any[] = [];
+      const walk = (nodes: any[]) => {
+        for (const n of nodes) {
+          const typeOk = !criteria.types || criteria.types.includes(n.type);
+          const keys = criteria.pluginData?.keys;
+          const dataOk = !keys || keys.some((k) => (n.pluginData?.[k] ?? "") !== "");
+          if (typeOk && dataOk) out.push(n);
+          if (n.children) walk(n.children);
+        }
+      };
+      walk(this.children);
+      return out;
+    };
+  }
+
+  it("is in the draw's page model and in get_page_model, once, and not when it sits in a component", async () => {
+    withNativeSearch();
+    const outer = base("8:1", "FRAME");
+    const inner = base("8:2", "FRAME");
+    page.appendChild(outer);
+    outer.appendChild(inner);
+    const deep = (await run(draw("Deep", { source: { title: "Deep" }, parentId: inner.id }))) as any;
+    const comp = base("8:3", "COMPONENT");
+    page.appendChild(comp);
+    const pictured = (await run(draw("Pictured", { source: { title: "P" }, parentId: comp.id }))) as any;
+
+    const onPage = (await run(draw("Top", { source: { title: "Top" } }))) as any;
+    const ids = (onPage.pageModel ?? []).map((d: any) => d.nodeId);
+    expect(ids, "the draw's cross-check missed the nested diagram").toContain(deep.frameId);
+    expect(ids).toContain(onPage.frameId);
+    expect(ids).not.toContain(pictured.frameId);
+    expect(new Set(ids).size).toBe(ids.length);
+
+    const res = (await getPageModel(makeContext({} as any, () => {}))) as any;
+    const listed = res.diagrams.map((d: any) => d.nodeId);
+    expect(listed, "get_page_model missed the nested diagram").toContain(deep.frameId);
+    expect(listed).toContain(onPage.frameId);
+    expect(listed).not.toContain(pictured.frameId);
+    expect(new Set(listed).size).toBe(listed.length);
+  });
+});

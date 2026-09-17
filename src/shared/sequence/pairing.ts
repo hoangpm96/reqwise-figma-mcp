@@ -43,6 +43,11 @@ export function pairCalls(messages: Msgish[], fragments: SeqFragmentSpec[]): Pai
   const open: PairedCall[] = [];
   const callOfReply = new Map<string, PairedCall>();
   const orphanReplies: Array<{ id: string; from: string; to: string }> = [];
+  // Every rule below asks "is this message inside that fragment?" by list
+  // membership, which only works when a fragment lists the messages of the
+  // fragments nested in it too. The text parser emits that shape; JSON written
+  // by hand often lists only a fragment's OWN messages. Read both the same way.
+  fragments = withNestedMessages(messages, fragments);
   const regions = regionMap(fragments);
 
   for (const m of messages) {
@@ -98,6 +103,64 @@ export function pairCalls(messages: Msgish[], fragments: SeqFragmentSpec[]): Pai
   }
 
   return { calls, unanswered: open, callOfReply, orphanReplies };
+}
+
+/**
+ * Each fragment with the messages of the fragments nested in it added to the
+ * branch that holds them. A fragment sits in a branch when all of its messages
+ * fall inside that branch's run of time: from its first message to its last,
+ * and — for the body of an `alt` — on up to the message the else opens at, so
+ * an inner fragment that ENDS the body is still counted as part of it.
+ * Messages only get added from other fragments, never from the gaps in
+ * between, so a list that already names everything comes back unchanged.
+ */
+function withNestedMessages(messages: Msgish[], fragments: SeqFragmentSpec[]): SeqFragmentSpec[] {
+  const order = new Map<string, number>();
+  messages.forEach((m, i) => order.set(m.id, i));
+  const indices = (ids: string[]) => ids.map((id) => order.get(id)).filter((i): i is number => i !== undefined);
+  const span = (ids: string[]): [number, number] | null => {
+    const at = indices(ids);
+    return at.length ? [Math.min(...at), Math.max(...at)] : null;
+  };
+
+  const out = fragments.map((f) => ({
+    body: [...f.messages],
+    els: f.else ? [...f.else.messages] : null,
+  }));
+  // Repeat until nothing moves, so three levels of nesting fill in from the
+  // inside out whatever order the fragments were written in.
+  for (let changed = true; changed; ) {
+    changed = false;
+    out.forEach((f, i) => {
+      const body = span(f.body);
+      const els = f.els ? span(f.els) : null;
+      const bodyRun: [number, number] | null =
+        body && els && els[0] > body[1] ? [body[0], els[0] - 1] : body;
+      out.forEach((g, j) => {
+        if (i === j) return;
+        const inner = span(g.body.concat(g.els ?? []));
+        if (!inner) return;
+        const all = g.body.concat(g.els ?? []);
+        for (const [run, list] of [
+          [bodyRun, f.body],
+          [els, f.els],
+        ] as const) {
+          if (!run || !list || inner[0] < run[0] || inner[1] > run[1]) continue;
+          for (const id of all) {
+            if (order.has(id) && !list.includes(id)) {
+              list.push(id);
+              changed = true;
+            }
+          }
+        }
+      });
+    });
+  }
+  return fragments.map((f, i) => ({
+    ...f,
+    messages: out[i]!.body,
+    ...(f.else ? { else: { ...f.else, messages: out[i]!.els! } } : {}),
+  }));
 }
 
 /**

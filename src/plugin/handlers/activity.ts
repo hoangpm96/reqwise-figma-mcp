@@ -259,14 +259,15 @@ function stepSpecs(steps: DrawStep[], FONT: string): Spec[] {
   const out: Spec[] = [];
   for (const s of steps) {
     out.push(shapeSpec(s, FONT));
-    if (s.outside) {
+    const label = s.outside?.text ?? s.title;
+    if (s.outside && label) {
       out.push({
         type: "TEXT",
         name: `text:${s.id}`,
         x: s.outside.at.x,
         y: s.outside.at.y,
         width: s.outside.at.w,
-        characters: s.title,
+        characters: label,
         fontSize: 11,
         fontFamily: FONT,
         fontStyle: "Medium",

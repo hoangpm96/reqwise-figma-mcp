@@ -83,9 +83,12 @@ bookings.id 1=+ booking_seats.booking_id "holds"
     expect(a.draw).toEqual(b.draw);
   });
 
-  it("reports a relationship that names no columns — the hard rule of an ERD", () => {
-    const p = parseErdText(`a\n  id uuid pk!\nb\n  id uuid pk!\na 1-* b "has"`);
-    expect(p.warnings.join(" ")).toContain("names no columns");
+  it("reports a relationship that names no columns — the hard rule of an ERD — exactly once", () => {
+    // The parser and the checker both used to say it, so the text form came
+    // back with the same finding twice. The checker owns it: it sees JSON too.
+    const built = buildErd({ title: "t", text: `a\n  id uuid pk!\nb\n  id uuid pk!\na 1-* b "has"` } as any);
+    expect(built.warnings.filter((w) => /no column/i.test(w))).toHaveLength(1);
+    expect(built.warnings.join(" ")).toContain("No column named on a → b");
   });
 
   it("accepts mermaid's crow's foot, since a model reaches for it by habit", () => {

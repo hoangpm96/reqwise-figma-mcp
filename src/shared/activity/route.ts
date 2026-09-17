@@ -750,17 +750,23 @@ function buildPaths(wires: Wire[], ranks: Ranks, lanes: { min: number; max: numb
 
     if (w.shape === "self") {
       const diamond = w.from_.kind === "decision";
+      // Any other single-port shape is a circle or an ellipse: it touches its
+      // box at the middle of the face and curves away from it on both sides.
+      const round = !diamond && w.from_.singlePort === true;
       // A diamond's side is two slants meeting at a tip, not a flat face: the
       // loop's second end is kept close to the tip and brought in to meet the
-      // slant, or it stops in empty canvas beside the shape.
-      const spread = diamond ? Math.min(20, ax.aLen(s) / 4) : 20;
+      // slant, or it stops in empty canvas beside the shape. A round shape is
+      // the same story with a curve — 20px along a 20px dot is past its edge,
+      // so the second end sits most of the way out from the centre instead.
+      const halfA = ax.aLen(s) / 2;
+      const spread = diamond ? Math.min(20, ax.aLen(s) / 4) : round ? Math.min(20, halfA * 0.7) : 20;
       const a1 = Math.min(w.portOut, w.portIn);
       const a2 = Math.max(w.portOut, w.portIn) + (w.portOut === w.portIn ? spread : 0);
       const outline = (a: number): number => {
-        const halfA = ax.aLen(s) / 2;
-        if (!diamond || halfA <= 0) return ax.c1(s);
+        if ((!diamond && !round) || halfA <= 0) return ax.c1(s);
         const off = Math.min(1, Math.abs(a - ax.aMid(s)) / halfA);
-        return ax.cMid(s) + (ax.cLen(s) / 2) * (1 - off);
+        const halfC = ax.cLen(s) / 2;
+        return ax.cMid(s) + halfC * (diamond ? 1 - off : Math.sqrt(1 - off * off));
       };
       const cOut = ax.c1(s) + SELF_OUT;
       push(a1, outline(a1));

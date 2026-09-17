@@ -211,9 +211,9 @@ export const TOOLS: Tool[] = [
             maxDepth: { type: "number", description: "type:\"sitemap\" — levels allowed before depth is reported, root = 1 (default 4, i.e. three clicks in)." },
             verify: { type: "boolean", description: "Return layout_audit of the frame just drawn as `audit` (default TRUE — it costs no round trip)." },
             policies: {
-              type: "object",
-              description: "Rules that have a VALUE: { \"hold-minutes\": 10, \"retry-attempts\": 3 }. Reference one from any label as `@hold-minutes` and it is filled in when drawn — \"Giữ ghế @hold-minutes phút\" draws \"Giữ ghế 10 phút\". Two diagrams then cannot quote one rule differently. The reference survives into the stored model, so get_page_model can say which frames depend on a rule.",
-              additionalProperties: { type: ["string", "number"] },
+              type: ["object", "null"],
+              description: "Rules that have a VALUE: { \"hold-minutes\": 10, \"retry-attempts\": 3 }. Reference one from any label as `@hold-minutes` and it is filled in when drawn — \"Giữ ghế @hold-minutes phút\" draws \"Giữ ghế 10 phút\". Two diagrams then cannot quote one rule differently. The reference survives into the stored model, so get_page_model can say which frames depend on a rule. Beside a patch, rules MERGE: a rule set to null is removed, policies:null removes all.",
+              additionalProperties: { type: ["string", "number", "null"] },
             },
             crossCheck: { type: "boolean", description: "Compare the drawing against the other diagrams on its page and return contradictions as `consistency`; a sitemap also gets `coverage` — pages with no artboard yet, artboards belonging to no page (default TRUE; costs no round trip)." },
           },

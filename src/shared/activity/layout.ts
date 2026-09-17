@@ -492,6 +492,7 @@ function drawStep(s: Sized, move: (at: Placement) => Placement, ax: Axis): DrawS
               // LR and hand the plugin a 23-wide, 91-tall box for one line.
               at: move(forkLabelBox(s, ax)),
               align: "LEFT" as const,
+              text: title,
             },
           }
         : {}),

@@ -8,6 +8,7 @@
  * /health leaks, SSRF through loadImage, and icon-name path injection on CDNs.
  */
 import { timingSafeEqual, randomBytes } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { OpError } from "./errors.js";
 import { ErrorCode } from "../shared/protocol.js";
@@ -117,8 +118,10 @@ function ipv6Groups(ip: string): number[] | null {
 
 /**
  * Validate a loadImage URL: https only, no credentials, no private/link-local
- * / metadata hosts. DNS rebinding is out of scope for this local tool; we
- * still refuse literal private IPs and well-known metadata hostnames.
+ * / metadata hosts. This is the STRING half of the check — it catches literal
+ * private IPs and well-known metadata names, but a public-looking name can
+ * still resolve to 127.0.0.1. assertHostResolvesPublic is the other half, and
+ * every fetch has to pass both.
  */
 export function assertSafeImageUrl(raw: string): URL {
   let url: URL;
@@ -167,4 +170,71 @@ export function assertSafeImageUrl(raw: string): URL {
     );
   }
   return url;
+}
+
+/** One resolved address, the shape `dns.lookup(host, { all: true })` returns. */
+export interface ResolvedAddress {
+  address: string;
+  family: number;
+}
+
+/** Resolve a hostname to EVERY address it has. Injectable so tests never touch DNS. */
+export type HostResolver = (host: string) => Promise<ResolvedAddress[]>;
+
+export const defaultHostResolver: HostResolver = (host) =>
+  lookup(host, { all: true, verbatim: true });
+
+/**
+ * The address half of the image-URL check. A name is only as safe as what it
+ * resolves to: `127.0.0.1.nip.io`, or any domain whose owner points an A
+ * record at 169.254.169.254, sails through a check on the hostname string.
+ *
+ * ALL addresses are checked, not the first: the resolver's order is not the
+ * connector's order (happy-eyeballs tries several), so one private address in
+ * the set is enough to refuse. An IP literal was already judged by
+ * assertSafeImageUrl and is returned as-is without a lookup.
+ *
+ * This alone does not stop DNS rebinding — a second lookup at connect time
+ * can answer differently. The default transport closes that by connecting
+ * through a `lookup` hook that calls this again and hands the socket only the
+ * addresses it vetted (see pinnedHttpsFetch in executor.ts).
+ */
+export async function assertHostResolvesPublic(
+  host: string,
+  resolve: HostResolver = defaultHostResolver,
+): Promise<ResolvedAddress[]> {
+  const bare = host.replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+  const literal = isIP(bare);
+  if (literal) return [{ address: bare, family: literal }];
+  let addresses: ResolvedAddress[];
+  try {
+    addresses = await resolve(bare);
+  } catch (e) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Image host "${bare}" did not resolve: ${(e as Error).message}`,
+      "Check the URL is reachable, or pass base64 bytes directly.",
+    );
+  }
+  if (!addresses.length) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Image host "${bare}" did not resolve to any address.`,
+      "Check the URL is reachable, or pass base64 bytes directly.",
+    );
+  }
+  // An address the resolver hands back that is not an IP at all is refused
+  // rather than guessed at; a %zone suffix only names the interface.
+  const blocked = addresses.find((a) => {
+    const ip = String(a.address).replace(/%.*$/, "").toLowerCase();
+    return !isIP(ip) || isPrivateOrLocalIp(ip);
+  });
+  if (blocked) {
+    throw new OpError(
+      ErrorCode.INVALID_PARAMS,
+      `Image host "${bare}" resolves to a private or local address (${blocked.address}).`,
+      "loadImage only fetches public https URLs — a public name pointing at a private address is refused too.",
+    );
+  }
+  return addresses;
 }

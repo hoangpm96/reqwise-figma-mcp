@@ -21,6 +21,7 @@ import {
   growToFit,
   hideEdge,
   hideLayer,
+  edgeEnds,
   indexChildren,
   unhide,
   restoreAutoHidden,
@@ -124,8 +125,9 @@ export async function reflowActivityFrame(
   if (opts?.onlyIfMoved && !changed) {
     // An undone delete brings its box back where it was, so nothing reads as
     // moved — but the lines hidden when it went are still hidden. See
-    // restoreAutoHidden.
-    if (!goneBoxes.length) restoreAutoHidden(byName);
+    // restoreAutoHidden, which brings back each layer whose own boxes are
+    // back even while some other box is still missing.
+    restoreAutoHidden(byName, scan);
     return {
       frameId: frame.id,
       name: frame.name,
@@ -154,7 +156,7 @@ export async function reflowActivityFrame(
   }
 
   let hidden = 0;
-  for (const id of dropped) hidden += hideEdge(byName, id);
+  for (const id of dropped) hidden += hideEdge(byName, id, edgeEnds(id));
 
   // A decision's question and a bar's caption are SIBLINGS of their shape
   // (a polygon cannot hold a child, a 10px bar cannot show text), so dragging
@@ -163,7 +165,7 @@ export async function reflowActivityFrame(
   for (const n of graph.nodes) {
     const shape = shapes.get(n.id);
     if (!shape) {
-      hidden += hideLayer(byName, `text:${n.id}`);
+      hidden += hideLayer(byName, `text:${n.id}`, { all: [n.id] });
       continue;
     }
     const text = byName.get(`text:${n.id}`);
@@ -177,6 +179,12 @@ export async function reflowActivityFrame(
     }
     unhide(text);
   }
+
+  // A layer hidden for a box that is back, but which the pass above did not
+  // touch (a hand-moved arrow is left alone, so applyEdge never un-hides it),
+  // and the stamp of a layer somebody showed by hand. Layers hidden above
+  // wait for a box that is still gone, so nothing flips back.
+  restoreAutoHidden(byName, scan);
 
   if (opts?.grow !== false) growToFit(frame);
 

@@ -24,8 +24,11 @@
  * timeout; per-item try/catch on the plugin side yields exact per-index errors;
  * partial results are committed (no rollback).
  */
+import { VERSION } from "./version.js";
 import { Worker } from "node:worker_threads";
 import { setMaxListeners } from "node:events";
+import { request as httpsRequest } from "node:https";
+import type { LookupFunction } from "node:net";
 import {
   BATCH_CHUNK_SIZE,
   OP_TIMEOUTS,
@@ -35,7 +38,12 @@ import {
   type Operation,
 } from "../shared/protocol.js";
 import { ErrorCode, OpError, toBridgeError } from "./errors.js";
-import { assertSafeImageUrl } from "./security.js";
+import {
+  assertHostResolvesPublic,
+  assertSafeImageUrl,
+  defaultHostResolver,
+  type HostResolver,
+} from "./security.js";
 import type { Session } from "./session.js";
 import { validateOperation, isReadOp } from "./validate.js";
 import { loadIconSvg, searchIcons as searchIconsSvc, type Fetcher, type IconLibrary } from "./icons.js";
@@ -61,6 +69,11 @@ export interface ExecutorDeps {
   iconFetcher?: Fetcher;
   /** Injectable for tests — resolves an image URL to base64 bytes. */
   imageFetcher?: (url: string) => Promise<string>;
+  /** Injectable for tests — the per-hop HTTP transport under loadImage's
+   * redirect and address checks (default: pinnedHttpsFetch). */
+  imageFetch?: ImageFetch;
+  /** Injectable for tests — DNS for loadImage's address check. */
+  resolveHost?: HostResolver;
 }
 
 export interface WriteResult {
@@ -305,6 +318,12 @@ async function executeWriteInner(
   const worker = new Worker(WRITE_WORKER_SOURCE, {
     eval: true,
     workerData: { code, stateJson, figmaMethods, figmaDataJson, timeoutMs },
+    // A sandbox that builds an unbounded array would otherwise grow until the
+    // whole MCP server (same process) is killed by the OS. With a heap cap
+    // only the worker dies, and the caller gets a SANDBOX_ERROR. It bounds the
+    // JS heap only: typed-array backing stores (Uint8Array) live outside it, so
+    // this is a guard against runaway objects and arrays, not a memory limit.
+    resourceLimits: { maxOldGenerationSizeMb: WORKER_HEAP_MB },
   });
   // A wedged worker must not pin the process open — terminate() is the cleanup.
   worker.unref();
@@ -314,12 +333,18 @@ async function executeWriteInner(
     ok: boolean;
     result?: unknown;
     error?: { code: ErrorCode; message: string; hint?: string };
+    logDropped?: number;
   }
   type WorkerMsg =
     | { t: "invoke"; seq: number; method: string; argsJson: string }
     | { t: "state"; json: string }
     | { t: "log"; line: string }
+    | { t: "log-dropped"; n: number }
     | DoneMsg;
+  // The parent keeps its own cap too: the worker's is what keeps the flood
+  // off the message channel, this one is what bounds the result regardless.
+  let logDropped = 0;
+  let logChars = 0;
 
   const done = new Promise<DoneMsg | null>((resolve) => {
     let finished = false;
@@ -341,8 +366,16 @@ async function executeWriteInner(
       } else if (m.t === "state") {
         syncState(m.json);
       } else if (m.t === "log") {
-        logs.push(m.line);
+        const line = String(m.line);
+        if (logs.length >= MAX_LOG_LINES || logChars >= MAX_LOG_CHARS) logDropped++;
+        else {
+          logs.push(line);
+          logChars += line.length;
+        }
+      } else if (m.t === "log-dropped") {
+        if (typeof m.n === "number" && m.n > logDropped) logDropped = m.n;
       } else if (m.t === "done") {
+        if (typeof m.logDropped === "number" && m.logDropped > logDropped) logDropped = m.logDropped;
         finish(m);
       }
     });
@@ -385,6 +418,7 @@ async function executeWriteInner(
   } catch {
     /* already gone */
   }
+  if (logDropped > 0) logs.push(`… ${logDropped} more log line${logDropped === 1 ? "" : "s"} truncated`);
 
   if (msg === null) {
     return {
@@ -414,6 +448,9 @@ async function executeWriteInner(
   }
   return { ok: true, result: msg.result, logs, warnings };
 }
+
+/** Heap ceiling for one sandbox worker, MB. */
+const WORKER_HEAP_MB = 512;
 
 /** Grace on top of VM_TIMEOUT_MS for worker spawn + the in-worker vm timeout. */
 const WORKER_SLACK_MS = 3000;
@@ -545,6 +582,15 @@ const BOOTSTRAP_SRC = `(() => {
  * is shared verbatim) and lets the same path run in tests, where no dist/
  * bundle exists to point a Worker at.
  */
+/**
+ * What one figma_write may print. Generous for debugging — a few hundred
+ * node summaries — and small enough that a runaway loop cannot turn the tool
+ * result into megabytes the model has to read.
+ */
+export const MAX_LOG_LINES = 1000;
+export const MAX_LOG_CHARS = 100_000;
+export const MAX_LOG_LINE_CHARS = 10_000;
+
 export const WRITE_WORKER_SOURCE = `(function () {
   "use strict";
   const { parentPort, workerData } = require("node:worker_threads");
@@ -581,7 +627,7 @@ export const WRITE_WORKER_SOURCE = `(function () {
   // on termination the caller still sees how far the code got.
   const post = (m) => {
     try {
-      parentPort.postMessage(m);
+      parentPort.postMessage(m && m.t === "done" ? Object.assign({}, m, { logDropped }) : m);
     } catch (_) {}
   };
   let serToText = (v) => {
@@ -592,12 +638,38 @@ export const WRITE_WORKER_SOURCE = `(function () {
     }
   };
   const fmtArgs = (a) => a.map((x) => (typeof x === "string" ? x : serToText(x))).join(" ");
+  // Logs are capped HERE, before they cost a message: a loop that logs every
+  // node of a big page would otherwise ship megabytes to the parent and into
+  // the tool result. Past the cap a line is not even formatted — serializing
+  // an object nobody will see is the expensive part. The dropped count rides
+  // on the done message (exact) and on a throttled update, so a worker killed
+  // mid-flood still leaves the caller a marker, if a low one.
+  const MAX_LOG_LINES = ${MAX_LOG_LINES};
+  const MAX_LOG_CHARS = ${MAX_LOG_CHARS};
+  const MAX_LOG_LINE_CHARS = ${MAX_LOG_LINE_CHARS};
+  let logLines = 0;
+  let logChars = 0;
+  let logDropped = 0;
+  const emit = (prefix, a) => {
+    if (logLines >= MAX_LOG_LINES || logChars >= MAX_LOG_CHARS) {
+      logDropped++;
+      if (logDropped === 1 || logDropped % 1000 === 0) post({ t: "log-dropped", n: logDropped });
+      return;
+    }
+    let line = prefix + fmtArgs(a);
+    if (line.length > MAX_LOG_LINE_CHARS) {
+      line = line.slice(0, MAX_LOG_LINE_CHARS) + "… (" + (line.length - MAX_LOG_LINE_CHARS) + " more chars)";
+    }
+    logLines++;
+    logChars += line.length;
+    post({ t: "log", line });
+  };
   const console_ = {
-    log: (...a) => post({ t: "log", line: fmtArgs(a) }),
-    info: (...a) => post({ t: "log", line: fmtArgs(a) }),
-    warn: (...a) => post({ t: "log", line: "WARN: " + fmtArgs(a) }),
-    error: (...a) => post({ t: "log", line: "ERROR: " + fmtArgs(a) }),
-    debug: (...a) => post({ t: "log", line: fmtArgs(a) }),
+    log: (...a) => emit("", a),
+    info: (...a) => emit("", a),
+    warn: (...a) => emit("WARN: ", a),
+    error: (...a) => emit("ERROR: ", a),
+    debug: (...a) => emit("", a),
   };
 
   // Explicit, minimal global surface — the same list the in-process sandbox
@@ -971,20 +1043,32 @@ function mergeTokenMap(
 
 const MAX_IMAGE_REDIRECTS = 3;
 
+/** One HTTP hop: never follows a redirect itself. */
+export type ImageFetch = (url: string, init: RequestInit) => Promise<Response>;
+
 /**
  * Fetch with redirects handled by hand. assertSafeImageUrl only vets the URL
  * it is given; letting fetch follow a 302 on its own would let any public
  * https host bounce the request to 169.254.169.254 or an intranet name. So
  * every Location is resolved against the hop that sent it and vetted again,
  * and a chain longer than a few hops is refused rather than chased.
+ *
+ * Every hop's HOST is resolved and vetted too, not just its spelling — a
+ * public name with an A record of 127.0.0.1 is the same request as the
+ * literal. That check runs whatever the transport; the default transport
+ * then pins the socket to addresses vetted at connect time, which is what
+ * actually defeats a rebinding answer between the two lookups.
  */
 export async function fetchImageFollowingSafeRedirects(
   url: string,
-  fetchImpl: (u: string, init: RequestInit) => Promise<Response> = globalThis.fetch as never,
+  fetchImpl?: ImageFetch,
+  resolveHost: HostResolver = defaultHostResolver,
 ): Promise<Response> {
-  let current = assertSafeImageUrl(url).href;
+  const transport: ImageFetch = fetchImpl ?? ((u, init) => pinnedHttpsFetch(u, init, resolveHost));
+  let current = assertSafeImageUrl(url);
   for (let hop = 0; ; hop++) {
-    const res = await fetchImpl(current, { redirect: "manual" });
+    await assertHostResolvesPublic(current.hostname, resolveHost);
+    const res = await transport(current.href, { redirect: "manual" });
     if (res.status < 300 || res.status >= 400) return res;
     const location = res.headers.get("location");
     if (!location) return res;
@@ -997,8 +1081,146 @@ export async function fetchImageFollowingSafeRedirects(
         "Pass the final image URL directly, or base64 bytes.",
       );
     }
-    current = assertSafeImageUrl(new URL(location, current).href).href;
+    current = assertSafeImageUrl(new URL(location, current.href).href);
   }
+}
+
+/** Statuses a Response may not carry a body with. */
+const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
+
+/**
+ * One https GET whose socket can only reach a vetted address.
+ *
+ * Global fetch resolves the host itself, AFTER our check, and a rebinding
+ * name answers public to the first lookup and 127.0.0.1 to the second. Node's
+ * bundled fetch does not expose a connect-time lookup hook without adding the
+ * undici package, but node:https does: `lookup` here is the only resolver the
+ * socket consults, so the address it connects to is one this function just
+ * refused to hand over unless it was public. A 3xx is returned unread (the
+ * caller follows it by hand), never followed.
+ */
+const IMAGE_FETCH_TIMEOUT_MS = 20_000;
+const IMAGE_FETCH_TOTAL_MS = 60_000;
+/** Figma rejects images past 20MB; nothing bigger is worth buffering. */
+const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+
+export function pinnedHttpsFetch(
+  url: string,
+  init: RequestInit,
+  resolveHost: HostResolver = defaultHostResolver,
+): Promise<Response> {
+  const lookup: LookupFunction = (hostname, options, callback) => {
+    assertHostResolvesPublic(hostname, resolveHost).then(
+      (addresses) => {
+        const family = typeof options.family === "number" ? options.family : 0;
+        const usable = family ? addresses.filter((a) => a.family === family) : addresses;
+        if (!usable.length) {
+          const err = Object.assign(new Error(`No IPv${family} address for ${hostname}`), { code: "ENOTFOUND" });
+          callback(err, "", 0);
+          return;
+        }
+        if (options.all) (callback as unknown as (e: null, a: typeof usable) => void)(null, usable);
+        else callback(null, usable[0]!.address, usable[0]!.family);
+      },
+      (err: Error) => callback(err as NodeJS.ErrnoException, "", 0),
+    );
+  };
+  return new Promise<Response>((resolve, reject) => {
+    let settled = false;
+    const done = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(total);
+      init.signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const fail = (err: unknown) => done(() => reject(err));
+    // Headers a browser-less client needs to be served at all: some image
+    // hosts (Wikimedia) answer 403 to a request with no User-Agent, which the
+    // bundled fetch used to send for us.
+    const req = httpsRequest(
+      url,
+      {
+        method: "GET",
+        lookup,
+        headers: { "user-agent": `reqwise-figma-mcp/${VERSION}`, accept: "image/*,*/*;q=0.8" },
+      },
+      (res) => {
+        // Everything in here runs outside the promise: a throw would be an
+        // uncaught exception that kills the server. `new Response` throws on a
+        // status outside 200–599, which any host can send.
+        try {
+          const status = res.statusCode ?? 502;
+          if (status < 200 || status > 599) {
+            res.destroy();
+            fail(new Error(`Image host answered with an invalid HTTP status ${status}.`));
+            return;
+          }
+          const headers = new Headers();
+          for (const [k, v] of Object.entries(res.headers)) {
+            if (v === undefined) continue;
+            for (const one of Array.isArray(v) ? v : [v]) headers.append(k, one);
+          }
+          if ((status >= 300 && status < 400) || NULL_BODY_STATUS.has(status)) {
+            res.destroy();
+            done(() => resolve(new Response(null, { status, headers })));
+            return;
+          }
+          const declared = Number(res.headers["content-length"]);
+          if (Number.isFinite(declared) && declared > IMAGE_MAX_BYTES) {
+            res.destroy();
+            fail(tooLarge());
+            return;
+          }
+          const chunks: Buffer[] = [];
+          let size = 0;
+          res.on("data", (c: Buffer) => {
+            size += c.length;
+            if (size > IMAGE_MAX_BYTES) {
+              res.destroy();
+              fail(tooLarge());
+              return;
+            }
+            chunks.push(c);
+          });
+          res.on("end", () => done(() => resolve(new Response(Buffer.concat(chunks), { status, headers }))));
+          res.on("error", fail);
+        } catch (err) {
+          res.destroy();
+          fail(err);
+        }
+      },
+    );
+    // A refusal from the lookup hook arrives here as the OpError it threw,
+    // so fetchImageAsBase64 reports it as-is instead of "Could not fetch".
+    req.on("error", fail);
+    // The socket timeout only notices silence; a host trickling one byte at a
+    // time never trips it. The total deadline bounds the whole download.
+    req.setTimeout(IMAGE_FETCH_TIMEOUT_MS, () => {
+      req.destroy(new Error(`Image host did not answer within ${IMAGE_FETCH_TIMEOUT_MS / 1000}s.`));
+    });
+    const total = setTimeout(() => {
+      req.destroy();
+      fail(new Error(`Image download took longer than ${IMAGE_FETCH_TOTAL_MS / 1000}s.`));
+    }, IMAGE_FETCH_TOTAL_MS);
+    total.unref?.();
+    // The figma_write that asked stopped waiting: stop downloading too.
+    const onAbort = () => {
+      req.destroy();
+      fail(new Error("Image download cancelled — the call that asked for it stopped waiting."));
+    };
+    if (init.signal?.aborted) onAbort();
+    else init.signal?.addEventListener("abort", onAbort, { once: true });
+    req.end();
+  });
+}
+
+function tooLarge(): OpError {
+  return new OpError(
+    ErrorCode.INVALID_PARAMS,
+    `Image is larger than ${IMAGE_MAX_BYTES / 1024 / 1024}MB.`,
+    "Pass a smaller image (Figma downscales past 4096px anyway), or base64 bytes of a resized copy.",
+  );
 }
 
 /** Fetch an image URL and return its base64 body. An optional imageFetcher on
@@ -1007,7 +1229,7 @@ async function fetchImageAsBase64(url: string, deps: ExecutorDeps): Promise<stri
   const safe = assertSafeImageUrl(url);
   try {
     if (deps.imageFetcher) return await deps.imageFetcher(safe.href);
-    const res = await fetchImageFollowingSafeRedirects(safe.href);
+    const res = await fetchImageFollowingSafeRedirects(safe.href, deps.imageFetch, deps.resolveHost);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     return buf.toString("base64");

@@ -6,7 +6,7 @@ import { hexToRgb } from "../color-util.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
 import { InsertAt, Inset } from "../layout-math.js";
-import { childOrigin, parentSize, resolveInParent } from "./create.js";
+import { childOrigin, parentSize, resolveInParent, rotatedGroupNote } from "./create.js";
 
 import { decodeBase64 } from "../base64.js";
 import { fitArtwork } from "../fit-artwork.js";
@@ -65,7 +65,7 @@ export async function loadIcon(ctx: HandlerContext): Promise<unknown> {
   const parent = await resolveParent(p.parentId);
   const frame = parentFrame(parent);
   insertInto(parent, node, p.insertAt as InsertAt | undefined);
-  positionInParent(node, p, parent, frame);
+  positionInParent(node, p, parent, frame, ctx.warn);
 
   return { id: node.id, node: serializeNode(node, "compact") };
 }
@@ -109,7 +109,7 @@ export async function loadImage(ctx: HandlerContext): Promise<unknown> {
   const parent = await resolveParent(p.parentId);
   const frame = parentFrame(parent);
   insertInto(parent, rect, p.insertAt as InsertAt | undefined);
-  positionInParent(rect, p, parent, frame);
+  positionInParent(rect, p, parent, frame, ctx.warn);
 
   return {
     id: rect.id,
@@ -135,12 +135,15 @@ function positionInParent(
   p: Record<string, unknown>,
   parent: BaseNode,
   frame: ReturnType<typeof parentFrame>,
+  warn: (msg: string) => void,
 ): void {
   const managed =
     "layoutMode" in parent && (parent as FrameNode).layoutMode !== "NONE";
   if (managed) return;
   const pb = frame.size;
   if (p.inset && pb) {
+    const rotated = rotatedGroupNote(parent);
+    if (rotated) warn(rotated);
     const box = resolveInParent(
       {
         w: node.width,

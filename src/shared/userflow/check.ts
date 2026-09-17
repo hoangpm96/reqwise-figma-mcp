@@ -62,7 +62,17 @@ export function checkGraph(
   const deadEnds: string[] = [];
   for (const n of nodes) {
     const outs = out.get(n.id)!.filter((e) => e.to !== n.id);
-    if (n.kind === "decision" && outs.length < 2) {
+    const selfLoops = out.get(n.id)!.filter((e) => e.to === n.id);
+    if (n.kind === "decision" && outs.length < 2 && selfLoops.length) {
+      // The branch IS there — it just asks the same question again, which no
+      // user can act on. "Has 1 way out, add the no case" sent authors
+      // looking for a branch they had already written.
+      const back = inbound.get(n.id)!.find((e) => e.from !== n.id)?.from;
+      const label = selfLoops[0]!.label ? ` "${selfLoops[0]!.label}"` : "";
+      warnings.push(
+        `Decision "${n.id}" (${firstLine(n.label)}): the branch${label} loops straight back to the same question, so it is not a way out. Point it at the step where the user fixes things${back ? ` (e.g. back to "${back}")` : ""}.`,
+      );
+    } else if (n.kind === "decision" && outs.length < 2) {
       warnings.push(
         `Decision "${n.id}" (${firstLine(n.label)}) has ${outs.length} way out — a question needs at least two. Add the missing branch (the "no" / error / timeout case).`,
       );
@@ -108,7 +118,10 @@ export function checkGraph(
     );
   }
 
-  const starts = nodes.filter((n) => inbound.get(n.id)!.length === 0);
+  // A dashed `return` (retry, go back) is a way BACK, not a way in: counting
+  // it made the first screen of every flow with a retry loop look reachable
+  // only from inside, and the flow was reported as having no entry point.
+  const starts = nodes.filter((n) => inbound.get(n.id)!.every((e) => e.kind === "return"));
   const roots = starts.length ? starts : nodes.slice(0, 1);
   const seen = new Set<string>();
   const queue = roots.map((n) => n.id);

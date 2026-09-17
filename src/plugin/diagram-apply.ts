@@ -41,6 +41,20 @@ const PAD = 40;
 const AUTO_HIDDEN = "reqwise.diagram.autoHidden";
 
 /**
+ * Which boxes a layer we hid was waiting for, stored next to AUTO_HIDDEN.
+ *
+ * Without it the only safe moment to bring a hidden layer back was "no box is
+ * missing at all": delete two participants, undo one, and the lifeline, bars
+ * and notes of the one that came back stayed hidden for as long as the other
+ * was gone. With it each layer comes back as soon as ITS boxes are back.
+ * `all`: every id must be on the canvas (a line needs both ends); `any`: one
+ * is enough (a sequence fragment still spans something while one party is).
+ */
+const AUTO_HIDDEN_FOR = "reqwise.diagram.autoHiddenFor";
+
+export type HiddenFor = { all: readonly string[] } | { any: readonly string[] };
+
+/**
  * The geometry this module last WROTE to a layer, read back off the node so
  * any normalisation Figma applies is already baked in.
  *
@@ -232,12 +246,22 @@ export async function applyMarkers(
  * brings the box back, and the next re-route shows the arrow again exactly as
  * it was.
  */
-export function hideEdge(byName: Map<string, SceneNode>, id: string): number {
+export function hideEdge(byName: Map<string, SceneNode>, id: string, waitsFor?: HiddenFor): number {
   let hidden = 0;
   for (const name of [`edge ${id}`, `arrow ${id}`, `label ${id}`]) {
-    hidden += hideLayer(byName, name);
+    hidden += hideLayer(byName, name, waitsFor);
   }
   return hidden;
+}
+
+/**
+ * The two box ids an edge id was built from: `a->b`, or `a->b#2` for a
+ * repeated pair. What a dropped line waits for before it can come back.
+ */
+export function edgeEnds(id: string): HiddenFor {
+  const bare = id.replace(/#\d+$/, "");
+  const at = bare.indexOf("->");
+  return { all: at < 0 ? [bare] : [bare.slice(0, at), bare.slice(at + 2)] };
 }
 
 /**
@@ -246,12 +270,17 @@ export function hideEdge(byName: Map<string, SceneNode>, id: string): number {
  * For the siblings a line does not own — a sequence note, a lifeline, an
  * activation bar, a fragment box, a decision's question text — which would
  * otherwise stay afloat when the thing they belonged to is gone.
+ *
+ * `waitsFor` names the boxes whose absence this hide answers, so
+ * restoreAutoHidden can bring the layer back as soon as THEY are back.
  */
-export function hideLayer(byName: Map<string, SceneNode>, name: string): number {
+export function hideLayer(byName: Map<string, SceneNode>, name: string, waitsFor?: HiddenFor): number {
   const layer = byName.get(name);
-  if (!layer || !layer.visible) return 0;
+  if (!layer) return 0;
+  heldThisPass(byName).add(name);
+  if (!layer.visible) return 0;
   layer.visible = false;
-  setAutoHidden(layer, true);
+  setAutoHidden(layer, true, waitsFor);
   return 1;
 }
 
@@ -274,42 +303,124 @@ export function growToFit(frame: FrameNode): void {
 
 /** Show a layer again only if WE hid it when its box went away. */
 export function unhide(node: SceneNode): void {
-  if (node.visible) return;
-  let flag = "";
-  try {
-    flag = node.getPluginData(AUTO_HIDDEN);
-  } catch {
-    flag = "";
-  }
+  const flag = readFlag(node);
   if (flag !== "1") return;
-  node.visible = true;
+  // Visible yet still stamped: somebody showed it by hand. The stamp no
+  // longer describes a hide of ours — see forgetShownByHand.
+  if (!node.visible) node.visible = true;
   setAutoHidden(node, false);
 }
 
+function readFlag(node: SceneNode): string {
+  try {
+    return node.getPluginData(AUTO_HIDDEN);
+  } catch {
+    return "";
+  }
+}
+
 /**
- * Every box is back and nothing moved: show again every layer WE hid.
+ * Show again every layer WE hid whose boxes are back.
  *
  * Undoing a box delete puts the box back exactly where it was, so a pass that
  * only acts when something moved or went missing found nothing to do and
  * returned — leaving the arrows it hid when the box went away hidden for good.
- * With no box missing, nothing a hide was answering is still true, so all of
- * them can come back. It writes only while a stamped layer is still hidden,
- * so the pass our own write triggers finds none and settles. A layer the user
- * hid by hand carries no stamp and stays hidden.
+ *
+ * Per box, not per diagram: a layer comes back once the boxes its hide
+ * recorded (AUTO_HIDDEN_FOR) are all on the canvas, even while some unrelated
+ * box is still missing. A stamp from an older build names no boxes, so it
+ * keeps the old rule — back only when no box is missing. `boxes` left out
+ * means the caller vouches that every box is present.
+ *
+ * It writes only while a stamped layer is still hidden and its boxes are
+ * back, so the pass our own write triggers finds none and settles. A layer
+ * the user hid by hand carries no stamp and stays hidden.
+ *
+ * It also drops the stamp of a layer that is VISIBLE again although we never
+ * showed it: somebody un-hid it by hand. Leaving the stamp made their later
+ * hide look like ours, and the next pass showed it again.
  */
-export function restoreAutoHidden(byName: Map<string, SceneNode>): number {
+export function restoreAutoHidden(
+  byName: Map<string, SceneNode>,
+  boxes?: { placed: ReadonlyMap<string, unknown>; goneBoxes: readonly string[] },
+): number {
   let shown = 0;
-  byName.forEach((layer) => {
-    if (layer.visible) return;
-    unhide(layer);
-    if (layer.visible) shown++;
+  const keep = held.get(byName);
+  byName.forEach((layer, name) => {
+    if (keep?.has(name)) return;
+    // Visible layers are read too, on every pass: dropping the stamp of a
+    // layer somebody showed by hand is what keeps their later hide from being
+    // undone. getPluginData is an in-process call, so the cost per layer is
+    // small; a pass that skipped visible layers re-showed hand-hidden lines.
+    if (readFlag(layer) !== "1") return;
+    if (layer.visible) {
+      forgetShownByHand(layer);
+      return;
+    }
+    if (!boxes || waitIsOver(layer, boxes)) {
+      unhide(layer);
+      if (layer.visible) shown++;
+    }
   });
   return shown;
 }
 
-function setAutoHidden(node: SceneNode, on: boolean): void {
+/**
+ * The layers this pass decided must be hidden — already hidden or not — keyed
+ * by the pass's own index (indexChildren builds one per pass). The restore at
+ * the end of a pass never shows one of them, whatever its stamp says: a line
+ * whose end is not a box in the graph at all is dropped on every pass while
+ * no box reads as missing, and showing it there would hide it again on the
+ * next pass, and show it on the one after — a write loop.
+ */
+const held = new WeakMap<Map<string, SceneNode>, Set<string>>();
+
+function heldThisPass(byName: Map<string, SceneNode>): Set<string> {
+  let names = held.get(byName);
+  if (!names) {
+    names = new Set();
+    held.set(byName, names);
+  }
+  return names;
+}
+
+function forgetShownByHand(layer: SceneNode): void {
+  setAutoHidden(layer, false);
+}
+
+function waitIsOver(
+  layer: SceneNode,
+  boxes: { placed: ReadonlyMap<string, unknown>; goneBoxes: readonly string[] },
+): boolean {
+  // No box missing at all: nothing any hide was answering is still true.
+  if (boxes.goneBoxes.length === 0) return true;
+  let raw = "";
+  try {
+    raw = layer.getPluginData(AUTO_HIDDEN_FOR);
+  } catch {
+    raw = "";
+  }
+  let waits: { all?: unknown; any?: unknown } | null = null;
+  try {
+    waits = raw ? (JSON.parse(raw) as { all?: unknown; any?: unknown }) : null;
+  } catch {
+    waits = null;
+  }
+  const ids = (v: unknown): string[] | null =>
+    Array.isArray(v) && v.every((x) => typeof x === "string") ? (v as string[]) : null;
+  const all = ids(waits?.all);
+  if (all && all.length) return all.every((id) => boxes.placed.has(id));
+  const any = ids(waits?.any);
+  if (any && any.length) return any.some((id) => boxes.placed.has(id));
+  // Nothing recorded (an older build's stamp): the old, all-or-nothing rule,
+  // and some box is still missing.
+  return false;
+}
+
+function setAutoHidden(node: SceneNode, on: boolean, waitsFor?: HiddenFor): void {
   try {
     node.setPluginData(AUTO_HIDDEN, on ? "1" : "");
+    node.setPluginData(AUTO_HIDDEN_FOR, on && waitsFor ? JSON.stringify(waitsFor) : "");
   } catch {
     // A node that refuses plugin data still hides correctly; it just will not
     // come back on its own.
@@ -692,11 +803,13 @@ export function pageModel(frame: FrameNode): Array<Record<string, unknown>> {
   while (page && page.type !== "PAGE") page = page.parent;
   if (!page) return [];
   const out: Array<Record<string, unknown>> = [];
-  // Plus the frame's own siblings: a diagram drawn with parentId into a plain
-  // board frame is not canvas-level, and must still see itself and its
-  // neighbours. De-duplicated, since in a section those are the same nodes.
+  // Every marked frame at any depth — a diagram inside a board inside a board
+  // was missed by the canvas-level walk, so the cross-check ran on a partial
+  // page and found nothing to disagree with. Plus the frame's own siblings:
+  // a diagram drawn with parentId must still see itself and its neighbours,
+  // whatever it sits in. De-duplicated, since those are usually the same nodes.
   const seen = new Set<string>();
-  const candidates = [...canvasChildren(page as PageNode)];
+  const candidates: SceneNode[] = [...(markedDiagramFrames(page as PageNode) ?? canvasChildren(page as PageNode))];
   const parent = frame.parent;
   if (parent && parent.type !== "PAGE" && parent.type !== "SECTION" && "children" in parent) {
     candidates.push(...(parent as ChildrenMixin).children);
@@ -714,4 +827,50 @@ export function pageModel(frame: FrameNode): Array<Record<string, unknown>> {
     });
   }
   return out;
+}
+
+/**
+ * Every frame on the page that carries one of our diagram markers, at ANY
+ * depth — or null when this runtime has no native search to do it with, so
+ * the caller falls back to the canvas-level walk.
+ *
+ * One `findAllWithCriteria` narrowed by plugin-data key: the engine does the
+ * walk, and only frames that carry a marker come back, which keeps it cheap
+ * enough to run after every draw and on every delete of a large page. The
+ * re-route sweep (diagramFrames), the draw's page model and get_page_model all
+ * use this, so none of them can see a diagram the others miss.
+ *
+ * A marked frame inside an instance or a component is a picture of a diagram,
+ * not a diagram: the native search reaches into them, and they are skipped.
+ */
+export function markedDiagramFrames(page: PageNode): FrameNode[] | null {
+  let marked: readonly SceneNode[] | null = null;
+  try {
+    if (typeof page.findAllWithCriteria === "function") {
+      marked = page.findAllWithCriteria({
+        types: ["FRAME"],
+        pluginData: { keys: [...DIAGRAM_MARKERS] },
+      });
+    }
+  } catch {
+    marked = null;
+  }
+  if (!marked) return null;
+  const out: FrameNode[] = [];
+  for (const node of marked) {
+    if (node.type === "FRAME" && !insideInstanceOrComponent(node)) out.push(node as FrameNode);
+  }
+  return out;
+}
+
+/**
+ * A diagram inside a component is a picture of one, not a live diagram: the
+ * native search reaches into instances, and hiding or routing their layers
+ * would write overrides onto every copy.
+ */
+export function insideInstanceOrComponent(node: BaseNode): boolean {
+  for (let cur = node.parent; cur && cur.type !== "PAGE"; cur = cur.parent) {
+    if (cur.type === "INSTANCE" || cur.type === "COMPONENT" || cur.type === "COMPONENT_SET") return true;
+  }
+  return false;
 }

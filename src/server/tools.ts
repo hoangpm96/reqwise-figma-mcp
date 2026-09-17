@@ -338,7 +338,7 @@ export async function handleDiagram(
         'It is the `frameId` a diagram tool returned, e.g. update: "140:5914".',
       );
     }
-    return handleDiagramUpdate(ctx, update, type, spec as Record<string, unknown>, channel);
+    return handleDiagramUpdate(ctx, update.trim(), type, spec as Record<string, unknown>, channel);
   }
   if ((spec as { patch?: unknown })?.patch !== undefined) {
     throw new OpError(
@@ -385,7 +385,7 @@ async function handleDiagramUpdate(
     const stored = resultOf(
       await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel),
     ) as { kind?: string; spec?: unknown };
-    const result = applyPatch(stored.spec, patch);
+    const result = applyPatch(withoutStoredDrawOnlyOptions(stored.spec), patch);
     // Anything else in the call would be a second, contradictory source for
     // the same fields, and silently picking one of them is how a patch stops
     // meaning what it says.
@@ -426,16 +426,30 @@ const PATCH_CALL_FIELDS = new Set(["type", "options"]);
  *
  * `layers` go on in order, later ones winning: a batch passes its shared
  * options and then the entry's own, so the frame's stored options are the
- * floor and never outvote what this call asked for. A draw-only option the
- * frame stored (an older build persisted them) is not carried forward — it
- * belonged to the call that set it.
+ * floor and never outvote what this call asked for.
+ *
+ * The spec here is already patched, and its stored draw-only options were
+ * dropped BEFORE the patch ran (withoutStoredDrawOnlyOptions) — so any that
+ * are left came from the patch itself, `set: { "options.verify": false }`,
+ * and steer this draw like the same flag beside the patch would. Stripping
+ * them here instead meant that spelling was quietly ignored. They still never
+ * reach the stored model: drawWithChecks takes them out before the draw.
  */
 function withCallOptions(spec: unknown, ...layers: unknown[]): unknown {
   const base = (spec ?? {}) as Record<string, unknown>;
-  const stored = withoutDrawOnlyOptions(readOptions(base));
   const hasLayer = layers.some((l) => l && typeof l === "object" && !Array.isArray(l));
-  if (!hasLayer && Object.keys(stored).length === Object.keys(readOptions(base)).length) return spec;
-  return { ...base, options: mergeOptionLayers(stored, ...layers) };
+  if (!hasLayer) return spec;
+  return { ...base, options: mergeOptionLayers(readOptions(base), ...layers) };
+}
+
+/**
+ * The model a frame gave back, minus any draw-only option an older build
+ * persisted — it belonged to the call that set it, and carried forward it
+ * would silently skip the audit of every later patch of that frame.
+ */
+function withoutStoredDrawOnlyOptions(spec: unknown): unknown {
+  if (!isPlainObject(spec) || !isPlainObject(spec.options)) return spec;
+  return { ...spec, options: withoutDrawOnlyOptions(spec.options) };
 }
 
 /**
@@ -456,15 +470,37 @@ function withoutDrawOnlyOptions(options: Record<string, unknown>): Record<string
  * Merge option objects left to right. `policies` is a map of named rules, and
  * sending one rule means "change this one", not "these are now all the
  * rules" — a shallow merge dropped every stored rule the call did not repeat.
+ *
+ * That makes `policies: {}` a no-op, so removal needs its own spelling, the
+ * same one a patch's `set` uses: `null`. A rule set to null is removed
+ * (`policies: { "hold-minutes": null }`), and `policies: null` removes every
+ * stored rule. Nulls never survive the merge — the spec validator only admits
+ * string and number values.
  */
 function mergeOptionLayers(...layers: unknown[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const layer of layers) {
     if (!layer || typeof layer !== "object" || Array.isArray(layer)) continue;
     for (const [k, v] of Object.entries(layer as Record<string, unknown>)) {
+      if (k !== "policies") {
+        out[k] = v;
+        continue;
+      }
+      if (v === null) {
+        delete out[k];
+        continue;
+      }
       const prev = out[k];
-      out[k] =
-        k === "policies" && isPlainObject(prev) && isPlainObject(v) ? { ...prev, ...v } : v;
+      if (!isPlainObject(v)) {
+        out[k] = v;
+        continue;
+      }
+      const rules: Record<string, unknown> = isPlainObject(prev) ? { ...prev } : {};
+      for (const [name, value] of Object.entries(v)) {
+        if (value === null) delete rules[name];
+        else rules[name] = value;
+      }
+      out[k] = rules;
     }
   }
   return out;
@@ -535,15 +571,18 @@ async function handleDiagramBatch(
       );
     }
     const entry = raw as Record<string, unknown>;
-    const update = entry.update;
-    if (update === undefined) continue;
-    if (typeof update !== "string" || !update.trim()) {
+    const rawUpdate = entry.update;
+    if (rawUpdate === undefined) continue;
+    if (typeof rawUpdate !== "string" || !rawUpdate.trim()) {
       throw new OpError(
         ErrorCode.INVALID_PARAMS,
         `"${titleOf(entry, i)}": \`update\` must be the id of the frame to redraw.`,
         'It is the `frameId` a diagram tool returned, e.g. update: "140:5914".',
       );
     }
+    // Compared trimmed: "1:2" and "1:2 " name one frame, and letting both
+    // through is exactly the double-draw this check exists to refuse.
+    const update = rawUpdate.trim();
     const first = targets.get(update);
     if (first !== undefined) {
       throw new OpError(
@@ -565,7 +604,10 @@ async function handleDiagramBatch(
   }> = [];
   for (const raw of items) {
     const item = { ...(raw as Record<string, unknown>) };
-    const { type: rawType, update, patch, ...rest } = item;
+    const { type: rawType, update: rawUpdate, patch, ...rest } = item;
+    // The same trimmed id the duplicate check compared is the one read and
+    // drawn into — a stray space must not reach get_diagram_spec either.
+    const update = typeof rawUpdate === "string" ? rawUpdate.trim() : rawUpdate;
     let type = rawType;
 
     // An entry can redraw a frame that already exists, and can express the
@@ -587,7 +629,7 @@ async function handleDiagramBatch(
       const stored = resultOf(
         await ctx.runValidated("get_diagram_spec", { nodeId: update }, undefined, channel),
       ) as { kind?: string; spec?: unknown };
-      const result = applyPatch(stored.spec, patch);
+      const result = applyPatch(withoutStoredDrawOnlyOptions(stored.spec), patch);
       const extra = Object.keys(rest).filter((k) => !PATCH_CALL_FIELDS.has(k));
       if (extra.length) {
         throw new OpError(
@@ -733,8 +775,11 @@ async function drawWithChecks(
   // What reaches the draw — and so becomes the model the frame stores — keeps
   // no draw-only option. They are read from `options` above and steer only
   // this call; a dry run still needs its flag to know not to draw.
+  // Merged as a single layer too, so `policies: null` / `{ rule: null }` mean
+  // "no rule" on a fresh draw exactly as they do beside a patch — the schema
+  // advertises null everywhere, and only the patch path used to strip it.
   const model = isPlainObject(spec) && isPlainObject(spec.options)
-    ? { ...spec, options: withoutDrawOnlyOptions(spec.options) }
+    ? { ...spec, options: mergeOptionLayers(withoutDrawOnlyOptions(spec.options)) }
     : spec;
 
   // `checkFirst` collapses the two-call dry-run ritual into one: the checker

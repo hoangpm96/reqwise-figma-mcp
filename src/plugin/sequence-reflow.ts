@@ -77,8 +77,9 @@ export async function reflowSequenceFrame(
   if (opts?.onlyIfMoved && !changed) {
     // An undone delete brings its box back where it was, so nothing reads as
     // moved — but the lines hidden when it went are still hidden. See
-    // restoreAutoHidden.
-    if (!goneBoxes.length) restoreAutoHidden(byName);
+    // restoreAutoHidden, which brings back each layer whose own boxes are
+    // back even while some other box is still missing.
+    restoreAutoHidden(byName, scan);
     return {
       frameId: frame.id,
       name: frame.name,
@@ -177,29 +178,40 @@ export async function reflowSequenceFrame(
   }
 
   let hidden = 0;
+  const ends = new Map(graph.messages.map((m) => [m.id, { all: [m.from, m.to] }]));
   for (const id of dropped) {
-    hidden += hideEdge(byName, id);
+    // What each hide waits for: the message's two parties, a participant's
+    // own head, a fragment's parties (any one of them) — so an undone delete
+    // brings back what belonged to THAT head while another is still gone.
+    const waits = ends.get(id);
+    hidden += hideEdge(byName, id, waits);
     // A message's note is a sibling of the line, not part of it — the line's
     // hide does not reach it on its own.
-    hidden += hideLayer(byName, `note ${id}`);
+    hidden += hideLayer(byName, `note ${id}`, waits);
   }
 
   // A participant that is gone takes its lifeline and the bars it carried
   // with it — hidden, not deleted, so an undone delete brings them back.
   for (const p of graph.participants) {
     if (alive.has(p.id)) continue;
-    hidden += hideLayer(byName, `life ${p.id}`);
+    hidden += hideLayer(byName, `life ${p.id}`, { all: [p.id] });
   }
   for (const b of graph.activations) {
     if (alive.has(b.participant)) continue;
-    hidden += hideLayer(byName, `bar ${b.id}`);
+    hidden += hideLayer(byName, `bar ${b.id}`, { all: [b.participant] });
   }
   for (const f of graph.fragments) {
     if (f.parties.some((id) => alive.has(id))) continue;
     for (const name of [`frag ${f.id}`, `frag-tab ${f.id}`, `frag-else ${f.id}`, `frag-else-label ${f.id}`]) {
-      hidden += hideLayer(byName, name);
+      hidden += hideLayer(byName, name, { any: f.parties });
     }
   }
+
+  // A layer hidden for a box that is back, but which the pass above did not
+  // touch (a hand-moved arrow is left alone, so applyEdge never un-hides it),
+  // and the stamp of a layer somebody showed by hand. Layers hidden above
+  // wait for a box that is still gone, so nothing flips back.
+  restoreAutoHidden(byName, scan);
 
   if (opts?.grow !== false) growToFit(frame);
 
@@ -296,6 +308,7 @@ function normalizeGraph(raw: unknown): SequenceGraph | null {
         bottom: num(f.bottom),
         tabW: num(f.tabW),
         tabH: num(f.tabH),
+        ...(typeof f.reach === "number" && f.reach > 0 ? { reach: f.reach } : {}),
         ...(divider && typeof divider.y === "number"
           ? { divider: { y: divider.y, label: typeof divider.label === "string" ? divider.label : "else" } }
           : {}),

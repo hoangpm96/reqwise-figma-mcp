@@ -18,7 +18,7 @@
  * agent makes ONCE, at the start of a session, to find out what already exists.
  */
 import { HandlerContext, getNodeByIdSafe } from "../context.js";
-import { canvasChildren, pageArtboards, readDiagramSource } from "../diagram-apply.js";
+import { canvasChildren, markedDiagramFrames, pageArtboards, readDiagramSource } from "../diagram-apply.js";
 import { isDiagramFrameName } from "../diagram-mark.js";
 import { err } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
@@ -75,8 +75,15 @@ function collect(
 ): void {
   // canvasChildren, like `artboards` below it: a diagram dragged into a
   // SECTION was left out entirely — not even listed as unreadable — so the
-  // cross-check ran on a partial page and reported nothing.
-  for (const child of canvasChildren(page)) {
+  // cross-check ran on a partial page and reported nothing. The same went for
+  // a diagram nested in a board inside a board: the marked frames at any
+  // depth come from the one native search the re-route sweep uses. The
+  // canvas-level walk stays for the unmarked, older frames only a name finds.
+  const seen = new Set<string>();
+  const candidates: SceneNode[] = [...canvasChildren(page), ...(markedDiagramFrames(page) ?? [])];
+  for (const child of candidates) {
+    if (seen.has(child.id)) continue;
+    seen.add(child.id);
     const mark = readDiagramSource(child);
 
     // A frame drawn by an older build carries no `kind`, so nothing here can

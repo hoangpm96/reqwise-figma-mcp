@@ -15,6 +15,12 @@ export interface ParsedMermaid {
   nodes: FlowNodeSpec[];
   edges: FlowEdgeSpec[];
   rankdir?: "TB" | "LR";
+  /**
+   * Set when the header asked for RL or BT, which a userflow cannot draw:
+   * `rankdir` then holds the direction it falls back to. Not a warning here —
+   * the caller knows whether the header decides the drawing at all.
+   */
+  mirrored?: "RL" | "BT";
   warnings: string[];
 }
 
@@ -40,6 +46,7 @@ export function parseMermaid(source: string): ParsedMermaid {
   const classOf = new Map<string, FlowClass>();
   const warnings: string[] = [];
   let rankdir: "TB" | "LR" | undefined;
+  let mirrored: "RL" | "BT" | undefined;
 
   const lines = source.split("\n");
   for (const raw of lines) {
@@ -52,16 +59,14 @@ export function parseMermaid(source: string): ParsedMermaid {
     if (header) {
       const dir = (header[1] ?? "TB").toUpperCase();
       rankdir = dir === "LR" || dir === "RL" ? "LR" : "TB";
-      if (dir === "RL" || dir === "BT") {
-        warnings.push(
-          `mermaid: direction ${dir} is drawn as ${rankdir} — a userflow reads left-to-right or top-to-bottom. Reverse the arrows if the order matters.`,
-        );
-      }
+      mirrored = dir === "RL" || dir === "BT" ? dir : undefined;
       continue;
     }
     // A bare `end` closes a subgraph. `end\b` also swallowed `end["Done"]` and
     // `end --> a` while `a --> end` still made the node — half a node, silently.
-    if (/^(classDef|style|linkStyle|click|%%|subgraph|direction)\b/i.test(line) || /^end\s*;?$/i.test(line)) {
+    // Only LOWERCASE `end` is the keyword: Mermaid reads a bare `End` or `END`
+    // as a node, so skipping those dropped a node the source really declares.
+    if (/^(classDef|style|linkStyle|click|%%|subgraph|direction)\b/i.test(line) || /^end\s*;?$/.test(line)) {
       if (/^subgraph\b/i.test(line)) {
         warnings.push(
           `mermaid: subgraph "${line.slice(9).trim()}" ignored — draw each subgraph as its own userflow call.`,
@@ -114,7 +119,13 @@ export function parseMermaid(source: string): ParsedMermaid {
     );
   }
 
-  return { nodes: [...nodes.values()], edges, ...(rankdir ? { rankdir } : {}), warnings };
+  return {
+    nodes: [...nodes.values()],
+    edges,
+    ...(rankdir ? { rankdir } : {}),
+    ...(mirrored ? { mirrored } : {}),
+    warnings,
+  };
 }
 
 function stripComment(line: string): string {

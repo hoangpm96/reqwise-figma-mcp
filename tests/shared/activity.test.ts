@@ -638,3 +638,27 @@ describe("labels and the boxes", () => {
     }
   });
 });
+
+describe("fork and join labels", () => {
+  it("carry their own text, since the bar itself has no title", () => {
+    const a = buildActivity({
+      title: "F",
+      options: { rankdir: "LR" },
+      nodes: [
+        { id: "s", label: "Start", kind: "start" },
+        { id: "f", label: "split work", kind: "fork" },
+        { id: "a", label: "Pack" },
+        { id: "b", label: "Bill" },
+        { id: "j", label: "join", kind: "join" },
+        { id: "e", label: "End", kind: "end" },
+      ],
+      edges: [
+        { from: "s", to: "f" }, { from: "f", to: "a" }, { from: "f", to: "b" },
+        { from: "a", to: "j" }, { from: "b", to: "j" }, { from: "j", to: "e" },
+      ],
+    } as never);
+    const fork = a.draw.steps.find((s: { id: string }) => s.id === "f")!;
+    expect(fork.title).toBe("");
+    expect(fork.outside?.text).toBe("split work");
+  });
+});

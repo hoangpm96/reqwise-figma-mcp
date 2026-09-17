@@ -448,7 +448,9 @@ describe("mermaid headers and the `end` keyword", () => {
   it("RL / BT are drawn LR / TB, and say so", () => {
     const rl = parseMermaid(`graph RL\n  a --> b`);
     expect(rl.rankdir).toBe("LR");
-    expect(rl.warnings.join(" ")).toMatch(/RL is drawn as LR/);
+    expect(rl.mirrored).toBe("RL");
+    // Said by the build, which knows whether the header decides the drawing.
+    expect(buildUserflow({ title: "t", mermaid: `graph RL\n  a --> b` }).warnings.join(" ")).toMatch(/RL is drawn as LR/);
     expect(parseMermaid(`graph LR\n  a --> b`).warnings).toEqual([]);
   });
 
@@ -457,5 +459,26 @@ describe("mermaid headers and the `end` keyword", () => {
     expect(p.nodes.map((n) => n.id).sort()).toEqual(["a", "b", "end"]);
     expect(p.edges.some((e) => e.from === "end" && e.to === "a")).toBe(true);
     expect(p.warnings.join(" ")).toMatch(/lowercase `end`/);
+  });
+});
+
+describe("a decision that loops back to itself", () => {
+  it("names the loop instead of asking for a branch the author already wrote", () => {
+    const p = parseMermaid(`flowchart TD\n  s["Form"] --> d{"Valid?"}\n  d -->|no, fix| d\n  d -->|yes| ok["Done"]`);
+    const { warnings } = checkGraph(p.nodes, p.edges);
+    const w = warnings.find((x) => x.includes('"d"'))!;
+    expect(w).toMatch(/loops straight back/);
+    expect(w).toContain('"no, fix"');
+    expect(w).toContain('back to "s"');
+    expect(w).not.toMatch(/Add the missing branch/);
+  });
+});
+
+
+describe("a retry loop back to the first screen", () => {
+  it("does not make the flow look like it has no entry point", () => {
+    const p = parseMermaid(`flowchart TD\n  s["Login"] --> d{"Valid?"}\n  d -->|no| e["Error"]\n  e -.->|retry| s\n  d -->|yes| h["Home"]`);
+    const { warnings } = checkGraph(p.nodes, p.edges);
+    expect(warnings.join(" ")).not.toMatch(/no entry point/);
   });
 });

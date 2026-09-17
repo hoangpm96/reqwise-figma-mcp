@@ -19,8 +19,9 @@ import { boxesOverlap } from "./layout-math.js";
  *
  * `placeGroup` keeps one figma_write call's layout intact. Six screens drawn
  * as a row must move as a row: the first one that has to move sets the offset,
- * the rest try that same offset first, and nodes of the same group never count
- * as obstacles to each other (their relative layout is the caller's design).
+ * the rest try that same offset first, the members placed before it are moved
+ * by that offset too, and nodes of the same group never count as obstacles to
+ * each other (their relative layout is the caller's design).
  *
  * `allowOverlap: true` opts out — an annotation deliberately laid over a screen.
  */
@@ -28,6 +29,12 @@ import { boxesOverlap } from "./layout-math.js";
 interface Group {
   dy: number;
   ids: Set<string>;
+  /**
+   * Members that landed where they were asked, before any member had to move.
+   * Held so the first collision can take them along — they are the row's
+   * left half, and a row must not come out on two levels.
+   */
+  before: SceneNode[];
 }
 
 const groups = new Map<string, Group>();
@@ -37,7 +44,7 @@ function groupFor(key: unknown): Group | undefined {
   if (typeof key !== "string" || !key) return undefined;
   let g = groups.get(key);
   if (!g) {
-    g = { dy: 0, ids: new Set() };
+    g = { dy: 0, ids: new Set(), before: [] };
     groups.set(key, g);
     // A Map iterates in insertion order: the first key is the oldest run.
     if (groups.size > MAX_GROUPS) groups.delete(groups.keys().next().value as string);
@@ -83,7 +90,10 @@ export function keepClearOnCanvas(node: SceneNode, p: Record<string, unknown>, c
     return;
   }
   const hit = covers(want.y);
-  if (!hit) return;
+  if (!hit) {
+    if (group && group.dy === 0) group.before.push(self);
+    return;
+  }
 
   const spot = findFreeSpot(occupied, want, PLACE_GUTTER);
   self.y = spot.y;
@@ -92,9 +102,25 @@ export function keepClearOnCanvas(node: SceneNode, p: Record<string, unknown>, c
   // (ids.size === 1, and ids is filled above), so when the first screen of a
   // row happened to land clear, no later one could ever set it: each collider
   // found its own spot and the row came out as a staircase. A member that sat
-  // clear before this point stays where it is — nothing covered it.
-  if (group && group.dy === 0) group.dy = spot.y - want.y;
+  // clear before this point used to stay where it was, so a row whose middle
+  // screen collided came out on two levels: the left half at the asked y,
+  // the rest below. They are known, so they move by the same offset — unless
+  // that would put one of them on something, in which case it stays put
+  // rather than trade one overlap for another.
+  let carried = 0;
+  if (group && group.dy === 0) {
+    group.dy = spot.y - want.y;
+    for (const m of group.before) {
+      if (m.removed || m.parent !== parent) continue;
+      const box = m as SceneNode & LayoutMixin;
+      const at = { x: box.x, y: box.y + group.dy, w: box.width, h: box.height };
+      if (occupied.some((r) => boxesOverlap(at, r))) continue;
+      box.y = at.y;
+      carried++;
+    }
+    group.before = [];
+  }
   ctx.warn(
-    `New ${node.type} "${node.name || "(unnamed)"}" overlapped existing "${hit.name}" at (${Math.round(want.x)},${Math.round(want.y)}), so it was moved to (${Math.round(spot.x)},${Math.round(spot.y)}) instead — clear of existing work. Pick a free x/y, or pass allowOverlap:true to lay it on top on purpose.`,
+    `New ${node.type} "${node.name || "(unnamed)"}" overlapped existing "${hit.name}" at (${Math.round(want.x)},${Math.round(want.y)}), so it was moved to (${Math.round(spot.x)},${Math.round(spot.y)}) instead — clear of existing work${carried ? `, and the ${carried} earlier layer${carried === 1 ? "" : "s"} of the same call moved with it so the row stays a row` : ""}. Pick a free x/y, or pass allowOverlap:true to lay it on top on purpose.`,
   );
 }

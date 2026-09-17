@@ -51,16 +51,18 @@ describe("loadImage: a redirect is vetted like the URL it came from", () => {
   }
 
   const runOp = async () => ({ id: "x", ok: true, result: { id: "1:1" } });
+  // Every example host resolves to a public address, so these tests are about
+  // the redirect rule alone and never touch real DNS or the network.
+  const publicDns = async () => [{ address: "93.184.216.34", family: 4 }];
 
   it("refuses a 302 to the cloud metadata address and never fetches it", async () => {
     const { impl, reached } = redirectingFetch({
       "https://images.example.com/cat.png": "https://169.254.169.254/latest/meta-data/",
     });
-    vi.stubGlobal("fetch", impl);
     const res = await executeWrite(
       `return await figma.loadImage("https://images.example.com/cat.png");`,
       freshSession(),
-      { runOp } as never,
+      { runOp, imageFetch: impl, resolveHost: publicDns } as never,
       { timeoutMs: 2000 },
     );
     expect(res.ok).toBe(false);
@@ -75,11 +77,10 @@ describe("loadImage: a redirect is vetted like the URL it came from", () => {
       "https://a.example.com/3": "https://a.example.com/4",
       "https://a.example.com/4": "https://a.example.com/5",
     });
-    vi.stubGlobal("fetch", impl);
     const res = await executeWrite(
       `return await figma.loadImage("https://a.example.com/1");`,
       freshSession(),
-      { runOp } as never,
+      { runOp, imageFetch: impl, resolveHost: publicDns } as never,
       { timeoutMs: 2000 },
     );
     expect(res.ok).toBe(false);
@@ -89,11 +90,10 @@ describe("loadImage: a redirect is vetted like the URL it came from", () => {
 
   it("still follows a redirect between public hosts", async () => {
     const { impl } = redirectingFetch({ "https://a.example.com/img": "/cdn/img.png" });
-    vi.stubGlobal("fetch", impl);
     const res = await executeWrite(
       `return await figma.loadImage("https://a.example.com/img");`,
       freshSession(),
-      { runOp } as never,
+      { runOp, imageFetch: impl, resolveHost: publicDns } as never,
       { timeoutMs: 2000 },
     );
     expect(res.ok).toBe(true);

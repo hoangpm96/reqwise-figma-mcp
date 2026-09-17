@@ -149,3 +149,47 @@ describe("placing into a GROUP", () => {
     expect([node.x, node.y, node.width, node.height]).toEqual([500, 300, 200, 100]);
   });
 });
+
+describe("placing into a ROTATED group", () => {
+  /**
+   * A group's x/y is where its rotated local origin landed and width/height
+   * its unrotated size, so inset/align measured from them landed off to the
+   * side. 90° counter-clockwise about (500,300): the 200x100 group now covers
+   * x 500..600, y 100..300 on screen.
+   */
+  beforeEach(() => {
+    group.rotation = 90;
+    group.relativeTransform = [
+      [0, 1, 500],
+      [-1, 0, 300],
+    ];
+  });
+
+  it("create: inset is measured from the group's visual box, and says the layer is not rotated", async () => {
+    const c = ctx({ type: "RECTANGLE", parentId: "2:1", width: 20, height: 20, inset: { left: 8, top: 4 } });
+    const res = (await create(c)) as { id: string };
+    const node = group.children.find((n: any) => n.id === res.id);
+    expect([node.x, node.y]).toEqual([508, 104]);
+    expect(c.warnings.some((w) => /rotated 90°/.test(w))).toBe(true);
+
+    const r = (await create(
+      ctx({ type: "RECTANGLE", parentId: "2:1", width: 20, height: 20, inset: { right: 10, bottom: 10 } }),
+    )) as { id: string };
+    const nr = group.children.find((n: any) => n.id === r.id);
+    expect([nr.x, nr.y]).toEqual([600 - 10 - 20, 300 - 10 - 20]);
+  });
+
+  it("load_image: same visual box", async () => {
+    const res = (await loadImage(
+      ctx({ base64: "AAAA", parentId: "2:1", inset: { left: 8, top: 4 } }),
+    )) as { id: string };
+    const node = group.children.find((n: any) => n.id === res.id);
+    expect([node.x, node.y]).toEqual([508, 104]);
+  });
+
+  it("create_overlay: covers what the group covers on screen", async () => {
+    const res = (await createOverlay(ctx({ parentId: "2:1" }))) as { id: string };
+    const node = group.children.find((n: any) => n.id === res.id);
+    expect([node.x, node.y, node.width, node.height]).toEqual([500, 100, 100, 200]);
+  });
+});

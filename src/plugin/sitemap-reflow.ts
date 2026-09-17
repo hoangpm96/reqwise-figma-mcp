@@ -18,7 +18,7 @@
  *    here to reposition.
  */
 import { readDiagramData, SITEMAP_MARKER } from "./diagram-mark.js";
-import { applyEdge, canvasChildren, growToFit, hideEdge, indexChildren, scanBoxes, restoreAutoHidden } from "./diagram-apply.js";
+import { applyEdge, canvasChildren, edgeEnds, growToFit, hideEdge, indexChildren, scanBoxes, restoreAutoHidden } from "./diagram-apply.js";
 import { reflowSitemap } from "../shared/sitemap/layout.js";
 import type { PageKind, SitemapGraph } from "../shared/sitemap/types.js";
 import type { FlowClass, Placement } from "../shared/diagram/types.js";
@@ -87,8 +87,9 @@ export async function reflowSitemapFrame(
   if (opts?.onlyIfMoved && !changed) {
     // An undone delete brings its box back where it was, so nothing reads as
     // moved — but the lines hidden when it went are still hidden. See
-    // restoreAutoHidden.
-    if (!goneBoxes.length) restoreAutoHidden(byName);
+    // restoreAutoHidden, which brings back each layer whose own boxes are
+    // back even while some other box is still missing.
+    restoreAutoHidden(byName, scan);
     return {
       frameId: frame.id,
       name: frame.name,
@@ -120,7 +121,13 @@ export async function reflowSitemapFrame(
   }
 
   let hidden = 0;
-  for (const id of dropped) hidden += hideEdge(byName, id);
+  for (const id of dropped) hidden += hideEdge(byName, id, edgeEnds(id));
+
+  // A layer hidden for a box that is back, but which the pass above did not
+  // touch (a hand-moved arrow is left alone, so applyEdge never un-hides it),
+  // and the stamp of a layer somebody showed by hand. Layers hidden above
+  // wait for a box that is still gone, so nothing flips back.
+  restoreAutoHidden(byName, scan);
 
   if (opts?.grow !== false) growToFit(frame);
 

@@ -197,6 +197,7 @@ export function layoutSequence(
       bottom: r2(f.bottom),
       tabW: f.tabW,
       tabH: f.tabH,
+      ...(f.reach ? { reach: f.reach } : {}),
       ...(f.divider ? { divider: f.divider } : {}),
     })),
   };
@@ -303,15 +304,13 @@ function placeRows(msgs: Msg[], fragments: SeqFragmentSpec[], headH: number, hea
   const opensAt = new Map<string, number>();
   const closesAt = new Map<string, number>();
   const dividerAt = new Map<string, number>();
+  const byMsg = msgIndex(msgs);
   for (const f of fragments) {
-    const first = f.messages[0];
-    const last = f.messages[f.messages.length - 1];
-    const elseFirst = f.else?.messages[0];
-    const elseLast = f.else?.messages[f.else.messages.length - 1];
-    if (first) opensAt.set(first, (opensAt.get(first) ?? 0) + 1);
-    if (elseFirst) dividerAt.set(elseFirst, (dividerAt.get(elseFirst) ?? 0) + 1);
-    const end = elseLast ?? last;
-    if (end) closesAt.set(end, (closesAt.get(end) ?? 0) + 1);
+    const span = fragmentSpan(f, byMsg);
+    if (!span) continue;
+    opensAt.set(span.first.id, (opensAt.get(span.first.id) ?? 0) + 1);
+    if (span.elseFirst) dividerAt.set(span.elseFirst.id, (dividerAt.get(span.elseFirst.id) ?? 0) + 1);
+    closesAt.set(span.last.id, (closesAt.get(span.last.id) ?? 0) + 1);
   }
 
   let y = head + headH + FIRST_ROW;
@@ -331,6 +330,41 @@ function placeRows(msgs: Msg[], fragments: SeqFragmentSpec[], headH: number, hea
     y += (closesAt.get(m.id) ?? 0) * FRAG_BOTTOM;
   }
   return { bottom: y };
+}
+
+function msgIndex(msgs: Msg[]): Map<string, { m: Msg; at: number }> {
+  const out = new Map<string, { m: Msg; at: number }>();
+  msgs.forEach((m, at) => out.set(m.id, { m, at }));
+  return out;
+}
+
+/**
+ * The messages a fragment's box starts at, ends at, and draws its `else` line
+ * above — counting only messages that are actually drawn, and in the order
+ * they are drawn. placeRows reserves the bands and placeFragments draws the
+ * boxes into them, so both read the span from HERE: the rows used the raw ids
+ * and the boxes the drawn ones, and a fragment naming a message that is not
+ * drawn (or listing its messages out of order) got its band reserved at one
+ * message and its box drawn at another.
+ */
+function fragmentSpan(
+  f: SeqFragmentSpec,
+  byMsg: Map<string, { m: Msg; at: number }>,
+): { held: Msg[]; first: Msg; last: Msg; elseFirst?: Msg } | null {
+  const drawn = (ids: string[]) =>
+    ids
+      .map((id) => byMsg.get(id))
+      .filter((e): e is { m: Msg; at: number } => !!e)
+      .sort((a, b) => a.at - b.at);
+  const els = drawn(f.else?.messages ?? []);
+  const held = drawn(f.messages.concat(f.else?.messages ?? [])).map((e) => e.m);
+  if (!held.length) return null;
+  return {
+    held,
+    first: held[0]!,
+    last: held[held.length - 1]!,
+    ...(els.length ? { elseFirst: els[0]!.m } : {}),
+  };
 }
 
 /**
@@ -466,6 +500,10 @@ interface Box {
   tabW: number;
   tabH: number;
   divider?: { y: number; label: string };
+  /** Right edge a self-message inside needs (its hop plus its label). */
+  needRight: number;
+  /** Extra width past the lifelines, stored so a reflow keeps it. */
+  reach: number;
 }
 
 function placeFragments(
@@ -473,8 +511,7 @@ function placeFragments(
   msgs: Msg[],
   byId: Map<string, Party>,
 ): Box[] {
-  const byMsg = new Map<string, Msg>();
-  for (const m of msgs) byMsg.set(m.id, m);
+  const byMsg = msgIndex(msgs);
   const out: Box[] = [];
 
   // Which fragment sits inside which, by the messages they hold. Two fragments
@@ -490,9 +527,9 @@ function placeFragments(
   };
 
   fragments.forEach((f, i) => {
-    const all = f.messages.concat(f.else?.messages ?? []);
-    const held = all.map((id) => byMsg.get(id)).filter((m): m is Msg => !!m);
-    if (!held.length) return;
+    const span = fragmentSpan(f, byMsg);
+    if (!span) return;
+    const { held } = span;
 
     const parties = new Set<string>();
     for (const m of held) {
@@ -506,8 +543,7 @@ function placeFragments(
     }
     if (!xs.length) return;
 
-    const first = held[0]!;
-    const last = held[held.length - 1]!;
+    const { first, last } = span;
     // placeRows already reserved one band above the first message for EVERY
     // fragment opening there, and one below the last for every fragment
     // closing there. Each box takes the band its nesting gives it: fragments
@@ -518,13 +554,20 @@ function placeFragments(
     let closesInside = 0;
     for (let j = 0; j < fragments.length; j++) {
       if (!inside(j, i)) continue;
-      const g = fragments[j]!;
-      const ids = g.messages.concat(g.else?.messages ?? []).filter((id) => byMsg.has(id));
-      if (ids[0] === first.id) opensInside++;
-      if (ids[ids.length - 1] === last.id) closesInside++;
+      const inner = fragmentSpan(fragments[j]!, byMsg);
+      if (inner?.first.id === first.id) opensInside++;
+      if (inner?.last.id === last.id) closesInside++;
     }
-    const elseFirst = f.else?.messages.map((id) => byMsg.get(id)).find((m): m is Msg => !!m);
+    const elseFirst = span.elseFirst;
     const label = `${f.kind} · ${f.label}`;
+    // A self-message hangs to the right of its lifeline with its label beyond
+    // the hop; a box sized from the lifelines alone cut through both.
+    let needRight = -Infinity;
+    for (const m of held) {
+      if (!m.self) continue;
+      const cx = byId.get(m.from)?.cx;
+      if (cx !== undefined) needRight = Math.max(needRight, cx + SELF_OUT + 10 + m.lw + 12);
+    }
     out.push({
       id: `frag${i}`,
       kind: f.kind,
@@ -544,13 +587,32 @@ function placeFragments(
       ...(elseFirst && f.else
         ? { divider: { y: r2(dividerY(elseFirst)), label: f.else.label ?? "else" } }
         : {}),
+      needRight,
+      reach: 0,
     });
   });
   const depth = nestDepth(out);
-  out.forEach((b, i) => {
+  const base = out.map((b, i) => {
     const inset = nestInset(depth[i]!, b.right - b.left, b.tabW);
     b.left += inset;
     b.right -= inset;
+    return b.right;
+  });
+  // Widen for the self-messages, deepest first, so every enclosing box ends
+  // one nesting step past the box it holds.
+  const order = out.map((_, i) => i).sort((p, q) => depth[q]! - depth[p]!);
+  for (const i of order) {
+    const b = out[i]!;
+    if (b.needRight > b.right) b.right = b.needRight;
+    for (const j of order) {
+      const c = out[j]!;
+      if (depth[j]! > depth[i]! && c.top > b.top && c.bottom < b.bottom && c.right + NEST_INSET > b.right) {
+        b.right = c.right + NEST_INSET;
+      }
+    }
+  }
+  out.forEach((b, i) => {
+    b.reach = r2(b.right - base[i]!);
   });
   return out;
 }
@@ -798,7 +860,7 @@ export function reflowSequence(
     const outerRight = xs.length ? Math.max(...xs) + FRAG_SIDE : 0;
     const inset = xs.length ? nestInset(depth[i]!, outerRight - outerLeft, f.tabW) : 0;
     const left = outerLeft + inset;
-    const right = outerRight - inset;
+    const right = outerRight - inset + (f.reach ?? 0);
     return {
       id: f.id,
       kind: f.kind,

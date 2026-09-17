@@ -139,8 +139,156 @@ function applyOne(spec: Record<string, unknown>, op: PatchOp, i: number): string
   if (!member || typeof member !== "object") {
     throw new OpError(ErrorCode.INVALID_PARAMS, `${at}: ${op.collection}[${idx}] is not an object.`, SHAPE);
   }
+  const renames = plannedRenames(spec, op.collection, member as Record<string, unknown>, op.set, at);
   assign(member as Record<string, unknown>, op.set);
-  return `set ${Object.keys(op.set).join(", ")} on ${op.collection} ${describe(member)}`;
+  const line = `set ${Object.keys(op.set).join(", ")} on ${op.collection} ${describe(member)}`;
+  const cascaded = renames.map((r) => r(member as Record<string, unknown>));
+  return cascaded.length ? `${line}; ${cascaded.join("; ")}` : line;
+}
+
+/**
+ * Who refers to the members of a collection by id, per collection name.
+ *
+ * An id is not just a label on its member: messages name participants by it,
+ * edges name nodes, fragments name messages. Renaming one through `set` and
+ * leaving the references on the old id made every one of them point at
+ * nothing — and the builders DROP an arrow whose end is unknown, so a sequence
+ * silently lost its messages. A rename therefore carries its references with
+ * it, the way renaming a symbol in an editor does.
+ *
+ * Keyed by collection name rather than by kind, which keeps this module
+ * kind-agnostic: the names do not collide across kinds (`nodes` → `edges` is
+ * the same relation in activity and userflow). `namespace` is every
+ * collection whose ids the references resolve against — a usecase link's end
+ * may be an actor OR a use case, so an id taken by either is taken.
+ * `path` is dotted, and may end on a string or on a list of strings.
+ */
+const REFERENCES: Record<string, { noun: string; namespace: string[]; refs: Array<[string, string]> }> = {
+  participants: { noun: "participant", namespace: ["participants"], refs: [["messages", "from"], ["messages", "to"]] },
+  messages: { noun: "message", namespace: ["messages"], refs: [["fragments", "messages"], ["fragments", "else.messages"]] },
+  lanes: { noun: "lane", namespace: ["lanes"], refs: [["nodes", "lane"]] },
+  nodes: { noun: "node", namespace: ["nodes"], refs: [["edges", "from"], ["edges", "to"]] },
+  states: { noun: "state", namespace: ["states"], refs: [["transitions", "from"], ["transitions", "to"]] },
+  entities: { noun: "entity", namespace: ["entities"], refs: [["relations", "from"], ["relations", "to"]] },
+  actors: { noun: "actor", namespace: ["actors", "useCases"], refs: [["links", "from"], ["links", "to"]] },
+  useCases: { noun: "use case", namespace: ["actors", "useCases"], refs: [["links", "from"], ["links", "to"]] },
+  pages: { noun: "page", namespace: ["pages"], refs: [["pages", "parent"]] },
+};
+
+/**
+ * Look at a `set` BEFORE it is applied and return the cascades it implies —
+ * each one runs after the assign and reports what it rewrote.
+ *
+ * The old values have to be read before the merge overwrites them, and a
+ * rename onto an id that is already taken has to be refused before anything
+ * moves: two members with one id would make every reference to it ambiguous,
+ * and the cascade would merge two things the author kept apart.
+ */
+function plannedRenames(
+  spec: Record<string, unknown>,
+  collection: string,
+  member: Record<string, unknown>,
+  set: Record<string, unknown>,
+  at: string,
+): Array<(member: Record<string, unknown>) => string> {
+  const out: Array<(member: Record<string, unknown>) => string> = [];
+  const table = REFERENCES[collection];
+  const oldId = member.id;
+  const newId = set.id;
+
+  if (typeof oldId === "string" && typeof newId === "string" && newId !== oldId) {
+    const namespace = table?.namespace ?? [collection];
+    for (const name of namespace) {
+      const taken = Array.isArray(spec[name])
+        && (spec[name] as unknown[]).some((m) => m !== member && isObj(m) && m.id === newId);
+      if (taken) {
+        throw new OpError(
+          ErrorCode.INVALID_PARAMS,
+          `${at}: cannot rename ${JSON.stringify(oldId)} to ${JSON.stringify(newId)} — \`${name}\` already has a member with that id.`,
+          "Ids have to stay unique: every reference to one would otherwise be ambiguous. Pick another id, or remove the other member first.",
+        );
+      }
+    }
+    if (table) {
+      out.push(() => {
+        let n = 0;
+        for (const [refCollection, path] of table.refs) {
+          n += rewrite(spec[refCollection], path, (v) => v === oldId, newId);
+        }
+        return `renamed ${table.noun} ${oldId} → ${newId} (${references(n)})`;
+      });
+    }
+  }
+
+  // An ERD column has no id — its NAME is what `relations[].fromField/toField`
+  // point at, so renaming it strands the line on a column that no longer
+  // exists. Only a rename addressed to ONE column by index is followed
+  // (`"attributes.2.name"` or `"attributes.2": {…}`): replacing the whole list
+  // could be a reorder as easily as a rename, and guessing which would
+  // rewrite relations the author never touched.
+  if (collection === "entities" && Array.isArray(member.attributes)) {
+    const attrs = member.attributes as unknown[];
+    for (const key of Object.keys(set)) {
+      const m = /^attributes\.(\d+)(\.name)?$/.exec(key);
+      if (!m) continue;
+      const i = Number(m[1]);
+      const before = attrs[i];
+      if (!isObj(before) || typeof before.name !== "string") continue;
+      const value = set[key];
+      const after = m[2] ? value : isObj(value) ? value.name : undefined;
+      if (typeof after !== "string" || after === before.name) continue;
+      const oldName = before.name;
+      out.push((changed) => {
+        // The entity may have been renamed by the same `set`; the relations
+        // were already moved to the new id by the cascade above.
+        const entity = changed.id;
+        let n = 0;
+        for (const rel of Array.isArray(spec.relations) ? (spec.relations as unknown[]) : []) {
+          if (!isObj(rel)) continue;
+          if (rel.from === entity && rel.fromField === oldName) {
+            rel.fromField = after;
+            n++;
+          }
+          if (rel.to === entity && rel.toField === oldName) {
+            rel.toField = after;
+            n++;
+          }
+        }
+        return `renamed column ${String(entity)}.${oldName} → ${after} (${references(n)})`;
+      });
+    }
+  }
+  return out;
+}
+
+/** Replace every string at `path` in each member that matches; count them. */
+function rewrite(list: unknown, path: string, match: (v: unknown) => boolean, to: string): number {
+  if (!Array.isArray(list)) return 0;
+  let n = 0;
+  const steps = path.split(".");
+  const last = steps.pop()!;
+  for (const m of list) {
+    let cur: unknown = m;
+    for (const step of steps) cur = isObj(cur) ? cur[step] : undefined;
+    if (!isObj(cur)) continue;
+    const value = cur[last];
+    if (Array.isArray(value)) {
+      value.forEach((v, i) => {
+        if (match(v)) {
+          value[i] = to;
+          n++;
+        }
+      });
+    } else if (match(value)) {
+      cur[last] = to;
+      n++;
+    }
+  }
+  return n;
+}
+
+function references(n: number): string {
+  return n === 1 ? "1 reference" : `${n} references`;
 }
 
 /**

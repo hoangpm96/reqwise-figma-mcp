@@ -70,11 +70,9 @@ export function parseErdText(src: string): ParsedErd {
       const fromCard = fc ? (SHORT[fc] ?? MERMAID[fc]) : undefined;
       const toCard = SHORT[tc!] ?? MERMAID[tc!];
       const label = unescapeQuotes((label1 ?? label2 ?? "").trim().replace(/^"|"$/g, ""));
-      if (!fromField || !toField) {
-        warnings.push(
-          `erd text, line ${l.no}: the relationship names no columns (write \`${from}.<column> 1-* ${to}.<column>\`). Without them the line attaches to the middle of a box and nobody can check it against the schema.`,
-        );
-      }
+      // A relationship with no column (or only one) is reported by the
+      // checker, which sees the JSON form too — reporting it here as well
+      // gave every text relation the same finding twice.
       relations.push({
         from: from!,
         to: to!,

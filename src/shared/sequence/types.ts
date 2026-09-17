@@ -185,6 +185,8 @@ export interface SequenceGraph {
     bottom: number;
     tabW: number;
     tabH: number;
+    /** Extra width past the lifelines (a self-message's hop and label). */
+    reach?: number;
     divider?: { y: number; label: string };
   }>;
 }

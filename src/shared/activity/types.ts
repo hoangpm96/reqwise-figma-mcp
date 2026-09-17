@@ -157,7 +157,12 @@ export interface DrawStep {
   title: string;
   detail?: string;
   /** Text drawn OUTSIDE the shape (a diamond, a fork bar) rather than inside. */
-  outside?: { at: Placement; align: "CENTER" | "LEFT" };
+  /**
+   * A label drawn beside the shape rather than in it. It carries its own
+   * `text`: a fork/join bar has no title of its own (`title` is empty so the
+   * bar stays a bar), and reading the label from `title` drew an empty text.
+   */
+  outside?: { at: Placement; align: "CENTER" | "LEFT"; text?: string };
   /** White text on a filled start marker. */
   invert: boolean;
 }

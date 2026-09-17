@@ -455,3 +455,22 @@ describe("plugin answers that come wrapped with warnings", () => {
     expect(JSON.stringify(res.audit)).toContain("clipped text");
   });
 });
+
+const DRY_MODEL = { title: "Pay", participants: [{ id: "a", name: "App" }, { id: "b", name: "API" }], messages: [{ id: "m1", from: "a", to: "b", label: "POST" }] };
+describe("dryRun beside a patch never draws", () => {
+  // Reported live: update+patch+options.dryRun:true redrew the frame and saved
+  // it, and a sequence lost six messages. Every way of asking must stay dry.
+  for (const [name, call] of [
+  ["single", { update: "1:2", patch: [{ collection: "messages", id: "m1", set: { label: "x" } }], options: { dryRun: true } }],
+  ["single via set", { update: "1:2", patch: [{ set: { "options.dryRun": true } }] }],
+  ["batch", { diagrams: [{ update: "1:2", patch: [{ collection: "messages", id: "m1", set: { label: "x" } }], options: { dryRun: true } }] }],
+  ["batch shared", { options: { dryRun: true }, diagrams: [{ update: "1:2", patch: [{ collection: "messages", id: "m1", set: { label: "x" } }] }] }],
+] as const) {
+  it(name, async () => {
+    const ops: string[] = [];
+    const ctx = { runValidated: vi.fn(async (op: string) => { ops.push(op); if (op === "get_diagram_spec") return { kind: "sequence", spec: DRY_MODEL }; return { frameId: "1:2" }; }) } as unknown as ToolContext;
+    await handleDiagram(ctx, undefined, call as never);
+    expect(ops.filter((o) => o.startsWith("create_"))).toEqual([]);
+  });
+}
+});

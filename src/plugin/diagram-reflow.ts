@@ -26,7 +26,7 @@ import {
   sitemapGraphOf,
   type SitemapReflowReport,
 } from "./sitemap-reflow.js";
-import { DIAGRAM_MARKERS } from "./diagram-mark.js";
+import { insideInstanceOrComponent, markedDiagramFrames } from "./diagram-apply.js";
 
 export type DiagramReport =
   | ReflowReport
@@ -99,29 +99,11 @@ export async function reflowAnyFrame(
  * the handful of frames that have one.
  */
 export function diagramFrames(page: PageNode): FrameNode[] {
-  let marked: readonly SceneNode[] | null = null;
-  try {
-    if (typeof page.findAllWithCriteria === "function") {
-      marked = page.findAllWithCriteria({
-        types: ["FRAME"],
-        pluginData: { keys: [...DIAGRAM_MARKERS] },
-      });
-    }
-  } catch {
-    // An API surface without the criterion: fall back to the shallow lists,
-    // which still cover every diagram on the page or in a section.
-    marked = null;
-  }
-  if (marked) {
-    const out: FrameNode[] = [];
-    for (const node of marked) {
-      if (node.type === "FRAME" && isDiagramFrame(node) && !insideInstanceOrComponent(node)) {
-        out.push(node as FrameNode);
-      }
-    }
-    return out;
-  }
-  return shallowDiagramFrames(page);
+  // An API surface without the criterion: fall back to the shallow lists,
+  // which still cover every diagram on the page or in a section.
+  const marked = markedDiagramFrames(page);
+  if (!marked) return shallowDiagramFrames(page);
+  return marked.filter((frame) => isDiagramFrame(frame));
 }
 
 function shallowDiagramFrames(page: PageNode): FrameNode[] {
@@ -146,18 +128,6 @@ function shallowDiagramFrames(page: PageNode): FrameNode[] {
  * layers into one frame climbs that frame's ancestry once, not a thousand
  * times, and a graph's JSON is parsed once per frame.
  */
-/**
- * A diagram inside a component is a picture of one, not a live diagram: the
- * native search reaches into instances, and hiding or routing their layers
- * would write overrides onto every copy.
- */
-function insideInstanceOrComponent(node: BaseNode): boolean {
-  for (let cur = node.parent; cur && cur.type !== "PAGE"; cur = cur.parent) {
-    if (cur.type === "INSTANCE" || cur.type === "COMPONENT" || cur.type === "COMPONENT_SET") return true;
-  }
-  return false;
-}
-
 export function owningDiagram(
   node: BaseNode | null,
   memo?: Map<string, FrameNode | null>,

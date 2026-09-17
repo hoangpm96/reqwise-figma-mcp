@@ -169,6 +169,23 @@ describe("keepClearOnCanvas", () => {
     expect(nc.y).toBe(nb.y);
   });
 
+  it("a row whose MIDDLE member collides moves as one: the members already placed come along", async () => {
+    // Only the 2nd of three screens sits on something. The 1st had already
+    // landed clear at y=0 and used to stay there while the 2nd and 3rd went
+    // below the obstacle — one row on two levels.
+    page.children.push({ id: "9:1", type: "FRAME", name: "Old", x: 500, y: 0, width: 400, height: 800 });
+    const make = (x: number) =>
+      create(ctx({ type: "FRAME", width: 400, height: 500, x, y: 0, placeGroup: "run-3" })) as Promise<{ id: string }>;
+    const a = await make(0);
+    const b = await make(500);
+    const c = await make(1000);
+    const [na, nb, nc] = [a, b, c].map((r) => page.children.find((n: any) => n.id === r.id));
+    expect(nb.y).toBeGreaterThanOrEqual(800);
+    expect(na.y, "the member placed before the collision stayed behind").toBe(nb.y);
+    expect(nc.y).toBe(nb.y);
+    expect([na.x, nb.x, nc.x]).toEqual([0, 500, 1000]);
+  });
+
   it("does NOT move a nested node (positioned by its parent, not the page)", async () => {
     const parent = fakeFrame("11:1");
     parent.layoutMode = "VERTICAL";

@@ -56,12 +56,22 @@ interface Sized {
   /** Length with the flow, and across it. */
   aLen: number;
   cLen: number;
+  /**
+   * The same two lengths with the caption drawn OUTSIDE the shape included,
+   * grown evenly about the shape's centre so the shape stays where dagre
+   * centred it. See footprint.
+   */
+  footA: number;
+  footC: number;
   /** Filled in by placement. */
   at: Placement;
   /** dagre's cross position — only used to ORDER the states. */
   order: number;
   rank: number;
 }
+
+/** A state before the layout knows how much room its caption takes. */
+type Shape = Omit<Sized, "footA" | "footC">;
 
 export interface StateLayout {
   states: DrawState[];
@@ -81,7 +91,7 @@ export function layoutState(
 ): StateLayout {
   const rankdir = options.rankdir === "TB" ? "TB" : "LR";
   const ax = new Axis(rankdir === "TB");
-  const sized = nodes.map((n) => sizeState(n, ax));
+  const sized = nodes.map((n) => footprint(sizeState(n, ax), ax));
 
   rankWithDagre(sized, transitions, ax, rankdir);
 
@@ -112,7 +122,7 @@ export function layoutState(
   let cursorA = 0;
   for (let rank = 0; rank < rankKeys.length; rank++) {
     let aLen = 0;
-    for (const s of sized) if (s.rank === rank) aLen = Math.max(aLen, s.aLen);
+    for (const s of sized) if (s.rank === rank) aLen = Math.max(aLen, s.footA);
     rankSpan.push({ start: cursorA, aLen });
     cursorA += aLen + (gaps[rank] ?? RANK_GAP);
   }
@@ -153,20 +163,25 @@ export function layoutState(
     ...(t.fromSide ? { fromPort: { side: t.fromSide, at: t.fromAt ?? 0.5 } } : {}),
     ...(t.toSide ? { toPort: { side: t.toSide, at: t.toAt ?? 0.5 } } : {}),
   }));
+  // A dot's, a ring's or a bar's name is drawn OUTSIDE its shape, where the
+  // router cannot see it. Three final states stacked in one rank put three
+  // captions right where the arrows into them fan out, and every label pill
+  // landed on one — so the captions go to the router as label obstacles.
+  const outsides = sized
+    .map((s) => outsideAt(s, ax))
+    .filter((at): at is Placement => at !== null);
   const routed = routeActivity({
     rankdir,
     colorByTarget: options.colorByTarget !== false,
     lanes: [],
     steps: places,
     edges: wires,
+    obstacles: outsides,
   });
 
   // ---- shift everything into the frame, under the title block ----
-  // A dot's name is drawn OUTSIDE its shape, so it is part of the diagram's
-  // extent: leaving it out ran the last state's caption off the frame.
-  const outsides = sized
-    .map((s) => outsideAt(s, ax))
-    .filter((at): at is Placement => at !== null);
+  // The captions are part of the diagram's extent too: leaving them out ran
+  // the last state's caption off the frame.
   const shift = boundsShift(places.map((p) => p.at).concat(outsides), routed.edges, subtitle);
   const move = (at: Placement): Placement => ({
     x: r2(at.x + shift.dx),
@@ -240,7 +255,7 @@ function routerKind(kind: StateKind): StepPlace["kind"] {
 
 // ---------------------------------------------------------------- sizing ----
 
-function sizeState(n: StateNodeSpec, ax: Axis): Sized {
+function sizeState(n: StateNodeSpec, ax: Axis): Shape {
   const kind = n.kind ?? "state";
   const cls: FlowClass = n.cls ?? (kind === "choice" ? "decision" : "plain");
   const label = (n.label ?? "").trim();
@@ -313,6 +328,33 @@ function sizeState(n: StateNodeSpec, ax: Axis): Sized {
   };
 }
 
+/**
+ * How much room a state needs, caption included.
+ *
+ * sizeState gives the SHAPE, and a ring's name was said not to change the
+ * footprint — which is true for the ring and false for the diagram. In TB the
+ * name sits beside the ring, across the flow, and dagre spaced stacked final
+ * states by the ring alone: each caption ran over the next ring. In LR it sits
+ * under the ring and wider than it, reaching into the corridor the labels of
+ * the arrows into that rank need. Both are the caption being left out of the
+ * space the layout hands out.
+ *
+ * Grown evenly on both sides of the shape, not just on the caption's side:
+ * dagre centres the box it is given, and the shape has to stay at that centre
+ * or the straight arrow into it gains a jog.
+ */
+function footprint(s: Shape, ax: Axis): Sized {
+  const out = outsideAt({ ...s, at: ax.box(0, 0, s.aLen, s.cLen) }, ax);
+  if (!out) return { ...s, footA: s.aLen, footC: s.cLen };
+  const reach = (lo: number, hi: number, len: number): number =>
+    2 * Math.max(len / 2, len / 2 - lo, hi - len / 2);
+  return {
+    ...s,
+    footA: reach(ax.a0(out), ax.a1(out), s.aLen),
+    footC: reach(ax.c0(out), ax.c1(out), s.cLen),
+  };
+}
+
 /** Space above and below the separator rule inside a state box. */
 const RULE_GAP = 8;
 
@@ -356,7 +398,7 @@ function rankWithDagre(
   g.setDefaultEdgeLabel(() => ({}));
   const ids = new Set(sized.map((s) => s.id));
   for (const s of sized) {
-    const box = ax.box(0, 0, s.aLen, s.cLen);
+    const box = ax.box(0, 0, s.footA, s.footC);
     g.setNode(s.id, { width: box.w, height: box.h });
   }
   let key = 0;
@@ -483,7 +525,7 @@ function drawState(s: Sized, move: (at: Placement) => Placement, ax: Axis): Draw
  * it; a dot's or a bar's name sits beside it, across the flow, where no
  * transition is running.
  */
-function outsideAt(s: Sized, ax: Axis): Placement | null {
+function outsideAt(s: Shape, ax: Axis): Placement | null {
   if (!s.titleLines.length) return null;
   const at = s.at;
   const h = s.titleLines.length * lineHeight(11);

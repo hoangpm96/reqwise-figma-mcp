@@ -178,7 +178,11 @@ describe("erd: lines attach to the column", () => {
 
   it("warns when only one end names its column", () => {
     const spec = erd({ relations: [{ from: "user", to: "post", fromField: "id" }] });
-    expect(checkErd(spec.entities!, spec.relations!).warnings.join(" ")).toContain("No column named on user → post");
+    // Worded for the end that is actually missing: user.id IS named.
+    const all = checkErd(spec.entities!, spec.relations!).warnings.join(" ");
+    expect(all).toContain('names user.id but no column on "post"');
+    expect(all).toContain("Give toField");
+    expect(all).not.toContain("No column named");
   });
 });
 
