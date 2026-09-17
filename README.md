@@ -214,6 +214,7 @@ Every operation — leader-direct or follower-forwarded — passes through one `
 - [`docs/TOOLS.md`](./docs/TOOLS.md) — full tool + `figma.*` API reference, error codes
 - [`docs/MIGRATION.md`](./docs/MIGRATION.md) — migrating from `figma-ui-mcp`
 - [`docs/RECIPES.md`](./docs/RECIPES.md) — practical cookbook
+- [`docs/DEMO-PROMPT.md`](./docs/DEMO-PROMPT.md) — a paste-ready prompt that demos every free diagram kind plus mobile screens
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) — design goals and internals
 
 ## Reqwise Figma MCP Pro
