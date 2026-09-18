@@ -5,6 +5,15 @@ import { toPaints, toEffects } from "../paints.js";
 import { loadNodeFonts, loadFontWithFallback, DEFAULT_FONT } from "../fonts.js";
 import { serializeNode } from "../serialize.js";
 import { applyTextAlign } from "./text.js";
+import { findVariableByName, bindVariableToField, expandBindableField } from "./tokens.js";
+import {
+  parseLineHeight,
+  parseLetterSpacing,
+  resolveTextStyle,
+  applyTextStyleToNode,
+  resolveEffectStyle,
+  applyEffectStyleToNode,
+} from "./styles.js";
 import { err, nodeNotFound } from "../errors.js";
 import { ErrorCode } from "../../shared/protocol.js";
 import {
@@ -59,8 +68,96 @@ export async function modify(ctx: HandlerContext): Promise<unknown> {
   if (typeof props.strokeWeight === "number" && "strokeWeight" in node) {
     (node as MinimalStrokesMixin).strokeWeight = props.strokeWeight;
   }
+  // Per-side weights, after strokeWeight (which resets all four) — the same
+  // order create() applies them in.
+  for (const side of ["strokeTopWeight", "strokeRightWeight", "strokeBottomWeight", "strokeLeftWeight"] as const) {
+    if (typeof props[side] === "number" && side in node) {
+      (node as unknown as Record<string, number>)[side] = props[side] as number;
+    }
+  }
+  // Stroke DETAIL. create() has honoured these since it learned to draw arrow
+  // heads and dashed dividers; modify() never did, so a stroke property that
+  // could be set when the node was made could not be CHANGED afterwards — and
+  // the failure is silent, which is the worst shape for it. `strokeAlign` is
+  // the one that bites: Figma's default is INSIDE, so two rectangles sharing
+  // an edge each paint their border inside themselves and the shared line
+  // comes out double-width. A focus ring that has to sit OUTSIDE its control
+  // cannot be expressed any other way, and going through the bridge silently
+  // returned it to INSIDE.
+  if (typeof props.strokeAlign === "string" && "strokeAlign" in node) {
+    (node as MinimalStrokesMixin).strokeAlign =
+      props.strokeAlign as "CENTER" | "INSIDE" | "OUTSIDE";
+  }
+  if (typeof props.strokeCap === "string" && "strokeCap" in node) {
+    (node as unknown as { strokeCap: StrokeCap }).strokeCap = props.strokeCap as StrokeCap;
+  }
+  if (typeof props.strokeJoin === "string" && "strokeJoin" in node) {
+    (node as unknown as { strokeJoin: StrokeJoin }).strokeJoin = props.strokeJoin as StrokeJoin;
+  }
+  if (Array.isArray(props.dashPattern) && "dashPattern" in node) {
+    (node as unknown as { dashPattern: readonly number[] }).dashPattern =
+      props.dashPattern.filter((v): v is number => typeof v === "number");
+  }
   if (props.effects !== undefined && "effects" in node) {
     (node as BlendMixin).effects = toEffects(props.effects);
+  }
+  // Named styles. `create` resolves these and fails fast on a wrong name;
+  // `modify` read neither, so a text layer could be GIVEN a style at birth and
+  // never moved to another one — and applying a style is the right route for
+  // type, so the gap pushed callers back to raw fontSize/lineHeight.
+  // Resolved before writing, so a typo is an error the caller can act on
+  // rather than a node that silently keeps its old look.
+  if (typeof props.textStyle === "string" && node.type === "TEXT") {
+    const style = await resolveTextStyle(props.textStyle);
+    if (style) await applyTextStyleToNode(node as TextNode, style);
+  }
+  if (typeof props.effectStyle === "string" && "effects" in node) {
+    const style = await resolveEffectStyle(props.effectStyle);
+    if (style) await applyEffectStyleToNode(node as SceneNode, style);
+  }
+  // Shape geometry that is settable for the life of the node. `points` was
+  // already here for VECTOR; these were not, so a polygon created with five
+  // sides was a pentagon forever.
+  if (typeof props.pointCount === "number" && "pointCount" in node) {
+    (node as unknown as { pointCount: number }).pointCount = Math.max(3, Math.round(props.pointCount));
+  }
+  if (typeof props.innerRadius === "number" && "innerRadius" in node) {
+    (node as unknown as { innerRadius: number }).innerRadius = props.innerRadius;
+  }
+  if (Array.isArray(props.vectorPaths) && node.type === "VECTOR") {
+    (node as VectorNode).vectorPaths = props.vectorPaths as VectorPaths;
+  }
+
+  // Token bindings, LAST — they have to land on the final paints and layout,
+  // the same order create uses.
+  //
+  // `tokens` was on the creation-only list until somebody pointed out it sits
+  // on the wrong side of the line: a binding is not a fact about a node's
+  // birth, it is a live property, and re-binding EXISTING nodes is exactly
+  // what a token migration is. Without it that job went through applyVariable
+  // one field at a time — nine calls a node for a fill, four corner radii and
+  // four paddings — which is not merely tedious: each call is its own
+  // round-trip, so a partial failure leaves a node half-migrated with nothing
+  // saying which half.
+  //
+  // A name that does not resolve throws BEFORE anything is bound, so a typo
+  // cannot leave a node partly rebound.
+  const tokenSpec = props.tokens;
+  if (tokenSpec && typeof tokenSpec === "object" && !Array.isArray(tokenSpec)) {
+    const wanted: Array<{ field: string; variable: Variable }> = [];
+    for (const [field, raw] of Object.entries(tokenSpec as Record<string, unknown>)) {
+      const tokenName = String(raw).replace(/^\$/, "");
+      const variable = await findVariableByName(tokenName);
+      if (!variable) {
+        throw err(
+          ErrorCode.INVALID_PARAMS,
+          `No variable named "${tokenName}" (for field "${field}"). Nothing was bound.`,
+          "Check the token name with figma_read get_variables, or create it first.",
+        );
+      }
+      for (const f of expandBindableField(field)) wanted.push({ field: f, variable });
+    }
+    for (const b of wanted) bindVariableToField(node, b.field, b.variable);
   }
   if (typeof props.opacity === "number" && "opacity" in node) {
     (node as BlendMixin).opacity = props.opacity;
@@ -138,7 +235,7 @@ export async function modify(ctx: HandlerContext): Promise<unknown> {
 /** Text props Figma rejects unless the node's fonts are loaded. */
 const TEXT_LAYOUT_KEYS = [
   "fontSize", "characters", "text", "textAlignHorizontal", "textAlignVertical",
-  "textAutoResize", "w", "h", "width", "height",
+  "textAutoResize", "lineHeight", "letterSpacing", "w", "h", "width", "height",
   // Stretching/growing a text layer in auto-layout re-lays its lines.
   "layoutAlign", "layoutGrow",
 ];
@@ -174,6 +271,14 @@ async function modifyText(
     await loadNodeFonts(node);
   }
   if (typeof props.fontSize === "number") node.fontSize = props.fontSize;
+  // `create` has honoured these since text styles landed; `modify` did not, so
+  // a line height set at creation could never be CHANGED — and the call
+  // returned ok, so the only way to find out was to read the property back.
+  // Reported from a real build: a badge stayed at 12.5/20 while its spec said
+  // 12.5/16, which no screenshot can catch because the chip is a fixed height
+  // and the text is centred in it.
+  if (props.lineHeight !== undefined) node.lineHeight = parseLineHeight(props.lineHeight);
+  if (props.letterSpacing !== undefined) node.letterSpacing = parseLetterSpacing(props.letterSpacing);
   if (typeof props.characters === "string") node.characters = props.characters;
   else if (typeof props.text === "string") node.characters = props.text;
   applyTextAlign(node, props);
@@ -195,6 +300,15 @@ function applyLayoutProps(node: FrameNode, props: Record<string, unknown>): void
   if (typeof pad.bottom === "number") node.paddingBottom = pad.bottom;
   if (typeof props.primaryAxisSizingMode === "string") {
     node.primaryAxisSizingMode = props.primaryAxisSizingMode as "FIXED" | "AUTO";
+  }
+  // Wrapping, and the gap BETWEEN wrapped rows. `counterAxisSpacing` only
+  // means anything once the frame wraps, which is why it is applied after.
+  if (typeof props.layoutWrap === "string") {
+    const wrap = props.layoutWrap.toUpperCase();
+    if (wrap === "WRAP" || wrap === "NO_WRAP") node.layoutWrap = wrap;
+  }
+  if (typeof props.counterAxisSpacing === "number" && node.layoutWrap === "WRAP") {
+    node.counterAxisSpacing = props.counterAxisSpacing;
   }
   if (typeof props.counterAxisSizingMode === "string") {
     node.counterAxisSizingMode = props.counterAxisSizingMode as "FIXED" | "AUTO";

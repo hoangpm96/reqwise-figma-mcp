@@ -21,13 +21,13 @@ const props = (name: string) => {
 describe("the declared shape of each tool", () => {
   it("figma_diagram is the one that can change a drawing", () => {
     expect(props("figma_diagram")).toEqual([
-      "channel", "diagrams", "edges", "entities", "fragments", "gap", "lanes", "mermaid", "messages",
-      "nodes", "options", "pages", "parentId", "participants", "patch", "place", "relations", "states",
+      "channel", "diagrams", "edges", "entities", "file", "fragments", "gap", "lanes", "mermaid", "messages",
+      "nodes", "options", "page", "pages", "parentId", "participants", "patch", "place", "relations", "states",
       "subtitle", "text", "title", "transitions", "type", "update", "x", "y",
     ]);
   });
 
-  it("draws all nine kinds, userflow included", () => {
+  it("draws all ten kinds, userflow included", () => {
     const t = TOOLS.find((x) => x.name === "figma_diagram")!;
     const type = (t.inputSchema as any).properties.type;
     expect(type.enum).toEqual(["activity", "erd", "sequence", "sitemap", "state", "userflow"]);
@@ -80,9 +80,10 @@ describe("the declared shape of each tool", () => {
 describe("what the tool list costs to load", () => {
   it("stays within the budget the token diet set", () => {
     const bytes = JSON.stringify(TOOLS).length;
-    // The free edition's six tools and six diagram kinds. Raise this
-    // deliberately, with the reason in the commit message — never to make a
-    // red test green.
-    expect(bytes).toBeLessThan(18_000);
+    // The free edition's six tools and six diagram kinds. 18,425B after
+    // file/page routing: agents were stuck asking the user to click Connect
+    // whenever two Figma windows were open. Raise this deliberately, with the
+    // reason in the commit message — never to make a red test green.
+    expect(bytes).toBeLessThan(18_600);
   });
 });

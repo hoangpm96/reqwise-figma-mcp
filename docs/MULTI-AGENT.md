@@ -44,15 +44,17 @@ Server-side fix áp ngay; plugin-side fix cần **chạy lại** plugin: Figma �
 
 ### Một cửa sổ Figma (thường gặp)
 
-Không cần `channel`. Mọi agent dùng chung một file; ops xếp hàng FIFO trên connection đó.
+Không cần `channel` hay `file`. Mọi agent dùng chung một file; ops xếp hàng FIFO trên connection đó.
 
-### Nhiều cửa sổ Figma
+### Nhiều cửa sổ Figma — AI tự nắm file/page
 
-1. Gọi `figma_read` op `list_channels` (hoặc xem `figma_status.channels`).
-2. Truyền `channel` trong `figma_read` / `figma_write` khi cần pin một cửa sổ.
-3. Hoặc trong plugin: **pick agent session → drive this window** (binding session↔channel).
+Agent **không** hỏi user bấm Connect. Đọc `figma_status.channels` (file, page, `focused`) rồi truyền `file` / `page` (fuzzy: `"klopop"` → `"Klopop official"`, `"flow"` → `"Flows"`). Session **nhớ** target sau lệnh đầu.
 
-Nếu ≥2 cửa sổ mà không chỉ `channel` → `AMBIGUOUS_CHANNEL` (cố ý — tránh agent vẽ nhầm file).
+- **Khác file** (Klopop vs reqwise-mcp-test) → mỗi file một channel, **chạy song song**.
+- **Cùng file, khác page**, mỗi page một cửa sổ (Window → New window) → song song. Pass page (e.g. `"Flows"`).
+- **Cùng file + cùng page** → xếp hàng trên một cửa sổ (Plugin API không chịu hai mutation chồng).
+
+Cửa sổ user vừa click (`focused`) là default cho session mới chưa truyền `file`. `channel` id vẫn dùng được, không bắt buộc.
 
 ### Nhiều agent, một cửa sổ
 

@@ -245,18 +245,8 @@ These change existing nodes rather than drawing new ones. See the
   round-trip): \`[{channel, plugin:{fileName,pageName,...}, queueLength}]\`.
 
 ## Channels (multiple Figma windows)
-Each Figma window running the plugin joins a **channel** (shown as a chip in
-the plugin UI). With ONE window you never think about this — everything
-auto-routes. With SEVERAL windows either:
-- pass \`channel\` in the tool call: \`figma_write({code, channel})\`,
-  \`figma_read({op, params, channel})\` — pick one via
-  \`figma_read({op:"list_channels"})\`; or
-- ask the user to click YOUR session in the plugin UI of the window they want
-  ("AI agents connected" list). After that your ops route there by default and
-  your next result carries a one-time warning naming the bound channel.
-\`AMBIGUOUS_CHANNEL\` / \`CHANNEL_NOT_FOUND\` errors list the open channels in
-their hint. Each channel has its own serial queue, so agents on different
-windows run in parallel.
+Each Figma window running the plugin joins a **channel**. With ONE window you never think about this. With SEVERAL, pass \`file\` (and \`page\` if the same file is open twice) — fuzzy names are fine, and the session remembers after the first call. Different files, and different pages that each have a window, run in parallel. Same page queues. A brand-new session with no hint follows the focused window (the one the user last clicked). Opaque \`channel\` ids still work. Do not ask the user to click Connect.
+\`AMBIGUOUS_CHANNEL\` / \`CHANNEL_NOT_FOUND\` errors list the open files in their hint.
 
 ## Sessions
 Each MCP connection (one Claude Code / Codex instance) gets a private session

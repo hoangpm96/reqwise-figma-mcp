@@ -551,6 +551,21 @@
         // If already connected, (re)send hello so the server has fresh file info.
         if (ws && ws.readyState === 1) sendHello();
         break;
+      case "context": {
+        hello = msg.hello || hello;
+        renderMeta();
+        if (ws && ws.readyState === 1) {
+          var h = msg.hello || hello || {};
+          ws.send(JSON.stringify({
+            type: "context",
+            fileName: h.fileName || "",
+            pageName: h.pageName || "",
+            reason: msg.reason || "selection",
+            at: Date.now()
+          }));
+        }
+        break;
+      }
       case "local": {
         var waiting = localPending[msg.id];
         if (!waiting) break;

@@ -117,6 +117,8 @@ export class Follower {
        * (__status__), which must not be held open by a busy leader.
        */
       extendWhileAlive?: boolean;
+      file?: string;
+      page?: string;
     },
   ): Promise<unknown> {
     const body = JSON.stringify({
@@ -124,6 +126,8 @@ export class Follower {
       params,
       ...(sessionId ? { sessionId } : {}),
       ...(channel ? { channel } : {}),
+      ...(opts?.file ? { file: opts.file } : {}),
+      ...(opts?.page ? { page: opts.page } : {}),
     });
     // Long ops stay within their leader-side budget via progress pings, so a
     // single request can legitimately outlive timeoutMs — a fixed socket

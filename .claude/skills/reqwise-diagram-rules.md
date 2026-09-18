@@ -122,8 +122,10 @@ refused. Your job is to **read what came back** (rule 3), not to re-derive the r
 6. **Once per session, not once per diagram.** The bridge does not close between two draws;
    re-probing before every frame buys nothing and costs a round trip.
 
-If several Figma windows are connected, `figma_status` lists them: ask which file, then pass
-that `channel` on every call. Without it the op lands non-deterministically.
+If several Figma windows are connected, `figma_status.channels` lists file, page, and
+`focused`. Pass `file` (and `page` if the same file is open twice) — fuzzy names are fine,
+the session remembers after the first call, and you must **not** ask the user to click
+Connect. Different files (and different pages with their own windows) run in parallel.
 
 ## 6. One call: proof-read, draw, verify
 

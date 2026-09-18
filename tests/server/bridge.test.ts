@@ -425,6 +425,158 @@ describe("multi-channel routing", () => {
     });
   });
 
+  it("routes two files by fuzzy file name and runs them in parallel", async () => {
+    const { bridge, port } = await newBridge();
+    const p1 = new FakePlugin();
+    const p2 = new FakePlugin();
+    const p1Seen: string[] = [];
+    p1.onRequest = (req) => {
+      p1Seen.push(req.op);
+      /* stall */
+    };
+    p2.onRequest = (req) => p2.respond(req.id, { ok: true, result: { from: "klopop" } });
+    await p1.connect(port, { channel: "chan-a", fileName: "reqwise-mcp-test", pageName: "Flows" });
+    await p2.connect(port, { channel: "chan-b", fileName: "Klopop official", pageName: "Page 1" });
+
+    const stalled = bridge
+      .dispatch("get_selection", {}, { file: "reqwise", timeoutMs: 5000 })
+      .catch(() => undefined);
+    const fast = await bridge.dispatch("get_selection", {}, { file: "klopop", timeoutMs: 1000 });
+    expect((fast.result as { from: string }).from).toBe("klopop");
+    expect(p1Seen).toEqual(["get_selection"]);
+    await bridge.close();
+    await stalled;
+  });
+
+  it("follows the focused window after a user-selection context message", async () => {
+    const { bridge, port } = await newBridge();
+    const pA = new FakePlugin();
+    const pB = new FakePlugin();
+    pA.onRequest = (req) => pA.respond(req.id, { ok: true, result: { from: "A" } });
+    pB.onRequest = (req) => pB.respond(req.id, { ok: true, result: { from: "B" } });
+    await pA.connect(port, { channel: "chan-a", fileName: "reqwise-mcp-test", pageName: "Flows" });
+    await pB.connect(port, { channel: "chan-b", fileName: "Klopop official", pageName: "Page 1" });
+
+    pB.ws!.send(
+      JSON.stringify({
+        type: "context",
+        fileName: "Klopop official",
+        pageName: "Page 1",
+        reason: "selection",
+        at: Date.now(),
+      }),
+    );
+    await delay(30);
+
+    const res = await bridge.dispatch("get_selection", {}, { sessionId: "s-fresh-focus", timeoutMs: 1000 });
+    expect((res.result as { from: string }).from).toBe("B");
+    expect(bridge.sessionBinding("s-fresh-focus")).toBe("chan-b");
+    expect(bridge.channelSummaries().find((c) => c.channel === "chan-b")?.focused).toBe(true);
+  });
+
+  it("switches page before the op when the file's window is on a different page", async () => {
+    const { bridge, port } = await newBridge();
+    const p = new FakePlugin();
+    const seen: string[] = [];
+    p.onRequest = (req) => {
+      seen.push(req.op);
+      if (req.op === "set_current_page") {
+        expect(req.params).toMatchObject({ name: "UI" });
+        p.respond(req.id, { ok: true, result: { name: "UI" } });
+        return;
+      }
+      p.respond(req.id, { ok: true, result: { from: "after-switch" } });
+    };
+    await p.connect(port, { channel: "solo", fileName: "reqwise-mcp-test", pageName: "Flows" });
+
+    const res = await bridge.dispatch("get_selection", {}, { file: "reqwise", page: "UI", timeoutMs: 1000 });
+    expect((res.result as { from: string }).from).toBe("after-switch");
+    expect(seen).toEqual(["set_current_page", "get_selection"]);
+  });
+
+  it("two sessions on the same file+page share one window instead of going AMBIGUOUS", async () => {
+    const { bridge, port } = await newBridge();
+    const p = new FakePlugin();
+    p.onRequest = (req) => p.respond(req.id, { ok: true, result: { from: "same-page" } });
+    await p.connect(port, { channel: "only", fileName: "reqwise-mcp-test", pageName: "Flows" });
+    const twin = new FakePlugin();
+    twin.onRequest = (req) => twin.respond(req.id, { ok: true, result: { from: "twin" } });
+    await twin.connect(port, { channel: "twin", fileName: "reqwise-mcp-test", pageName: "Flows" });
+
+    const a = await bridge.dispatch("get_selection", {}, { file: "reqwise", page: "flow", sessionId: "s-task-a", timeoutMs: 1000 });
+    const b = await bridge.dispatch("get_selection", {}, { file: "reqwise", page: "flow", sessionId: "s-task-b", timeoutMs: 1000 });
+    expect((a.result as { from: string }).from).toBe("same-page");
+    expect((b.result as { from: string }).from).toBe("same-page");
+    expect(bridge.sessionBinding("s-task-a")).toBe("only");
+    expect(bridge.sessionBinding("s-task-b")).toBe("only");
+  });
+
+  it("queues a second same-page session on the busy window instead of the idle twin", async () => {
+    const { bridge, port } = await newBridge();
+    const p = new FakePlugin();
+    const pSeen: string[] = [];
+    p.onRequest = (req) => {
+      pSeen.push(req.id);
+      /* stall the first op so the second would race if routed to the twin */
+    };
+    await p.connect(port, { channel: "aaa-busy", fileName: "reqwise-mcp-test", pageName: "Flows" });
+    const twin = new FakePlugin();
+    const twinSeen: string[] = [];
+    twin.onRequest = (req) => {
+      twinSeen.push(req.id);
+      twin.respond(req.id, { ok: true, result: { from: "twin" } });
+    };
+    await twin.connect(port, { channel: "zzz-idle", fileName: "reqwise-mcp-test", pageName: "Flows" });
+
+    const first = bridge.dispatch("get_selection", {}, { file: "reqwise", page: "flow", sessionId: "s-busy", timeoutMs: 5000 });
+    await delay(30);
+    const second = bridge.dispatch("get_selection", {}, { file: "reqwise", page: "flow", sessionId: "s-queued", timeoutMs: 5000 });
+    await delay(30);
+
+    expect(pSeen).toHaveLength(1);
+    expect(twinSeen).toHaveLength(0);
+
+    p.respond(pSeen[0]!, { ok: true, result: { from: "busy" } });
+    const firstRes = await first;
+    await delay(30);
+    expect(pSeen).toHaveLength(2);
+    p.respond(pSeen[1]!, { ok: true, result: { from: "busy" } });
+    const secondRes = await second;
+    expect((firstRes.result as { from: string }).from).toBe("busy");
+    expect((secondRes.result as { from: string }).from).toBe("busy");
+    expect(twinSeen).toHaveLength(0);
+  });
+
+  it("auto-stickies a session to a file so later calls omit file", async () => {
+    const { bridge, port } = await newBridge();
+    const pA = new FakePlugin();
+    const pB = new FakePlugin();
+    pA.onRequest = (req) => pA.respond(req.id, { ok: true, result: { from: "A" } });
+    pB.onRequest = (req) => pB.respond(req.id, { ok: true, result: { from: "B" } });
+    await pA.connect(port, { channel: "chan-a", fileName: "File A" });
+    await pB.connect(port, { channel: "chan-b", fileName: "File B" });
+
+    const first = await bridge.dispatch("get_selection", {}, { file: "File B", sessionId: "s-1", timeoutMs: 1000 });
+    expect((first.result as { from: string }).from).toBe("B");
+    expect(bridge.sessionBinding("s-1")).toBe("chan-b");
+
+    const second = await bridge.dispatch("get_selection", {}, { sessionId: "s-1", timeoutMs: 1000 });
+    expect((second.result as { from: string }).from).toBe("B");
+  });
+
+  it("accepts a file name stuffed into channel", async () => {
+    const { bridge, port } = await newBridge();
+    const pA = new FakePlugin();
+    const pB = new FakePlugin();
+    pA.onRequest = (req) => pA.respond(req.id, { ok: true, result: { from: "A" } });
+    pB.onRequest = (req) => pB.respond(req.id, { ok: true, result: { from: "B" } });
+    await pA.connect(port, { channel: "chan-a", fileName: "reqwise-mcp-test" });
+    await pB.connect(port, { channel: "chan-b", fileName: "Klopop official" });
+
+    const res = await bridge.dispatch("get_selection", {}, { channel: "klopop", timeoutMs: 1000 });
+    expect((res.result as { from: string }).from).toBe("B");
+  });
+
   it("CHANNEL_NOT_FOUND names connected channels", async () => {
     const { bridge, port } = await newBridge();
     const p = new FakePlugin();

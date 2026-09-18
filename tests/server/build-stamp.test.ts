@@ -71,6 +71,23 @@ describe("which half is stale", () => {
     expect(hint).toContain("rotates the channel id");
   });
 
+  it("blames the SERVER when the server is the older half", async () => {
+    // The direction that used to be reported backwards. Re-running the plugin
+    // is a no-op when the plugin is already the new half, and the hint saying
+    // so is the difference between one restart and a confused half hour — it
+    // cost exactly that before anyone compared the two timestamps by hand.
+    const hint = staleBundleHints([channel("Klopop official", "2026-09-18T11:15")], "2026-09-18T11:07").join("\n");
+    expect(hint).toMatch(/SERVER is the stale half/i);
+    expect(hint).toContain("2026-09-18T11:07");
+    expect(hint).toContain("2026-09-18T11:15");
+    // It must NOT send the reader to reload the plugin in this direction.
+    expect(hint).not.toContain("Plugins → Development");
+    expect(hint).toMatch(/change nothing/i);
+    // And it names the follower trap: a fresh follower still forwards to
+    // whatever old leader holds the port.
+    expect(hint).toMatch(/follower/i);
+  });
+
   it("stays quiet when the two halves agree", () => {
     expect(staleBundleHints([channel("AI4BA", "2026-09-13T12:40")], "2026-09-13T12:40")).toEqual([]);
   });

@@ -14,6 +14,7 @@ import {
 } from "../shared/protocol.js";
 import { BUILD, VERSION } from "./version.js";
 import { ErrorCode, OpError } from "./errors.js";
+import type { RouteArg } from "./route.js";
 import { validateOperation, isReadOp } from "./validate.js";
 import { runUserflow } from "./userflow.js";
 import { runActivity, type OpCall } from "./activity.js";
@@ -32,9 +33,9 @@ import type { SessionRegistry } from "./session.js";
 /** Everything the tool handlers need from the running server. */
 export interface ToolContext {
   /** validate → dispatch (leader) OR validate → forward (follower). */
-  runValidated: (op: string, params: Record<string, unknown>, sessionId?: string, channel?: string) => Promise<unknown>;
+  runValidated: (op: string, params: Record<string, unknown>, sessionId?: string, route?: RouteArg) => Promise<unknown>;
   /** figma_write executor (leader only; followers forward a "write" pseudo-op). */
-  runWrite: (code: string, sessionId?: string, channel?: string) => Promise<unknown>;
+  runWrite: (code: string, sessionId?: string, route?: RouteArg) => Promise<unknown>;
   sessions: SessionRegistry;
   diagnostics: () => Promise<Diagnostics>;
 }
@@ -55,8 +56,10 @@ export interface ChannelDiagnostics {
   queueLength: number;
   pendingCount: number;
   lastHeartbeatMs: number;
-  /** Agent sessions the user bound to this window from the plugin UI. */
+  /** Agent sessions bound to this window (Connect, or auto-sticky). */
   boundSessions?: string[];
+  lastUserActivityMs?: number | null;
+  focused?: boolean;
 }
 
 export interface Diagnostics {
@@ -95,6 +98,8 @@ export interface Diagnostics {
   defaultSessionId?: string;
   /** Channel this process's session is bound to via the plugin UI, if any. */
   boundChannel?: string;
+  /** Leader-side session summaries (followers read these over /rpc). */
+  sessions?: Array<{ id: string; writeCount: number; stateKeys: number; lastUsedMs: number }>;
 }
 
 // ---- figma_status ----
@@ -136,11 +141,13 @@ export async function handleStatus(ctx: ToolContext): Promise<Record<string, unk
             lastHeartbeatMs: c.lastHeartbeatMs,
             ...(c.plugin.build ? { pluginBuild: c.plugin.build } : {}),
             ...(c.boundSessions?.length ? { boundSessions: c.boundSessions } : {}),
+            ...(c.lastUserActivityMs != null ? { lastUserActivityMs: c.lastUserActivityMs } : {}),
+            ...(c.focused ? { focused: true } : {}),
           })),
     lastHeartbeatMs: d.lastHeartbeatMs,
     queueLength: d.queueLength,
     pendingCount: d.pendingCount,
-    sessions: ctx.sessions.summaries(),
+    sessions: d.sessions ?? ctx.sessions.summaries(),
     ...(d.defaultSessionId ? { mySessionId: d.defaultSessionId } : {}),
     ...(d.boundChannel ? { myBoundChannel: d.boundChannel } : {}),
     hints,
@@ -163,6 +170,17 @@ export async function handleStatus(ctx: ToolContext): Promise<Record<string, unk
  * value is not evidence), and a server running unbundled — `dev`, i.e. vitest
  * or tsx — compares nothing, because it has no build of its own to compare
  * against.
+ *
+ * WHICH SIDE is stale decides the remedy, and they are opposite remedies. This
+ * used to report any mismatch as "re-run the plugin", which is wrong half the
+ * time and expensively wrong: when the SERVER is the old half, re-running the
+ * plugin changes nothing, the hint still says the same thing afterwards, and
+ * the reader concludes the tool is confused rather than that they restarted
+ * the wrong half. It cost a session real time before it was noticed — by a
+ * reader who compared the two timestamps by hand and saw the hint naming the
+ * newer one.
+ *
+ * The stamps are `YYYY-MM-DDTHH:mm`, so ordering them is a string compare.
  */
 export function staleBundleHints(
   channels: ChannelDiagnostics[] | undefined,
@@ -173,9 +191,19 @@ export function staleBundleHints(
   for (const c of channels ?? []) {
     const build = c.plugin.build;
     if (!build || build === serverBuild) continue;
-    out.push(
-      `The plugin open in "${c.plugin.fileName}" is running a bundle built ${build}, but this server is running ${serverBuild}. Anything fixed in between is NOT loaded there — re-run the plugin from Figma's Plugins → Development. (A reconnect restarts the SERVER and rotates the channel id; it does not reload the plugin.)`,
-    );
+    if (build < serverBuild) {
+      // The plugin is the old half: Figma keeps the bundle a window launched
+      // with, and no amount of reconnecting reloads it.
+      out.push(
+        `The plugin open in "${c.plugin.fileName}" is running a bundle built ${build}, but this server is running ${serverBuild}. Anything fixed in between is NOT loaded in that WINDOW — re-run the plugin from Figma's Plugins → Development. (A reconnect restarts the SERVER and rotates the channel id; it does not reload the plugin.)`,
+      );
+    } else {
+      // The SERVER is the old half. Re-running the plugin is a no-op here and
+      // leaves this same hint on screen, so the hint has to say so.
+      out.push(
+        `This SERVER is the stale half: it is running a build from ${serverBuild}, while the plugin open in "${c.plugin.fileName}" is already on ${build}. Re-running the plugin will change nothing — restart this MCP server instead (reconnect it, or start a fresh one from the current dist). If it reports mode:"follower", the process that VALIDATES operations is the leader holding the port, and a new operation stays rejected until that leader is the fresh one too.`,
+      );
+    }
   }
   return out;
 }
@@ -213,12 +241,12 @@ function buildHints(d: Diagnostics, apiVersionMatch: boolean | null): string[] {
   } else {
     if ((d.channels?.length ?? 0) > 1 && !d.boundChannel) {
       hints.push(
-        `${d.channels?.length} Figma windows are connected. Pass channel in figma_write/figma_read (see channels above or figma_read {op:"list_channels"}), or ask the user to pick this session (${d.defaultSessionId ?? "?"}) in the plugin UI of the window they want.`,
+        `${d.channels?.length} Figma windows are connected. Pass file (and page if the same file is open twice) from channels above — do not ask the user to click Connect. This session stickies after the first call. Different files run in parallel.`,
       );
     }
     if (d.boundChannel) {
       hints.push(
-        `This session is bound to channel "${d.boundChannel}" (picked by the user in the plugin UI) — operations route there by default.`,
+        `This session is bound to channel "${d.boundChannel}" — operations route there by default. Pass file/page to switch.`,
       );
     }
     if (apiVersionMatch === false) {
@@ -247,7 +275,7 @@ export async function handleRead(
   ctx: ToolContext,
   op: string,
   params: Record<string, unknown>,
-  channel?: string,
+  route?: RouteArg,
 ): Promise<unknown> {
   if (!isReadOp(op)) {
     throw new OpError(
@@ -257,7 +285,7 @@ export async function handleRead(
     );
   }
   // validateOperation is applied inside runValidated (the choke point).
-  const result = await ctx.runValidated(op, params, undefined, channel);
+  const result = await ctx.runValidated(op, params, undefined, route);
 
   // The plugin hands back what each frame stores; deriving what the PAGE knows
   // from it is the server's job, and it is what makes "the hold becomes 15
@@ -295,7 +323,7 @@ export async function handleWrite(
   ctx: ToolContext,
   code: string,
   sessionId?: string,
-  channel?: string,
+  route?: RouteArg,
 ): Promise<unknown> {
   if (typeof code !== "string" || code.trim().length === 0) {
     throw new OpError(
@@ -304,7 +332,7 @@ export async function handleWrite(
       "Pass JavaScript that uses the figma.* proxy, e.g. await figma.create({type:'FRAME'}).",
     );
   }
-  return ctx.runWrite(code, sessionId, channel);
+  return ctx.runWrite(code, sessionId, route);
 }
 
 // ---- figma_diagram ----
@@ -318,7 +346,7 @@ export async function handleDiagram(
   ctx: ToolContext,
   type: unknown,
   spec: unknown,
-  channel?: string,
+  channel?: RouteArg,
 ): Promise<unknown> {
   const batch = (spec as { diagrams?: unknown })?.diagrams;
   if (Array.isArray(batch)) return handleDiagramBatch(ctx, spec as BatchSpec, channel);
@@ -373,7 +401,7 @@ async function handleDiagramUpdate(
   update: string,
   type: unknown,
   spec: Record<string, unknown>,
-  channel?: string,
+  channel?: RouteArg,
 ): Promise<unknown> {
   // `update` is where the drawing goes, not part of what is drawn.
   const { patch, update: _target, ...rest } = spec;
@@ -537,7 +565,7 @@ interface BatchSpec {
 async function handleDiagramBatch(
   ctx: ToolContext,
   spec: BatchSpec,
-  channel?: string,
+  channel?: RouteArg,
 ): Promise<unknown> {
   const items = spec.diagrams;
   if (!items.length) {
@@ -767,7 +795,7 @@ function titleOf(spec: Record<string, unknown>, i: number): string {
 async function drawWithChecks(
   ctx: ToolContext,
   spec: unknown,
-  channel: string | undefined,
+  channel: RouteArg | undefined,
   run: (spec: unknown) => Promise<unknown>,
 ): Promise<unknown> {
   const options = readOptions(spec);
@@ -880,7 +908,7 @@ function runDiagramType(
   ctx: ToolContext,
   type: unknown,
   spec: unknown,
-  channel?: string,
+  channel?: RouteArg,
   /** Redraw into this existing frame, keeping its id, instead of a new one. */
   into?: string,
 ): Promise<unknown> {
@@ -930,7 +958,7 @@ function withOptions(spec: unknown, extra: Record<string, unknown>): unknown {
 export async function auditFrame(
   ctx: ToolContext,
   frameId: string,
-  channel?: string,
+  channel?: RouteArg,
 ): Promise<Record<string, unknown>> {
   try {
     const raw = resultOf(await ctx.runValidated("layout_audit", { nodeId: frameId }, undefined, channel)) as
@@ -968,7 +996,7 @@ function resultOf(raw: unknown): unknown {
 
 // ---- figma_rules ----
 
-export async function handleRules(ctx: ToolContext, channel?: string): Promise<string> {
+export async function handleRules(ctx: ToolContext, channel?: RouteArg): Promise<string> {
   const [styles, variables, components] = await Promise.allSettled([
     ctx.runValidated("get_styles", {}, undefined, channel),
     ctx.runValidated("get_variables", {}, undefined, channel),

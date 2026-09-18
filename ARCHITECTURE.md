@@ -37,19 +37,48 @@ MCP clients (N × Claude Code / Codex / Cursor — one server process each)
 
 ### Channel routing (multi-window, multi-agent)
 
-`dispatch(op, params, {channel?, sessionId?})` resolves the target window:
+`dispatch(op, params, {channel?, file?, page?, sessionId?})` resolves the target window:
 
-1. **Explicit `channel`** (tool arg on figma_write/figma_read/figma_rules) → that window, or `CHANNEL_NOT_FOUND` listing open channels.
-2. **Session binding** — the user clicked an agent session in a plugin window's UI (`bind` message): that session's ops route to that window. The first routed result carries a one-time warning naming the bound channel so the agent LEARNS about the pairing without polling; `figma_status` reports it as `myBoundChannel`.
-3. **Single window** → auto-route (the zero-config default; one window + N agents needs no channel anywhere).
-4. **No window** → ops wait in an unrouted queue until the first window connects ("start the agent first, open Figma second").
-5. **Several windows, none of the above** → `AMBIGUOUS_CHANNEL` whose hint lists `channel (fileName · pageName)` for self-correction.
+1. **Explicit `channel`** (id, or a file name stuffed in that field) → that window, or `CHANNEL_NOT_FOUND`.
+2. **`file` / `page`** (fuzzy) → the matching window. Two windows of the same file+page collapse onto one thread. A page the file is not currently showing is switched via `set_current_page` first.
+3. **Session sticky** — user Connect, or auto after the first successful file/page/focus route. Later calls from that session omit file/page.
+4. **Single window** → auto-route.
+5. **All windows the same file** → the focused page, or the only page.
+6. **Focused window** — last user selection/page change within 5 minutes.
+7. **Several different files, none of the above** → `AMBIGUOUS_CHANNEL` listing **file · page**, telling the agent to pass `file` (never to ask the user to click Connect).
+
+Different channels (different files, or different pages with their own windows) run **in parallel**. Same page serialises.
 
 The plugin UI shows: the window's channel chip (copy/change/join), and an **agent-session picker** ("AI agents connected — pick one to drive this window") fed by server pushes (`channels` message on every join/leave/bind + heartbeat piggyback). `figma_read {op:"list_channels"}` returns the same list to agents (server-answered; never a plugin round-trip).
 
 ### Sessions (multi-agent isolation)
 
 Each MCP server process generates a private default sessionId (`s-xxxxxxxx`) for its one stdio client, so N parallel Claude Code / Codex instances get isolated vm `state` automatically — no more accidental sharing through the old global `"default"` session. Passing an explicit `sessionId` remains the opt-in for deliberate state sharing. `figma_status` reports `mySessionId`.
+
+## One rule about the tests
+
+A check is only worth trusting when it can go RED at the moment the thing it
+asserts becomes false. Before writing an assertion, ask whether the mechanism
+would fail if the behaviour inverted — and if the answer is no, the assertion is
+decoration.
+
+Two failures in this codebase were exactly that shape, and both are worth
+knowing because neither looked like a testing problem at the time.
+
+- A build-skew hint reported any mismatch as "re-run the plugin", which is the
+  wrong half of the advice whenever the SERVER is the stale one. It was checked
+  by a test that only ever supplied a stale plugin, so the backwards case had no
+  way to fail. The hint then stayed on screen after the reader followed it,
+  and the tool looked confused rather than wrong.
+- An argument shim silently dropped the second argument of
+  override" — and returning `ok`. Nothing caught it because the natural thing
+  to assert is the return value, and the return value was never what broke. The
+  test that does catch it asserts the PARAMS THE OP RECEIVED.
+
+So: assert the thing the bug would touch, and prove the assertion bites by
+breaking the fix and watching it go red. Several comments in this repo record
+having done exactly that, because a green test nobody has seen fail is a claim,
+not evidence.
 
 ## MCP tool surface
 
@@ -69,7 +98,7 @@ Returns JSON: `{ pluginConnected, statusSource, statusError?, mode: "leader"|"fo
 **Plugin state on a follower is measured, not guessed.** A follower holds no bridge, so it forwards a synthetic `__status__` op over `/rpc` (short 2 s timeout — a diagnostic must not inherit the 130 s drawing-op timeout) and reports whatever the leader actually sees. `statusSource` says where the numbers came from: `"local"` (own bridge), `"leader"` (read over `/rpc`), or `"unknown"`.
 
 `pluginConnected` is therefore **tri-state**: `true`/`false` are measured; `null` means the leader could not be queried. `lastHeartbeatMs` and `channels` are likewise `null` when unknown, never `-1`/`[]`. This distinction is load-bearing: the follower branch used to hardcode `pluginConnected:false`, and clients that gate on it walked users through plugin restarts while the plugin was connected and writing normally. Never collapse "no data" into `false`.
-`hints` is an ordered list of concrete next steps when something is off (e.g. "Plugin version 1.x < server 2.x — reinstall plugin from plugin/manifest.json", "No heartbeat for 30s — the Figma window may be minimized", "2 Figma windows are connected — pass channel or ask the user to pick this session in the plugin UI").
+`hints` is an ordered list of concrete next steps when something is off (e.g. "Plugin version 1.x < server 2.x — reinstall plugin from plugin/manifest.json", "No heartbeat for 30s — the Figma window may be minimized", "2 Figma windows are connected — pass file from channels above; do not ask the user to click Connect").
 
 ### `figma_read` operations
 
@@ -82,7 +111,7 @@ At `design` detail, paints/effects/typography are compacted for token economy: a
 
 ### `figma_write` — code execution model
 
-- Payload `{ code, sessionId?, channel? }`. Code runs in `vm.createContext` with: `figma` proxy, `console` (captured), standard globals. Banned: `require/process/fetch/setTimeout/eval`. Node's vm supports full modern syntax (`?.`, `??`, spread) — no ES restrictions. `channel` pins the whole call to one Figma window (see Channel routing); omitted, it auto-routes.
+- Payload `{ code, sessionId?, file?, page?, channel? }`. Code runs in `vm.createContext` with: `figma` proxy, `console` (captured), standard globals. Banned: `require/process/fetch/setTimeout/eval`. Node's vm supports full modern syntax (`?.`, `??`, spread) — no ES restrictions. `file`/`page` (fuzzy) pin the whole call to one Figma window (see Channel routing); omitted, the session stickies after the first route. `channel` ids still work.
 - **Persistent session state**: `session.state` (a plain object) survives across `figma_write` calls in the same session — token maps, node id registries, constants. Exposed as global `state` in the sandbox. Sessions default to a per-process private id (see Sessions above).
 - Every `figma.*` method is a Promise → one bridge round-trip, except `figma.batch(ops)` which ships N ops in one round-trip with **chunked streaming**: server splits into chunks of 20, plugin reports progress per chunk (resets timeout), per-item try/catch, partial results are committed (no rollback), response lists exactly which index failed and why. No hard cap: 200 ops are fine, they stream.
 

@@ -14,6 +14,7 @@ export const USECASE_MARKER = "reqwise.usecase";
 export const JOURNEY_MARKER = "reqwise.journey";
 export const SITEMAP_MARKER = "reqwise.sitemap";
 export const PERSONA_MARKER = "reqwise.persona";
+export const BPMN_MARKER = "reqwise.bpmn";
 
 /**
  * Every key a diagram tool has ever written on a frame, in ONE list.
@@ -32,6 +33,7 @@ export const PERSONA_MARKER = "reqwise.persona";
  */
 export const DIAGRAM_MARKERS = [
   ACTIVITY_MARKER,
+  BPMN_MARKER,
   ERD_MARKER,
   JOURNEY_MARKER,
   PERSONA_MARKER,
@@ -91,7 +93,7 @@ export function isDiagramFrameName(name: string): boolean {
   // The full "<Kind> · " prefix, not the bare word: a frame the user named
   // "State machine" or "Activity log" is theirs, and skipping it would hide
   // real findings on a real screen.
-  for (const kind of ["Userflow", "Activity", "ERD", "Sequence", "State", "Use case", "Journey", "Sitemap", "Persona"]) {
+  for (const kind of ["Userflow", "Activity", "BPMN", "ERD", "Sequence", "State", "Use case", "Journey", "Sitemap", "Persona"]) {
     if (name.indexOf(`${kind} \u00b7 `) === 0) return true;
   }
   return false;
@@ -101,6 +103,16 @@ export function isDiagramLayerName(name: string): boolean {
   for (const prefix of [
     "step:",
     "flow:",
+    "bpmn:",
+    "pool:",
+    "pool-head:",
+    "pool-name:",
+    "lane-name:",
+    "glyph:",
+    "mark:",
+    "ring:",
+    "fold:",
+    "rim:",
     "lane:",
     "lane-head:",
     "text:",

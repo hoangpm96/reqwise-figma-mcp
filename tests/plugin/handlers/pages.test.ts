@@ -30,6 +30,13 @@ describe("set_current_page", () => {
     expect((globalThis as any).figma.currentPage).toBe(mobile);
   });
 
+  it("switches by a unique fuzzy name", async () => {
+    const flows = { id: "0:3", name: "Flows", type: "PAGE" };
+    (globalThis as any).figma.root.children.push(flows);
+    await setCurrentPage(makeContext({ name: "flow" }, () => {}));
+    expect((globalThis as any).figma.currentPage).toBe(flows);
+  });
+
   it("reports a missing page cleanly", async () => {
     const error = await setCurrentPage(makeContext({ pageId: "9:9" }, () => {})).catch((e) => e) as HandlerError;
     expect(error.code).toBe(ErrorCode.NODE_NOT_FOUND);

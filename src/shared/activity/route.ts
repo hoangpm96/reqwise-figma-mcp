@@ -252,7 +252,7 @@ export function routeActivity(input: RouteInput): RoutedActivity {
   classify(wires, input.steps, ranks, ax, input.gutter !== false, warnings);
   assignCorridors(wires, ranks);
   assignGutterLanes(wires, ax);
-  buildPaths(wires, ranks, laneExtent(input, ax), ax);
+  buildPaths(wires, ranks, laneExtent(input, ax), ax, input.gutter === false ? input.lanes : []);
   // Edges whose connection points were chosen by a person (or by the spec) are
   // re-routed through the generic connector: it can leave and arrive on any
   // face, which the lane-aware routing above cannot express.
@@ -521,7 +521,18 @@ function classify(
       continue;
     }
     if (w.kind === "return" || w.rankTo < w.rankFrom) {
-      w.shape = gutterAllowed ? "back" : "sameRank";
+      // `sameRank` builds its polyline in the CROSS space and assumes the two
+      // boxes share a rank. Handed an edge that spans ranks it uses each port
+      // offset as an ALONG coordinate, and the result is a short zigzag
+      // detached from both endpoints — a line drawn nowhere near the two
+      // things it connects. A rework loop in a BPMN pool hit exactly that:
+      // `repack → merge` spans 270px of the diagram and came out as a 73px
+      // stub 200px away from either box.
+      //
+      // So a backward edge that really crosses ranks takes the gutter even
+      // where the gutter is otherwise refused. A detour around the outside is
+      // ugly and argued about; a line that is nowhere is simply broken.
+      w.shape = gutterAllowed || w.rankFrom !== w.rankTo ? "back" : "sameRank";
       continue;
     }
     if (w.rankFrom === w.rankTo) {
@@ -732,7 +743,23 @@ function assignGutterLanes(wires: Wire[], ax: Axis): void {
 
 // ----------------------------------------------------------------- paths ----
 
-function buildPaths(wires: Wire[], ranks: Ranks, lanes: { min: number; max: number }, ax: Axis): void {
+function buildPaths(
+  wires: Wire[],
+  ranks: Ranks,
+  lanes: { min: number; max: number },
+  ax: Axis,
+  /**
+   * The bands a detour must stay INSIDE, or empty to allow the outer gutter.
+   *
+   * Only the callers that refuse the gutter pass these, and for them the
+   * outside is not merely untidy: in BPMN it is outside the POOL, and a
+   * sequence flow that appears to leave its pool is the one thing the notation
+   * has no exception for. A rework loop between two boxes of one lane came out
+   * as a detour over the top of the whole diagram, above a second pool that has
+   * nothing to do with it.
+   */
+  bands: LanePlace[] = [],
+): void {
   const groove = new Map<string, number>();
   const stagger = (key: string): number => {
     const k = groove.get(key) ?? 0;
@@ -836,9 +863,22 @@ function buildPaths(wires: Wire[], ranks: Ranks, lanes: { min: number; max: numb
     // Outside every lane: backwards rework below the first lane, a forward
     // skip that cannot get through above the last one.
     const back = w.shape === "back";
-    const gc = back
-      ? lanes.min - GUTTER - w.lane * GUTTER_STEP
-      : lanes.max + GUTTER + w.lane * GUTTER_STEP;
+    // A detour keeps to the band both its boxes live in when one is named —
+    // just inside that band's far edge, which is where every process tool
+    // draws a loop-back and is the only place it can go without appearing to
+    // leave the participant that owns it. With no band it takes the outer
+    // gutter as before.
+    const band =
+      bands.length && w.from_.lane && w.from_.lane === w.to_.lane
+        ? (bands.find((b) => b.id === w.from_.lane) ?? null)
+        : null;
+    const gc = band
+      ? back
+        ? ax.c1(band.at) - GUTTER - w.lane * GUTTER_STEP
+        : ax.c0(band.at) + GUTTER + w.lane * GUTTER_STEP
+      : back
+        ? lanes.min - GUTTER - w.lane * GUTTER_STEP
+        : lanes.max + GUTTER + w.lane * GUTTER_STEP;
     const rankOut = ranks.span[w.rankFrom]!;
     const rankIn = ranks.span[w.rankTo]!;
     const aOut = rankOut.end + GUTTER_TURN + stagger(`o${w.rankFrom}`) * 9;

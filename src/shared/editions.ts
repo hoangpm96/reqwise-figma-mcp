@@ -71,6 +71,7 @@ export const PRO_METHODS = [
   "exposeNestedInstance",
   "detachInstance",
   "resetInstanceOverrides",
+  "matchMainValues",
   "applyDesignSystem",
   "buildDemo",
   "playDemo",

@@ -197,14 +197,30 @@ export async function setCurrentPage(ctx: HandlerContext): Promise<unknown> {
     const node = await getNodeByIdSafe(pageId);
     if (node?.type === "PAGE") page = node;
   } else if (pageName) {
-    const matches = figma.root.children.filter((candidate) => candidate.name.toLowerCase() === pageName.toLowerCase());
-    if (matches.length === 1) page = matches[0]!;
-    if (matches.length > 1) {
+    const exact = figma.root.children.filter(
+      (candidate) => candidate.name.toLowerCase() === pageName.toLowerCase(),
+    );
+    if (exact.length === 1) page = exact[0]!;
+    else if (exact.length > 1) {
       throw err(
         ErrorCode.INVALID_PARAMS,
         `Multiple pages are named "${pageName}".`,
         "Call get_document_info and pass the exact pageId instead.",
       );
+    } else {
+      const needle = pageName.toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const fuzzy = figma.root.children.filter((candidate) => {
+        const have = candidate.name.toLowerCase().replace(/[^a-z0-9]+/g, "");
+        return have === needle || have.includes(needle) || needle.includes(have);
+      });
+      if (fuzzy.length === 1) page = fuzzy[0]!;
+      if (fuzzy.length > 1) {
+        throw err(
+          ErrorCode.INVALID_PARAMS,
+          `Several pages match "${pageName}": ${fuzzy.map((p) => p.name).join(", ")}.`,
+          "Pass a more specific page name, or the pageId from get_document_info.",
+        );
+      }
     }
   }
   if (!page) {

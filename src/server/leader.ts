@@ -46,7 +46,7 @@ export type RunValidated = (
   op: string,
   params: Record<string, unknown>,
   sessionId?: string,
-  channel?: string,
+  route?: import("./route.js").RouteArg,
 ) => Promise<unknown>;
 
 export interface CoordinatorDeps {
@@ -191,12 +191,14 @@ export class Coordinator {
     sessionId?: string,
     channel?: string,
     timeoutMs?: number,
+    route?: { file?: string; page?: string },
   ): Promise<unknown> {
     if (!this.follower) {
       throw new OpError(ErrorCode.INTERNAL, "forward() called without a follower.", "This is a server bug.");
     }
+    const opts = route?.file || route?.page ? { file: route.file, page: route.page } : undefined;
     try {
-      return await this.follower.forward(op, params, sessionId, channel, timeoutMs);
+      return await this.follower.forward(op, params, sessionId, channel, timeoutMs, opts);
     } catch (err) {
       // 401: the leader restarted on the same port with a fresh token (e.g.
       // the user reloaded that window's MCP server). /health stays green, so
@@ -207,7 +209,7 @@ export class Coordinator {
         err.code === ErrorCode.UNAUTHORIZED &&
         (await this.refreshFollowerInfo())
       ) {
-        return this.follower.forward(op, params, sessionId, channel, timeoutMs);
+        return this.follower.forward(op, params, sessionId, channel, timeoutMs, opts);
       }
       throw err;
     }

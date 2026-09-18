@@ -231,6 +231,19 @@ export interface BindRequest {
   sessionId: string;
 }
 
+/**
+ * Plugin → server: this window is the one the user is working in (selection
+ * or page change, not plugin-driven). The bridge uses it as the default
+ * target for a new agent session that has not passed file/page yet.
+ */
+export interface PluginContext {
+  type: "context";
+  fileName: string;
+  pageName: string;
+  reason: "selection" | "page";
+  at: number;
+}
+
 export interface Heartbeat {
   type: "ping" | "pong";
   at: number;
@@ -244,6 +257,7 @@ export type WireMessage =
   | ChannelAssigned
   | ChannelsUpdate
   | BindRequest
+  | PluginContext
   | Heartbeat;
 
 /** Heartbeat cadence (ms). Plugin sends ping; server answers pong. */

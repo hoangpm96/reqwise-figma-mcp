@@ -21,7 +21,8 @@
  *   no channel + exactly one connection → it (zero-config single-window UX);
  *   no channel + none → held in an unrouted queue until a plugin connects
  *     (same wait-for-plugin behaviour the single-connection bridge had);
- *   no channel + several → AMBIGUOUS_CHANNEL listing the open channels.
+ *   no channel + several → file/page match, then session sticky, then
+ *     focused window, then AMBIGUOUS_CHANNEL listing files not channel ids.
  *
  * Correlation: every dispatched request gets an id; responses/progress are
  * matched via the owning connection's `pending` map. Each op has a per-op
@@ -47,6 +48,7 @@ import {
   type WireMessage,
 } from "../shared/protocol.js";
 import { ErrorCode, OpError, toBridgeError } from "./errors.js";
+import { namesMatch, resolveRoute, USER_ACTIVITY_FRESH_MS, type RouteArg } from "./route.js";
 
 /**
  * Does this operation CHANGE the document? A timeout on a read is just a
@@ -126,6 +128,10 @@ export interface ChannelSummary {
   queueLength: number;
   pendingCount: number;
   lastHeartbeatMs: number;
+  /** ms since the user last touched this window; null = never. */
+  lastUserActivityMs: number | null;
+  /** True on the window with the most recent fresh user activity. */
+  focused?: boolean;
 }
 
 interface Pending {
@@ -155,15 +161,20 @@ export interface DispatchOptions {
   onProgress?: (p: NonNullable<BridgeResponse["progress"]>) => void;
   /**
    * Target channel (Figma window). Omit for the zero-config default: with one
-   * window connected everything routes there; with several the dispatch fails
-   * AMBIGUOUS_CHANNEL so the caller picks one via list_channels — unless the
-   * calling session was bound to a window from the plugin UI (see sessionId).
+   * window connected everything routes there. With several, pass `file`/`page`
+   * (or `channel`); a session also stickies after the first successful route,
+   * and a brand-new session follows the focused window when activity is fresh.
    */
   channel?: string;
+  /** Figma file name (fuzzy). Preferred over channel when several windows are open. */
+  file?: string;
+  /** Page name (fuzzy). Pins to a window already on that page, or switches. */
+  page?: string;
   /**
    * The calling agent session. Used for Figma-side pairing: when the user
    * picks this session in a plugin window's UI, ops from the session route to
-   * that window without an explicit channel.
+   * that window without an explicit channel. Also the key for auto-sticky
+   * after the first file/page/focus route.
    */
   sessionId?: string;
   /**
@@ -182,7 +193,7 @@ export interface BridgeHandlers {
     op: string,
     params: Record<string, unknown>,
     sessionId?: string,
-    channel?: string,
+    route?: RouteArg,
   ) => Promise<unknown>;
 }
 
@@ -203,6 +214,8 @@ class PluginConnection {
   readonly queue: QueueItem[] = [];
   inFlight = 0;
   lastHeartbeatAt = Date.now();
+  /** User (not plugin) last touched this window. 0 = never. */
+  lastUserActivityAt = 0;
 
   constructor(
     public readonly channel: string,
@@ -356,6 +369,7 @@ class PluginConnection {
       queueLength: this.queue.length,
       pendingCount: this.pending.size,
       lastHeartbeatMs: this.lastHeartbeatMs,
+      lastUserActivityMs: this.lastUserActivityAt > 0 ? Date.now() - this.lastUserActivityAt : null,
     };
   }
 }
@@ -380,12 +394,14 @@ export class Bridge {
    */
   private readonly unrouted: QueueItem[] = [];
   /**
-   * Figma-side pairing: sessionId → channel, set when the user picks an agent
-   * session in a plugin window's UI ({type:"bind"}). `notified` flips after
-   * the first op routed through the binding has carried a warning back to the
-   * agent, so the agent learns about the pairing without polling status.
+   * Figma-side pairing: sessionId → channel. `user` is a Connect click in the
+   * plugin UI; `auto` is a successful file/page/focus route. `notified` flips
+   * after the first op has carried a warning back to the agent.
    */
-  private readonly sessionBindings = new Map<string, { channel: string; notified: boolean }>();
+  private readonly sessionBindings = new Map<
+    string,
+    { channel: string; notified: boolean; source: "user" | "auto" }
+  >();
   /** Supplied by index.ts so channel pushes can list agent sessions. */
   private sessionsProvider?: () => SessionSummaryWire[];
 
@@ -405,9 +421,13 @@ export class Bridge {
     this.sessionsProvider = fn;
   }
 
-  /** The channel a session is bound to (via the plugin UI), if any. */
+  /** The channel a session is bound to (plugin UI or auto-sticky), if any. */
   sessionBinding(sessionId: string): string | undefined {
     return this.sessionBindings.get(sessionId)?.channel;
+  }
+
+  sessionBindingSource(sessionId: string): "user" | "auto" | undefined {
+    return this.sessionBindings.get(sessionId)?.source;
   }
 
   get port(): number {
@@ -457,7 +477,15 @@ export class Bridge {
 
   /** list_channels / figma_status / health: one row per connected window. */
   channelSummaries(): ChannelSummary[] {
-    return [...this.channels.values()].map((c) => c.summary());
+    const rows = [...this.channels.values()].map((c) => c.summary());
+    let focused: ChannelSummary | undefined;
+    for (const r of rows) {
+      if (r.lastUserActivityMs == null) continue;
+      if (r.lastUserActivityMs > USER_ACTIVITY_FRESH_MS) continue;
+      if (!focused || r.lastUserActivityMs < focused.lastUserActivityMs!) focused = r;
+    }
+    if (focused) focused.focused = true;
+    return rows;
   }
 
   /**
@@ -607,8 +635,20 @@ export class Bridge {
           const oldest = this.sessionBindings.keys().next().value;
           if (oldest !== undefined) this.sessionBindings.delete(oldest);
         }
-        this.sessionBindings.set(msg.sessionId, { channel: conn.channel, notified: false });
+        this.sessionBindings.set(msg.sessionId, { channel: conn.channel, notified: false, source: "user" });
         this.broadcastChannels();
+        break;
+      }
+      case "context": {
+        if (!conn) break;
+        if (typeof msg.fileName === "string" && msg.fileName.length > 0) {
+          conn.info = { ...conn.info, fileName: msg.fileName };
+        }
+        if (typeof msg.pageName === "string" && msg.pageName.length > 0) {
+          conn.info = { ...conn.info, pageName: msg.pageName };
+        }
+        conn.lastUserActivityAt = typeof msg.at === "number" && msg.at > 0 ? msg.at : Date.now();
+        conn.lastHeartbeatAt = Date.now();
         break;
       }
       default:
@@ -639,6 +679,7 @@ export class Bridge {
       // page info (ui.html re-sends hello on page change). Update info in
       // place; the channel of a live connection never changes (changing
       // channel is a reconnect in the UI).
+      const prevPage = established.info.pageName;
       established.info = {
         ...established.info,
         version: hello.pluginVersion,
@@ -650,6 +691,11 @@ export class Bridge {
         editorType: hello.editorType,
       };
       established.lastHeartbeatAt = Date.now();
+      // A re-hello with a new page name is the user working in this window.
+      if (hello.pageName && hello.pageName !== prevPage) {
+        established.lastUserActivityAt = Date.now();
+      }
+      this.broadcastChannels();
       return;
     }
 
@@ -824,57 +870,25 @@ export class Bridge {
 
       // From here on every refusal goes through pending.reject, which also
       // detaches the abort listener; the raw reject left it on the signal.
-      // Explicit channel → exactly that window.
-      if (opts.channel) {
-        const conn = this.channels.get(opts.channel);
-        if (!conn) {
-          pending.reject(
-            new OpError(
-              ErrorCode.CHANNEL_NOT_FOUND,
-              `No Figma window is connected on channel "${opts.channel}".`,
-              this.channels.size > 0
-                ? `Connected channels: ${this.describeChannels()}. Use figma_read {op:"list_channels"} and pick one, or enter "${opts.channel}" in the plugin UI of the window you want.`
-                : "No plugin is connected at all. Open the Reqwise plugin in Figma and check its channel chip.",
-            ),
-          );
-          return;
-        }
-        conn.enqueue(request, pending);
-        return;
-      }
+      void this.routeAndEnqueue(op, request, pending, opts);
+    });
+  }
 
-      // Figma-side pairing: the user bound this agent session to a window in
-      // the plugin UI. The first routed op carries a warning back so the
-      // agent learns about the pairing without polling figma_status.
-      if (opts.sessionId) {
-        const binding = this.sessionBindings.get(opts.sessionId);
-        const conn = binding ? this.channels.get(binding.channel) : undefined;
-        if (binding && conn) {
-          if (!binding.notified) {
-            // Marked only when an answer actually carries the notice back: an
-            // op that dies queued (QUEUE_FULL, timeout, disconnect) would
-            // otherwise spend the one-time notice on a reply nobody receives.
-            const notice = `The user bound this session to channel "${binding.channel}" (${conn.info.fileName || "untitled"}) from the Figma plugin UI — operations now route to that window by default.`;
-            const inner = pending.resolve;
-            pending.resolve = (res) => {
-              if (binding.notified) return inner(res);
-              binding.notified = true;
-              inner({ ...res, warnings: [...(res.warnings ?? []), notice] });
-            };
-          }
-          conn.enqueue(request, pending);
-          return;
-        }
-      }
-
-      // No channel: zero-config when unambiguous.
-      if (this.channels.size === 1) {
-        const conn = this.channels.values().next().value as PluginConnection;
-        conn.enqueue(request, pending);
-        return;
-      }
-      if (this.channels.size === 0) {
-        // Wait for the first window — same UX as the single-connection bridge.
+  /**
+   * Resolve the target window (file/page/channel/session/focus) and put the
+   * op on that connection's queue. Page switches run as a prior
+   * set_current_page on the same channel so they work with the plugin that
+   * is already open — no extra protocol field.
+   */
+  private async routeAndEnqueue(
+    op: Operation,
+    request: BridgeRequest,
+    pending: Pending,
+    opts: DispatchOptions,
+  ): Promise<void> {
+    try {
+      const explicit = Boolean(opts.channel?.trim() || opts.file?.trim() || opts.page?.trim());
+      if (this.channels.size === 0 && !explicit) {
         if (this.unrouted.length >= MAX_QUEUE) {
           pending.reject(
             new OpError(
@@ -885,33 +899,102 @@ export class Bridge {
           );
           return;
         }
-        // Waiting for a window is bounded too. Without a deadline the caller
-        // could time out and move on while this op sat here, only to run
-        // later against whichever file connected first.
         pending.timer = setTimeout(() => {
-          if (!this.removeUnrouted(id)) return;
+          if (!this.removeUnrouted(request.id)) return;
           pending.reject(
             new OpError(
               ErrorCode.PLUGIN_TIMEOUT,
-              `Operation "${op}" waited ${timeoutMs}ms for a Figma window and none connected.`,
+              `Operation "${op}" waited ${pending.timeoutMs}ms for a Figma window and none connected.`,
               "Nothing was sent to Figma. Open the Reqwise plugin in the file you want, then retry.",
             ),
           );
-        }, timeoutMs);
+        }, pending.timeoutMs);
         pending.timer.unref?.();
         this.unrouted.push({ request, pending });
         return;
       }
 
-      // Several windows and no channel — make the caller pick.
-      pending.reject(
-        new OpError(
-          ErrorCode.AMBIGUOUS_CHANNEL,
-          `${this.channels.size} Figma windows are connected — specify which channel to target.`,
-          `Connected channels: ${this.describeChannels()}. Pass channel in the tool call (figma_write/figma_read {channel}), list details with figma_read {op:"list_channels"} — or ask the user to pick this agent session in the plugin UI of the window they want.`,
-        ),
-      );
-    });
+      const windows = [...this.channels.values()].map((c) => ({
+        channel: c.channel,
+        fileName: c.info.fileName,
+        pageName: c.info.pageName,
+        lastUserActivityAt: c.lastUserActivityAt,
+        queueLength: c.queue.length + c.inFlight,
+      }));
+      const bound = opts.sessionId ? this.sessionBindings.get(opts.sessionId) : undefined;
+      const decision = resolveRoute({
+        ...(opts.channel ? { channel: opts.channel } : {}),
+        ...(opts.file ? { file: opts.file } : {}),
+        ...(opts.page ? { page: opts.page } : {}),
+        ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+        ...(bound ? { sessionBoundChannel: bound.channel, sessionBoundSource: bound.source } : {}),
+        windows,
+      });
+      if (!decision.ok) {
+        pending.reject(new OpError(decision.code, decision.message, decision.hint));
+        return;
+      }
+      const conn = this.channels.get(decision.channel);
+      if (!conn) {
+        pending.reject(
+          new OpError(
+            ErrorCode.CHANNEL_NOT_FOUND,
+            `No Figma window is connected on channel "${decision.channel}".`,
+            `Connected: ${this.describeChannels()}.`,
+          ),
+        );
+        return;
+      }
+
+      if (opts.sessionId && decision.sticky === "auto") {
+        const prev = this.sessionBindings.get(opts.sessionId);
+        if (!prev || prev.source !== "user" || explicit) {
+          this.sessionBindings.set(opts.sessionId, {
+            channel: conn.channel,
+            notified: prev?.notified ?? false,
+            source: prev?.source === "user" && !explicit ? "user" : "auto",
+          });
+        }
+      }
+
+      const binding = opts.sessionId ? this.sessionBindings.get(opts.sessionId) : undefined;
+      const notice = decision.notice;
+      if (notice && binding && !binding.notified) {
+        const inner = pending.resolve;
+        pending.resolve = (res) => {
+          if (binding.notified) return inner(res);
+          binding.notified = true;
+          inner({ ...res, warnings: [...(res.warnings ?? []), notice] });
+        };
+      }
+
+      if (decision.ensurePage && op !== "set_current_page" && !namesMatch(conn.info.pageName, decision.ensurePage)) {
+        const switched = await this.dispatch("set_current_page", { name: decision.ensurePage }, {
+          channel: conn.channel,
+          timeoutMs: Math.min(pending.timeoutMs, 15_000),
+        });
+        if (!switched.ok) {
+          const err = switched.error;
+          pending.reject(
+            new OpError(
+              (err?.code as ErrorCode | undefined) ?? ErrorCode.NODE_NOT_FOUND,
+              err?.message ?? `Could not switch to page "${decision.ensurePage}".`,
+              err?.hint ?? `Open a window of this file already on "${decision.ensurePage}", or create the page first.`,
+            ),
+          );
+          return;
+        }
+        const named =
+          switched.result && typeof switched.result === "object"
+            ? (switched.result as { name?: string }).name
+            : undefined;
+        if (named) conn.info.pageName = named;
+      }
+
+      conn.enqueue(request, pending);
+    } catch (err) {
+      pending.reject(err instanceof OpError ? err : new OpError(ErrorCode.INTERNAL, String(err)));
+    }
   }
 
   /** Take one request out of the unrouted queue; false when it is not there. */
@@ -971,12 +1054,19 @@ export class Bridge {
       return;
     }
 
-    let body: { op?: string; params?: Record<string, unknown>; sessionId?: string; channel?: string };
+    let body: {
+      op?: string;
+      params?: Record<string, unknown>;
+      sessionId?: string;
+      channel?: string;
+      file?: string;
+      page?: string;
+    };
     try {
       body = JSON.parse(await readBody(req)) as typeof body;
     } catch {
       this.respondJson(res, 400, {
-        error: { code: ErrorCode.INVALID_PARAMS, message: "Body must be JSON.", hint: "POST { op, params, sessionId?, channel? }." },
+        error: { code: ErrorCode.INVALID_PARAMS, message: "Body must be JSON.", hint: "POST { op, params, sessionId?, channel?, file?, page? }." },
       });
       return;
     }
@@ -991,7 +1081,12 @@ export class Bridge {
     try {
       // NOTE: onRpc runs the op through the SAME validateOperation choke point
       // as leader-direct calls — see index.ts wiring. No bypass.
-      const result = await this.handlers.onRpc(body.op ?? "", body.params ?? {}, body.sessionId, body.channel);
+      const route = {
+        ...(body.channel ? { channel: body.channel } : {}),
+        ...(body.file ? { file: body.file } : {}),
+        ...(body.page ? { page: body.page } : {}),
+      };
+      const result = await this.handlers.onRpc(body.op ?? "", body.params ?? {}, body.sessionId, route);
       this.respondJson(res, 200, { ok: true, result });
     } catch (err) {
       this.respondJson(res, 200, { ok: false, error: toBridgeError(err) });

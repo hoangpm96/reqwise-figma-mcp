@@ -44,6 +44,7 @@ import type { Bridge } from "./bridge.js";
 import type { AnyOperation, BridgeResponse } from "../shared/protocol.js";
 import { DOC_SECTION_NAMES } from "./docs-content/index.js";
 import { READ_OPERATIONS, DEFAULT_PORT, PORT_RANGE } from "../shared/protocol.js";
+import { parseRouteArg, type RouteArg } from "./route.js";
 
 // ---- JSON tool schemas (match ARCHITECTURE.md) ----
 
@@ -64,11 +65,28 @@ const arrayOf = (description: string) => ({
   items: { type: "object" as const, additionalProperties: true },
 });
 
+/** Shared by every canvas tool so agents route by file/page, not channel ids. */
+const ROUTE_TARGET = {
+  file: {
+    type: "string" as const,
+    description:
+      'File name, fuzzy ("klopop"). Session remembers it. Different files run in parallel.',
+  },
+  page: {
+    type: "string" as const,
+    description: 'Page name, fuzzy ("ui"). Pins to that window or switches. Same page queues.',
+  },
+  channel: {
+    type: "string" as const,
+    description: "Window id. Optional — prefer file/page, or omit to follow this session's last target / the focused window.",
+  },
+};
+
 export const TOOLS: Tool[] = [
   {
     name: "figma_status",
     description:
-      "Rich connection diagnostics for the Figma bridge (never a bare boolean): plugin connection, leader/follower mode, port, heartbeat, queue, sessions, and an ordered list of concrete next-step hints when something is off. `pluginConnected` is TRI-STATE: true/false are measured, null means UNKNOWN (this follower could not query the leader — see `statusSource`/`statusError`). Do NOT treat null as disconnected and do NOT ask the user to reopen the plugin on that basis; ops may still be forwarding fine.",
+      "Rich connection diagnostics for the Figma bridge (never a bare boolean): plugin connection, leader/follower mode, port, heartbeat, queue, sessions, and an ordered list of concrete next-step hints when something is off. `pluginConnected` is TRI-STATE: true/false are measured, null means UNKNOWN (this follower could not query the leader — see `statusSource`/`statusError`). Do NOT treat null as disconnected and do NOT ask the user to reopen the plugin on that basis; ops may still be forwarding fine. `channels[]` lists file, page, focused — pass those as file/page on later tools; this session stickies. Different files run in parallel.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -81,17 +99,14 @@ export const TOOLS: Tool[] = [
         op: {
           type: "string",
           enum: [...READ_OPERATIONS, "list_channels"],
-          description: "The read operation to run. list_channels lists connected Figma windows (channel, file, page) — needed only when several windows are open.",
+          description: "The read operation to run. list_channels lists connected Figma windows (file, page, focused) — pass those names as file/page on later tools; channel ids are optional.",
         },
         params: {
           type: "object",
           description: "Operation parameters (e.g. { nodeId }, { nodeIds }, { detail: 'sparse'|'compact'|'full' }, read_selection: { detail?, depth? }).",
           additionalProperties: true,
         },
-        channel: {
-          type: "string",
-          description: "Target Figma window's channel. Omit with a single window (auto-routes). With several windows, pick one from list_channels.",
-        },
+        ...ROUTE_TARGET,
       },
       required: ["op"],
       additionalProperties: false,
@@ -112,10 +127,7 @@ export const TOOLS: Tool[] = [
           type: "string",
           description: "Optional session key. Omit for this MCP connection's own private session (each Claude Code / Codex instance gets isolated `state` automatically). Pass an explicit shared key only to deliberately share state across agents.",
         },
-        channel: {
-          type: "string",
-          description: "Target Figma window's channel. Omit with a single window (auto-routes). With several windows, pick one from figma_read list_channels.",
-        },
+        ...ROUTE_TARGET,
       },
       required: ["code"],
       additionalProperties: false,
@@ -219,7 +231,9 @@ export const TOOLS: Tool[] = [
           },
           additionalProperties: false,
         },
-        channel: { type: "string", description: "Target Figma window's channel; omit with a single window." },
+        channel: ROUTE_TARGET.channel,
+        file: ROUTE_TARGET.file,
+        page: ROUTE_TARGET.page,
       },
       // One diagram needs type+title; a `diagrams` batch carries them per entry,
       // so the pair is checked in the handler, with a hint instead of a schema error.
@@ -234,10 +248,9 @@ export const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        channel: {
-          type: "string",
-          description: "Target Figma window's channel; omit with a single window.",
-        },
+        channel: ROUTE_TARGET.channel,
+        file: ROUTE_TARGET.file,
+        page: ROUTE_TARGET.page,
       },
       additionalProperties: false,
     },
@@ -343,7 +356,8 @@ export async function createServer(): Promise<ServerHandle> {
     // THE single choke point. Called for leader-direct ops AND /rpc forwards —
     // wired by leader.ts onto EVERY bridge it creates, so the synthetic ops
     // below keep working across takeovers (no post-hoc router to forget).
-    runValidated: async (op, params, sessionId, channel) => {
+    runValidated: async (op, params, sessionId, route) => {
+      const hint = parseRouteArg(route);
       // Synthetic /rpc ops from followers (never sent to the plugin, so they
       // must be intercepted before validateOperation rejects them):
       // __register__ makes the follower's session visible in the plugin UI
@@ -371,7 +385,7 @@ export async function createServer(): Promise<ServerHandle> {
               return { id: "server", ok: true, result: b.channelSummaries() };
             }
             return b.dispatch(v, p, {
-              ...(channel ? { channel } : {}),
+              ...hint,
               ...(sessionId ? { sessionId } : {}),
               ...(ctx ? { signal: ctx.signal } : {}),
             });
@@ -379,7 +393,7 @@ export async function createServer(): Promise<ServerHandle> {
         });
       }
       const { op: validOp, params: validParams } = validateOperation(op, params);
-      return dispatchLeader(validOp, validParams, sessionId, channel);
+      return dispatchLeader(validOp, validParams, sessionId, hint);
     },
     // Runs for the initial bridge AND any takeover replacement.
     onBridgeCreated: (bridge) => {
@@ -415,7 +429,7 @@ export async function createServer(): Promise<ServerHandle> {
     op: AnyOperation,
     params: Record<string, unknown>,
     sessionId?: string,
-    channel?: string,
+    route?: { channel?: string; file?: string; page?: string },
   ): Promise<unknown> {
     const bridge = liveBridge();
     if (!bridge) {
@@ -429,7 +443,7 @@ export async function createServer(): Promise<ServerHandle> {
       return bridge.channelSummaries();
     }
     const res: BridgeResponse = await bridge.dispatch(op, params, {
-      ...(channel ? { channel } : {}),
+      ...parseRouteArg(route),
       ...(sessionId ? { sessionId } : {}),
     });
     return unwrap(res);
@@ -440,26 +454,34 @@ export async function createServer(): Promise<ServerHandle> {
     op: string,
     params: Record<string, unknown>,
     sessionId?: string,
-    channel?: string,
+    route?: RouteArg,
   ): Promise<unknown> {
     const { op: validOp, params: validParams } = validateOperation(op, params);
     const sid = resolveSession(sessionId);
+    const hint = parseRouteArg(route);
     if (coordinator.role === "leader") {
-      return dispatchLeader(validOp, validParams, sid, channel);
+      return dispatchLeader(validOp, validParams, sid, hint);
     }
     // Follower: local validation already done; leader validates again on /rpc.
-    return coordinator.forward(validOp, validParams, sid, channel);
+    return coordinator.forward(validOp, validParams, sid, hint.channel, undefined, {
+      file: hint.file,
+      page: hint.page,
+    });
   }
 
   /** figma_write execution. On a follower, forward the whole code to the leader. */
-  async function runWrite(code: string, sessionId?: string, channel?: string): Promise<WriteResult | unknown> {
+  async function runWrite(code: string, sessionId?: string, route?: RouteArg): Promise<WriteResult | unknown> {
     const sid = resolveSession(sessionId);
+    const hint = parseRouteArg(route);
     if (coordinator.role === "follower") {
       // The executor lives on the leader (it owns sessions + bridge). Forward a
       // synthetic op so the leader runs the vm; the leader's onRpc maps it.
       // The resolved (per-process) session id is sent explicitly so parallel
       // followers never collapse onto the leader's default session.
-      return coordinator.forward("__write__", { code }, sid, channel);
+      return coordinator.forward("__write__", { code }, sid, hint.channel, undefined, {
+        file: hint.file,
+        page: hint.page,
+      });
     }
     const session = sessions.get(sid);
     return executeWrite(code, session, {
@@ -475,7 +497,7 @@ export async function createServer(): Promise<ServerHandle> {
           return { id: "server", ok: true, result: bridge.channelSummaries() };
         }
         return bridge.dispatch(validOp, validParams, {
-          ...(channel ? { channel } : {}),
+          ...hint,
           sessionId: sid,
           ...(ctx ? { signal: ctx.signal } : {}),
         });
@@ -491,7 +513,7 @@ export async function createServer(): Promise<ServerHandle> {
   type LeaderPluginState = Pick<
     Diagnostics,
     "pluginConnected" | "plugin" | "channels" | "lastHeartbeatMs" | "queueLength" | "pendingCount"
-  >;
+  > & { sessions?: Diagnostics["sessions"] };
 
   function leaderPluginState(bridge: Bridge): LeaderPluginState {
     return {
@@ -517,6 +539,7 @@ export async function createServer(): Promise<ServerHandle> {
       lastHeartbeatMs: bridge.lastHeartbeatMs,
       queueLength: bridge.queueLength,
       pendingCount: bridge.pendingCount,
+      sessions: sessions.summaries(),
     };
   }
 
@@ -637,6 +660,14 @@ export async function createServer(): Promise<ServerHandle> {
   };
 }
 
+function pickRoute(args: Record<string, unknown>): RouteArg {
+  return parseRouteArg({
+    channel: typeof args["channel"] === "string" ? args["channel"] : undefined,
+    file: typeof args["file"] === "string" ? args["file"] : undefined,
+    page: typeof args["page"] === "string" ? args["page"] : undefined,
+  });
+}
+
 async function callTool(ctx: ToolContext, name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
     case "figma_status":
@@ -646,21 +677,21 @@ async function callTool(ctx: ToolContext, name: string, args: Record<string, unk
         ctx,
         String(args["op"] ?? ""),
         (args["params"] as Record<string, unknown>) ?? {},
-        args["channel"] as string | undefined,
+        pickRoute(args),
       );
     case "figma_write":
       return handleWrite(
         ctx,
         String(args["code"] ?? ""),
         args["sessionId"] as string | undefined,
-        args["channel"] as string | undefined,
+        pickRoute(args),
       );
     case "figma_diagram": {
-      const { type, channel, ...spec } = args;
-      return handleDiagram(ctx, type, spec, channel as string | undefined);
+      const { type, channel: _c, file: _f, page: _p, ...spec } = args;
+      return handleDiagram(ctx, type, spec, pickRoute(args));
     }
     case "figma_rules":
-      return handleRules(ctx, args["channel"] as string | undefined);
+      return handleRules(ctx, pickRoute(args));
     case "figma_docs":
       return handleDocs(String(args["section"] ?? ""), args["level"] === "cheat" ? "cheat" : "full");
     default:

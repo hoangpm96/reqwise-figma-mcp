@@ -44,6 +44,7 @@ type UiToMain =
 type MainToUi =
   | { kind: "handshake"; pluginVersion: string; protocolVersion: number }
   | { kind: "hello"; hello: HelloData }
+  | { kind: "context"; reason: "selection" | "page"; hello: HelloData }
   | { kind: "response"; payload: BridgeResponse; op: Operation }
   | { kind: "progress"; payload: BridgeResponse; op: Operation }
   | {
@@ -110,7 +111,18 @@ function helloData(): HelloData {
 }
 
 /** Dispatch a single request to its handler and build a BridgeResponse. */
+let inFlight = 0;
+
 async function dispatch(req: BridgeRequest): Promise<BridgeResponse> {
+  inFlight += 1;
+  try {
+    return await dispatchInner(req);
+  } finally {
+    inFlight -= 1;
+  }
+}
+
+async function dispatchInner(req: BridgeRequest): Promise<BridgeResponse> {
   const emitProgress = (done: number, total: number, note?: string) => {
     post({
       kind: "progress",
@@ -408,6 +420,12 @@ figma.ui.onmessage = async (msg: UiToMain) => {
 // Keep hello data fresh when the user switches pages/files.
 figma.on("currentpagechange", () => {
   post({ kind: "hello", hello: helloData() });
+  if (inFlight === 0) post({ kind: "context", reason: "page", hello: helloData() });
+});
+
+figma.on("selectionchange", () => {
+  if (inFlight > 0) return;
+  post({ kind: "context", reason: "selection", hello: helloData() });
 });
 
 // A drawn diagram's arrows are plain vectors — Figma Design has no connector
